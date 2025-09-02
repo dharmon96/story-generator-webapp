@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run build:*)",
+      "WebSearch",
+      "Bash(python -m pip install:*)",
+      "Bash(python:*)",
+      "Bash(curl:*)",
+      "Bash(npm start)",
+      "Bash(set PORT=3001)",
+      "Bash(taskkill:*)",
+      "Bash(cmd //c:*)",
+      "Bash(npm update:*)",
+      "Bash(npm install)",
+      "Bash(npm run type-check:*)",
+      "Bash(npm run:*)",
+      "Bash(npm test:*)",
+      "Bash(npm install:*)",
+      "Bash(telnet:*)",
+      "Bash(del /Q \"D:\\AI\\story-generator-webapp\\src\\services\\networkProxy.ts\")",
+      "Bash(npm uninstall:*)",
+      "Bash(dir:*)",
+      "Bash(npx tsc:*)",
+      "Bash(timeout:*)",
+      "Bash(cmd /c:*)",
+      "Bash(sqlite3:*)",
+      "mcp__ide__getDiagnostics",
+      "Bash(/dev/null)",
+      "Bash(start http://localhost:3000)",
+      "mcp__ide__executeCode"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Debug Story Queue Processing</title>
+</head>
+<body>
+    <h1>Debug Story Queue Processing</h1>
+    <p>Open the browser console (F12) and navigate to the Story Generator app at <a href="http://localhost:3000" target="_blank">localhost:3000</a></p>
+    
+    <h2>Steps to debug:</h2>
+    <ol>
+        <li>Open browser console (F12)</li>
+        <li>Go to Settings tab and check if there are any model configurations</li>
+        <li>Go to Story Generator tab</li>
+        <li>Enter a simple prompt like "A detective story"</li>
+        <li>Click "Generate Story"</li>
+        <li>Watch the console for debug messages</li>
+    </ol>
+    
+    <h2>Expected console messages:</h2>
+    <ul>
+        <li>🔍 Queue check: [number] queued, 0 processing...</li>
+        <li>🔍 Settings: processingEnabled=true, modelConfigs=[number]</li>
+        <li>🚀 Auto-starting processing for [number] queued items...</li>
+        <li>📋 Validating processing setup...</li>
+        <li>✅ Validation passed, starting processing...</li>
+        <li>🚀 Starting processNextQueueItem...</li>
+    </ul>
+    
+    <h2>Common issues to check:</h2>
+    <ul>
+        <li>No model configurations: Go to Settings and set up at least one model for each step</li>
+        <li>Missing nodes: Go to Settings and scan for local services</li>
+        <li>Validation fails: Check console for specific error messages</li>
+    </ul>
+    
+    <script>
+        console.log("🐛 Debug page loaded. Use this page as a reference while debugging the queue processing.");
+        console.log("📋 Navigate to http://localhost:3000 to test the actual app");
+    </script>
+</body>
+</html>

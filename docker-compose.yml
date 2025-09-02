@@ -1,0 +1,107 @@
+version: '3.8'
+
+services:
+  # Frontend React Application
+  frontend:
+    build:
+      context: ./story-generator-webapp
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+      - REACT_APP_WS_URL=ws://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - app-network
+
+  # Backend FastAPI Application
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite:///./data/film_generator.db
+      - OLLAMA_HOST=http://ollama:11434
+      - COMFYUI_HOST=http://comfyui:8188
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+      - ./renders:/app/renders
+    depends_on:
+      - redis
+      - ollama
+    networks:
+      - app-network
+
+  # Redis for Celery
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - app-network
+
+  # Ollama for AI Models
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      - OLLAMA_MODELS=/root/.ollama/models
+    networks:
+      - app-network
+
+  # ComfyUI for Video Generation (Optional)
+  comfyui:
+    build:
+      context: ./comfyui
+      dockerfile: Dockerfile
+    ports:
+      - "8188:8188"
+    volumes:
+      - comfyui-data:/app/models
+      - ./outputs:/app/output
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - app-network
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/ssl:/etc/nginx/ssl
+    depends_on:
+      - frontend
+      - backend
+    networks:
+      - app-network
+
+volumes:
+  redis-data:
+  ollama-data:
+  comfyui-data:
+
+networks:
+  app-network:
+    driver: bridge

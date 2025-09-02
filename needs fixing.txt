@@ -1,0 +1,8 @@
+ Please critically review this implimentation and analyze if we need a re-write or code cleanup. We are close but it shouldnt be this
+ challenging to impliment. Steps seem out of order. I think the shotlist gets smaller somehow beween story part 4 and 5. We are making it       
+ further through the process but it feels like brutal brute forcing to get this working. I do not want to use fallbacks or make the process,    
+ or prompts simpler. It should work.
+
+ also please make sure the bug auto scrolling/ user scrolls -> able to resume auto scrolling feature.
+
+ Review debug-logs-2025-09-02(8).json
