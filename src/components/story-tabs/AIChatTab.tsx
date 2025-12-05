@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   Box,
   Card,
@@ -13,6 +13,7 @@ import {
   Collapse,
   TextField,
   Avatar,
+  Fab,
 } from '@mui/material';
 import {
   Psychology as AIIcon,
@@ -26,6 +27,7 @@ import {
   AccessTime as TimeIcon,
   Memory as TokenIcon,
   Send as SendIcon,
+  KeyboardArrowDown as ScrollDownIcon,
 } from '@mui/icons-material';
 import { AILogEntry } from '../../types/storyTypes';
 
@@ -39,13 +41,63 @@ const AIChatTab: React.FC<AIChatTabProps> = ({ aiLogs, storyId, onClearLogs }) =
   const [expandedLog, setExpandedLog] = useState<string | null>(null);
   const [filterLevel, setFilterLevel] = useState<AILogEntry['level'] | 'all'>('all');
   const [newMessage, setNewMessage] = useState('');
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [isUserScrolling, setIsUserScrolling] = useState(false);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
+  const isScrollingRef = useRef(false);
 
-  useEffect(() => {
-    if (listRef.current) {
-      listRef.current.scrollTop = listRef.current.scrollHeight;
+  // Handle scroll events to detect user interaction
+  const handleScroll = useCallback(() => {
+    if (!listRef.current || isScrollingRef.current) return;
+    
+    const element = listRef.current;
+    const { scrollTop, scrollHeight, clientHeight } = element;
+    const isAtBottom = Math.abs(scrollHeight - scrollTop - clientHeight) < 10; // 10px tolerance
+    
+    if (!isAtBottom && !isUserScrolling) {
+      // User scrolled up, pause auto-scroll
+      setIsUserScrolling(true);
+      setShowScrollToBottom(true);
+    } else if (isAtBottom && isUserScrolling) {
+      // User scrolled back to bottom
+      setIsUserScrolling(false);
+      setShowScrollToBottom(false);
     }
-  }, [aiLogs]);
+  }, [isUserScrolling]);
+
+  // Set up scroll event listener
+  useEffect(() => {
+    const element = listRef.current;
+    if (!element) return;
+
+    element.addEventListener('scroll', handleScroll, { passive: true });
+    return () => element.removeEventListener('scroll', handleScroll);
+  }, [handleScroll]);
+
+  // Auto-scroll to bottom when new logs arrive (only if user hasn't manually scrolled)
+  useEffect(() => {
+    if (!isUserScrolling && autoScroll && listRef.current) {
+      isScrollingRef.current = true;
+      listRef.current.scrollTop = listRef.current.scrollHeight;
+      setTimeout(() => {
+        isScrollingRef.current = false;
+      }, 100);
+    }
+  }, [aiLogs, isUserScrolling, autoScroll]);
+
+  // Force scroll to bottom function
+  const scrollToBottom = useCallback(() => {
+    if (listRef.current) {
+      isScrollingRef.current = true;
+      listRef.current.scrollTop = listRef.current.scrollHeight;
+      setIsUserScrolling(false);
+      setShowScrollToBottom(false);
+      setTimeout(() => {
+        isScrollingRef.current = false;
+      }, 100);
+    }
+  }, []);
 
   const filteredLogs = aiLogs.filter(log => 
     filterLevel === 'all' || log.level === filterLevel
@@ -73,12 +125,20 @@ const AIChatTab: React.FC<AIChatTabProps> = ({ aiLogs, storyId, onClearLogs }) =
     }
   };
 
-  const formatTimestamp = (timestamp: Date) => {
-    return timestamp.toLocaleTimeString('en-US', { 
-      hour12: false, 
-      hour: '2-digit', 
-      minute: '2-digit', 
-      second: '2-digit' 
+  const formatTimestamp = (timestamp: Date | string) => {
+    // FIX BUG #4: Handle both Date objects and string timestamps
+    const date = timestamp instanceof Date ? timestamp : new Date(timestamp);
+
+    // Validate date is valid
+    if (isNaN(date.getTime())) {
+      return '--:--:--';
+    }
+
+    return date.toLocaleTimeString('en-US', {
+      hour12: false,
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
     });
   };
 
@@ -146,6 +206,14 @@ const AIChatTab: React.FC<AIChatTabProps> = ({ aiLogs, storyId, onClearLogs }) =
                 onClick={() => setFilterLevel(filterLevel === 'all' ? 'info' : 'all')}
               >
                 Filter: {filterLevel}
+              </Button>
+              <Button 
+                size="small" 
+                variant={autoScroll ? "contained" : "outlined"}
+                onClick={() => setAutoScroll(!autoScroll)}
+                color={autoScroll ? "primary" : "inherit"}
+              >
+                Auto-scroll
               </Button>
               <Button 
                 size="small" 
@@ -298,7 +366,13 @@ const AIChatTab: React.FC<AIChatTabProps> = ({ aiLogs, storyId, onClearLogs }) =
                         {expandedLog === log.id ? 'Hide' : 'Show'} Details
                       </Button>
                       <Collapse in={expandedLog === log.id}>
-                        <Paper sx={{ p: 2, mt: 1, backgroundColor: 'grey.50' }}>
+                        <Paper sx={{
+                          p: 2,
+                          mt: 1,
+                          backgroundColor: theme => theme.palette.mode === 'dark' ? 'grey.900' : 'grey.50',
+                          border: '1px solid',
+                          borderColor: theme => theme.palette.mode === 'dark' ? 'grey.700' : 'grey.300'
+                        }}>
                           {/* Special handling for AI requests and responses */}
                           {log.details?.systemPrompt || log.details?.userPrompt ? (
                             <Box>
@@ -307,14 +381,19 @@ const AIChatTab: React.FC<AIChatTabProps> = ({ aiLogs, storyId, onClearLogs }) =
                                   <Typography variant="subtitle2" gutterBottom sx={{ fontWeight: 'bold', color: 'primary.main' }}>
                                     🤖 System Prompt:
                                   </Typography>
-                                  <Paper sx={{ p: 1.5, backgroundColor: 'primary.50', border: '1px solid', borderColor: 'primary.200' }}>
-                                    <Typography 
-                                      variant="body2" 
-                                      sx={{ 
-                                        fontFamily: 'monospace', 
+                                  <Paper sx={{
+                                    p: 1.5,
+                                    backgroundColor: theme => theme.palette.mode === 'dark' ? 'rgba(99, 102, 241, 0.15)' : 'primary.50',
+                                    border: '1px solid',
+                                    borderColor: theme => theme.palette.mode === 'dark' ? 'primary.700' : 'primary.200'
+                                  }}>
+                                    <Typography
+                                      variant="body2"
+                                      sx={{
+                                        fontFamily: 'monospace',
                                         whiteSpace: 'pre-wrap',
                                         fontSize: '0.8rem',
-                                        color: 'primary.dark'
+                                        color: theme => theme.palette.mode === 'dark' ? 'primary.light' : 'primary.dark'
                                       }}
                                     >
                                       {log.details.systemPrompt}
@@ -327,14 +406,19 @@ const AIChatTab: React.FC<AIChatTabProps> = ({ aiLogs, storyId, onClearLogs }) =
                                   <Typography variant="subtitle2" gutterBottom sx={{ fontWeight: 'bold', color: 'info.main' }}>
                                     👤 User Prompt:
                                   </Typography>
-                                  <Paper sx={{ p: 1.5, backgroundColor: 'info.50', border: '1px solid', borderColor: 'info.200' }}>
-                                    <Typography 
-                                      variant="body2" 
-                                      sx={{ 
-                                        fontFamily: 'monospace', 
+                                  <Paper sx={{
+                                    p: 1.5,
+                                    backgroundColor: theme => theme.palette.mode === 'dark' ? 'rgba(59, 130, 246, 0.15)' : 'info.50',
+                                    border: '1px solid',
+                                    borderColor: theme => theme.palette.mode === 'dark' ? 'info.700' : 'info.200'
+                                  }}>
+                                    <Typography
+                                      variant="body2"
+                                      sx={{
+                                        fontFamily: 'monospace',
                                         whiteSpace: 'pre-wrap',
                                         fontSize: '0.8rem',
-                                        color: 'info.dark'
+                                        color: theme => theme.palette.mode === 'dark' ? 'info.light' : 'info.dark'
                                       }}
                                     >
                                       {log.details.userPrompt}
@@ -354,14 +438,19 @@ const AIChatTab: React.FC<AIChatTabProps> = ({ aiLogs, storyId, onClearLogs }) =
                               <Typography variant="subtitle2" gutterBottom sx={{ fontWeight: 'bold', color: 'success.main' }}>
                                 ✅ AI Response ({log.details.response.length} characters):
                               </Typography>
-                              <Paper sx={{ p: 1.5, backgroundColor: 'success.50', border: '1px solid', borderColor: 'success.200' }}>
-                                <Typography 
-                                  variant="body2" 
-                                  sx={{ 
-                                    fontFamily: 'monospace', 
+                              <Paper sx={{
+                                p: 1.5,
+                                backgroundColor: theme => theme.palette.mode === 'dark' ? 'rgba(16, 185, 129, 0.15)' : 'success.50',
+                                border: '1px solid',
+                                borderColor: theme => theme.palette.mode === 'dark' ? 'success.700' : 'success.200'
+                              }}>
+                                <Typography
+                                  variant="body2"
+                                  sx={{
+                                    fontFamily: 'monospace',
                                     whiteSpace: 'pre-wrap',
                                     fontSize: '0.8rem',
-                                    color: 'success.dark'
+                                    color: theme => theme.palette.mode === 'dark' ? 'success.light' : 'success.dark'
                                   }}
                                 >
                                   {log.details.response}
@@ -429,6 +518,23 @@ const AIChatTab: React.FC<AIChatTabProps> = ({ aiLogs, storyId, onClearLogs }) =
           </Box>
         </CardContent>
       </Card>
+
+      {/* Floating Scroll to Bottom Button */}
+      {showScrollToBottom && (
+        <Fab
+          size="small"
+          color="primary"
+          onClick={scrollToBottom}
+          sx={{
+            position: 'absolute',
+            bottom: 120,
+            right: 16,
+            zIndex: 1000,
+          }}
+        >
+          <ScrollDownIcon />
+        </Fab>
+      )}
     </Box>
   );
 };

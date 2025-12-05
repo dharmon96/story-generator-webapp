@@ -63,7 +63,14 @@ function initializeDatabase() {
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
       )`);
 
+      // Create indexes for better query performance
+      db.run(`CREATE INDEX IF NOT EXISTS idx_queue_priority ON story_queue(priority DESC, created_at ASC)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_queue_status ON story_queue(status)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_logs_story_id ON generation_logs(story_id)`);
+      db.run(`CREATE INDEX IF NOT EXISTS idx_stories_created ON stories(created_at DESC)`);
+
       console.log('✅ Database tables initialized');
+      console.log('✅ Database indexes created');
       resolve(db);
     });
   });

@@ -22,6 +22,8 @@ interface StoryDataCache {
 class StoryDataManager {
   private cache: StoryDataCache = {};
   private subscribers: Map<string, Set<(data: EnhancedStory) => void>> = new Map();
+  private updateLocks: Set<string> = new Set(); // Prevent concurrent updates
+  private pendingUpdates: Map<string, Array<{updates: Partial<EnhancedStory>, step?: string}>> = new Map();
 
   /**
    * Initialize or update story data
@@ -60,46 +62,85 @@ class StoryDataManager {
   }
 
   /**
-   * Update story with partial data from any generation step
+   * Update story with partial data from any generation step - Thread Safe
    */
   public updateStory(storyId: string, updates: Partial<EnhancedStory>, step?: string): void {
     console.log(`📊 Updating story ${storyId} - Step: ${step || 'unknown'}`);
+    
+    // Check if story is locked for updates
+    if (this.updateLocks.has(storyId)) {
+      console.log(`📊 Story ${storyId} is locked, queuing update for step ${step}`);
+      
+      // Queue the update for later
+      if (!this.pendingUpdates.has(storyId)) {
+        this.pendingUpdates.set(storyId, []);
+      }
+      this.pendingUpdates.get(storyId)!.push({ updates, step });
+      return;
+    }
     
     if (!this.cache[storyId]) {
       this.initializeStory(storyId, updates);
       return;
     }
 
-    const cached = this.cache[storyId];
+    // Acquire lock
+    this.updateLocks.add(storyId);
     
-    // Deep merge updates to preserve existing data
-    cached.story = this.deepMergeStory(cached.story, updates);
-    cached.lastUpdated = new Date();
-    
-    if (step) {
-      cached.generationProgress.currentStep = step;
-    }
+    try {
+      const cached = this.cache[storyId];
+      
+      // Deep merge updates to preserve existing data
+      cached.story = this.deepMergeStory(cached.story, updates);
+      cached.lastUpdated = new Date();
+      
+      if (step) {
+        cached.generationProgress.currentStep = step;
+      }
 
-    // Log what was updated
-    console.log(`📊 Updated fields:`, Object.keys(updates));
-    if (updates.shots) {
-      console.log(`📊 Shots updated: ${updates.shots.length} shots`);
-      const shotsWithPrompts = updates.shots.filter(s => s.comfyUIPositivePrompt);
-      console.log(`📊 Shots with ComfyUI prompts: ${shotsWithPrompts.length}`);
-    }
+      // Log what was updated
+      console.log(`📊 Updated fields:`, Object.keys(updates));
+      if (updates.shots) {
+        console.log(`📊 Shots updated: ${updates.shots.length} shots`);
+        const shotsWithPrompts = updates.shots.filter(s => s.comfyUIPositivePrompt);
+        console.log(`📊 Shots with ComfyUI prompts: ${shotsWithPrompts.length}`);
+      }
 
-    this.notifySubscribers(storyId);
-    this.syncToStore(storyId);
+      this.notifySubscribers(storyId);
+      this.syncToStore(storyId);
+      
+      // Process any pending updates
+      this.processPendingUpdates(storyId);
+      
+    } finally {
+      // Release lock
+      this.updateLocks.delete(storyId);
+    }
   }
 
   /**
-   * Update specific shot data
+   * Update specific shot data - Thread Safe
    */
-  public updateShot(storyId: string, shotId: string, shotUpdates: Partial<EnhancedShot>): void {
+  public updateShot(storyId: string, shotId: string, shotUpdates: Partial<EnhancedShot>, retryCount: number = 0): void {
     console.log(`📊 Updating shot ${shotId} in story ${storyId}`);
-    
+
+    // FIX BUG #5: Add maximum retry count to prevent infinite loops
+    const MAX_RETRIES = 10;
+    const RETRY_DELAY_MS = 50; // Increased delay with exponential backoff
+
     if (!this.cache[storyId]) {
       console.error(`Story ${storyId} not found in cache`);
+      return;
+    }
+
+    // Wait for any pending story updates to complete with retry limit
+    if (this.updateLocks.has(storyId)) {
+      if (retryCount >= MAX_RETRIES) {
+        console.error(`Shot update for ${shotId} exceeded max retries (${MAX_RETRIES}), skipping update`);
+        return;
+      }
+      const delay = RETRY_DELAY_MS * Math.pow(1.5, retryCount); // Exponential backoff
+      setTimeout(() => this.updateShot(storyId, shotId, shotUpdates, retryCount + 1), delay);
       return;
     }
 
@@ -111,24 +152,52 @@ class StoryDataManager {
       return;
     }
 
-    // Update the specific shot
-    cached.story.shots[shotIndex] = {
-      ...cached.story.shots[shotIndex],
-      ...shotUpdates
-    };
+    // Acquire lock for shot update
+    this.updateLocks.add(storyId);
     
-    cached.lastUpdated = new Date();
+    try {
+      // Update the specific shot
+      cached.story.shots[shotIndex] = {
+        ...cached.story.shots[shotIndex],
+        ...shotUpdates
+      };
+      
+      cached.lastUpdated = new Date();
 
-    // Log prompt updates
-    if (shotUpdates.comfyUIPositivePrompt || shotUpdates.comfyUINegativePrompt) {
-      console.log(`📊 Updated ComfyUI prompts for shot ${shotIndex + 1}:`, {
-        positive: shotUpdates.comfyUIPositivePrompt?.slice(0, 50) + '...',
-        negative: shotUpdates.comfyUINegativePrompt?.slice(0, 50) + '...'
-      });
+      // Log prompt updates
+      if (shotUpdates.comfyUIPositivePrompt || shotUpdates.comfyUINegativePrompt) {
+        console.log(`📊 Updated ComfyUI prompts for shot ${shotIndex + 1}:`, {
+          positive: shotUpdates.comfyUIPositivePrompt?.slice(0, 50) + '...',
+          negative: shotUpdates.comfyUINegativePrompt?.slice(0, 50) + '...'
+        });
+      }
+
+      this.notifySubscribers(storyId);
+      this.syncToStore(storyId);
+      
+    } finally {
+      this.updateLocks.delete(storyId);
+    }
+  }
+
+  /**
+   * Process any pending updates after releasing lock
+   */
+  private processPendingUpdates(storyId: string): void {
+    const pendingQueue = this.pendingUpdates.get(storyId);
+    if (!pendingQueue || pendingQueue.length === 0) {
+      return;
     }
 
-    this.notifySubscribers(storyId);
-    this.syncToStore(storyId);
+    console.log(`📊 Processing ${pendingQueue.length} pending updates for story ${storyId}`);
+    
+    // Clear the pending queue first to prevent infinite loops
+    this.pendingUpdates.delete(storyId);
+    
+    // Process all pending updates in order
+    for (const { updates, step } of pendingQueue) {
+      this.updateStory(storyId, updates, step);
+    }
   }
 
   /**
@@ -142,9 +211,15 @@ class StoryDataManager {
     const cached = this.cache[storyId];
     cached.generationProgress.currentStep = step;
     cached.generationProgress.overallProgress = progress;
-    
+
+    // FIX BUG #2: Implement log rotation to prevent memory bloat
+    const MAX_LOGS = 500;
     if (logs) {
       cached.generationProgress.logs.push(...logs);
+      // Trim logs if exceeding maximum
+      if (cached.generationProgress.logs.length > MAX_LOGS) {
+        cached.generationProgress.logs = cached.generationProgress.logs.slice(-MAX_LOGS);
+      }
     }
 
     // Update story status based on progress
@@ -244,12 +319,14 @@ class StoryDataManager {
         characters: shot.characters,
         locations: shot.locations
       })),
+      // FIX BUG #3: Handle both snake_case and camelCase field names
+      // EnhancedCharacter uses camelCase, store uses snake_case
       characters: storyData.characters.map(char => ({
         name: char.name,
-        role: char.role === 'protagonist' ? 'main' : 'supporting',
-        physical_description: char.physicalDescription,
-        age_range: char.age,
-        importance_level: char.importanceLevel
+        role: char.role === 'protagonist' ? 'main' : (char.role as string === 'main' ? 'main' : 'supporting'),
+        physical_description: char.physicalDescription || (char as any).physical_description || '',
+        age_range: char.age || (char as any).age_range || '',
+        importance_level: char.importanceLevel || (char as any).importance_level || 3
       })),
       status: storyData.status === 'completed' ? 'completed' as const : 
              storyData.status === 'failed' ? 'draft' as const : 'generating' as const,

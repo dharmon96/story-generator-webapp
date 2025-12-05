@@ -27,7 +27,10 @@
       "mcp__ide__getDiagnostics",
       "Bash(/dev/null)",
       "Bash(start http://localhost:3000)",
-      "mcp__ide__executeCode"
+      "mcp__ide__executeCode",
+      "Bash(find:*)",
+      "Bash(findstr:*)",
+      "Bash(grep:*)"
     ],
     "deny": [],
     "ask": []

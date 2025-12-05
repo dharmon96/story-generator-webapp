@@ -31,13 +31,23 @@ export interface QueueItem {
   storyId?: string;
 }
 
+export interface StoryPart {
+  partNumber: number;
+  title: string;
+  content: string;
+  narrativePurpose: 'introduction' | 'conflict' | 'development' | 'climax' | 'resolution';
+  durationEstimate: number;
+  shotCount?: number;
+}
+
 export interface Story {
   id: string;
   title: string;
-  content: string;
+  content: string;  // Master story content (full story)
   genre: string;
   shots: Shot[];
   characters?: Character[];
+  locations?: StoryLocation[];  // Locations extracted from the story
   prompts?: string[];
   narrations?: string[];
   musicCues?: string[];
@@ -45,14 +55,43 @@ export interface Story {
   updatedAt?: Date;
   status: 'draft' | 'generating' | 'completed';
   generationData?: any; // Store intermediate generation data
+
+  // Master Story Architecture fields
+  masterStoryId?: string;  // If this is a part, references the master story
+  storyParts?: StoryPart[];  // Array of story parts for multi-video production
+  totalParts?: number;  // Total number of parts this story is divided into
+  logline?: string;  // Story logline/summary for context
+  totalDuration?: number;  // Total estimated duration in seconds
 }
 
 export interface Character {
+  id?: string;
   name: string;
   role: string;
   physical_description: string;
   age_range?: string;
+  gender?: string;
+  clothing?: string;
+  distinctiveFeatures?: string[];
+  personality?: string;
   importance_level?: number;
+  screenTime?: number;
+  visualPrompt?: string;
+}
+
+export interface StoryLocation {
+  id?: string;
+  name: string;
+  type: 'interior' | 'exterior' | 'mixed' | string;
+  description: string;
+  atmosphere?: string;
+  lighting?: string;
+  timeOfDay?: string;
+  weather?: string;
+  keyElements?: string[];
+  colorPalette?: string[];
+  visualPrompt?: string;
+  usedInShots?: string[];
 }
 
 export interface Shot {
@@ -62,34 +101,38 @@ export interface Shot {
   description: string;
   duration: number;
   frames: number;
-  
+
   // Camera information
   camera: string;
   cameraMovement?: string;
   shotType?: 'wide' | 'medium' | 'close-up' | 'extreme-close' | 'establishing' | 'tracking' | 'panning';
   angle?: 'eye-level' | 'low-angle' | 'high-angle' | 'birds-eye' | 'worms-eye';
-  
+
   // Visual generation
   visualPrompt?: string;
   comfyUIPositivePrompt?: string;
   comfyUINegativePrompt?: string;
   styleReference?: string;
-  
+
   // Audio elements
   narration?: string;
   dialogue?: Array<{ character: string; text: string; timing?: number }>;
   musicCue?: string;
   soundEffects?: string[];
-  
+
   // Rendering
   renderStatus?: 'pending' | 'prompt-generated' | 'rendering' | 'completed' | 'failed';
   renderUrl?: string;
   renderProgress?: number;
-  
+
   // Metadata
   characters?: string[];
   locations?: string[];
   complexity?: 'simple' | 'moderate' | 'complex';
+
+  // Part reference for multi-video coherence
+  partNumber?: number;  // Which part this shot belongs to (1-indexed)
+  partTitle?: string;   // Title of the part this shot belongs to
 }
 
 export interface ResearchData {

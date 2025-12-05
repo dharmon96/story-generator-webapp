@@ -38,19 +38,9 @@ import {
   Refresh,
 } from '@mui/icons-material';
 import { useStore, Story } from '../store/useStore';
-import { sequentialAiPipelineService } from '../services/sequentialAiPipeline';
 import { debugService } from '../services/debugService';
 import { nodeDiscoveryService } from '../services/nodeDiscovery';
-
-// Global processing state to prevent double processing across component mounts
-const globalProcessingState = {
-  isProcessing: false,
-  currentItemId: null as string | null,
-  reset() {
-    this.isProcessing = false;
-    this.currentItemId = null;
-  }
-};
+import { queueProcessor, ProcessingStatus } from '../services/queueProcessor';
 
 interface StoryQueueProps {
   onOpenStory?: (storyId: string, queueItemId: string) => void;
@@ -60,17 +50,13 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
   const { queue, removeFromQueue, clearCompletedQueue, moveQueueItem, updateQueueItem, addStory, reQueueItem, settings } = useStore();
   const [selectedItem, setSelectedItem] = useState<string | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [processingErrors, setProcessingErrors] = useState<string[]>([]);
-  const [currentProcessingItem, setCurrentProcessingItem] = useState<string | null>(null);
-  
-  // Use ref to track processing state to avoid closure issues
-  const isProcessingRef = useRef(false);
-  const processingItemRef = useRef<string | null>(null);
-  
-  // Global processing lock to prevent race conditions across component mounts
-  const processingLockRef = useRef<string | null>(null);
-  const abortControllerRef = useRef<AbortController | null>(null);
+  const [processingStatus, setProcessingStatus] = useState<ProcessingStatus>({
+    isProcessing: false,
+    currentItemId: null,
+    startedAt: null,
+    queueLength: 0,
+    errors: []
+  });
 
   // Logging function
   const addDebugLog = useCallback((message: string, level: 'info' | 'error' | 'success' | 'warning' = 'info') => {
@@ -91,46 +77,31 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
     }
   }, []);
 
-  // Initialize component (run only once on mount)
+  // Initialize component and subscribe to queue processor status
   useEffect(() => {
-    // Add a unique mount ID to detect duplicate mounts
     const mountId = Math.random().toString(36).substring(2, 9);
     const mountTime = new Date().toLocaleTimeString();
     
     addDebugLog(`📊 ===== StoryQueue mounted [${mountId}] at ${mountTime} =====`);
-    addDebugLog(`📊 Mount ID: ${mountId} - If you see multiple IDs, React is double-mounting`);
-    addDebugLog(`📊 Initial state: isProcessing=${isProcessing}, currentProcessingItem=${currentProcessingItem}`);
     addDebugLog(`📊 Queue items: ${queue.length}, Processing enabled: ${settings.processingEnabled}`);
     addDebugLog(`📊 Available nodes: ${nodeDiscoveryService.getNodes().length}`);
     
-    // Only log detailed state if queue has items
-    if (queue.length > 0) {
-      queue.forEach((item, index) => {
-        addDebugLog(`📊 Queue Item ${index + 1}: ${item.status} - "${item.config.prompt.slice(0, 30)}..." (ID: ${item.id})`);
-      });
-    }
+    // Subscribe to queue processor status changes
+    const unsubscribe = queueProcessor.onStatusChange((status) => {
+      setProcessingStatus(status);
+      addDebugLog(`📊 Queue processor status updated: isProcessing=${status.isProcessing}, currentItem=${status.currentItemId}`);
+    });
     
-    const nodes = nodeDiscoveryService.getNodes();
-    if (nodes.length > 0) {
-      addDebugLog(`📊 Found ${nodes.length} nodes: ${nodes.map(n => n.name).join(', ')}`);
-    } else {
-      addDebugLog(`📊 ⚠️ No nodes found - check node discovery service`);
-    }
+    // Get initial status
+    const initialStatus = queueProcessor.getStatus();
+    setProcessingStatus(initialStatus);
     
     addDebugLog(`📊 ===== End mount [${mountId}] =====`);
     
-    // Cleanup function to detect unmounting
+    // Cleanup function
     return () => {
       addDebugLog(`📊 🔄 StoryQueue unmounting [${mountId}]`);
-      // Abort any ongoing processing
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-        abortControllerRef.current = null;
-      }
-      isProcessingRef.current = false;
-      processingItemRef.current = null;
-      processingLockRef.current = null;
-      // Don't reset global state on unmount - let it persist
+      unsubscribe();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // Only run once on mount
@@ -156,9 +127,8 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
   const confirmDelete = () => {
     if (selectedItem) {
       // Stop processing this item if it's currently being processed
-      if (currentProcessingItem === selectedItem) {
-        setCurrentProcessingItem(null);
-        processingItemRef.current = null;
+      if (processingStatus.currentItemId === selectedItem) {
+        queueProcessor.stopProcessing();
       }
       removeFromQueue(selectedItem);
     }
@@ -166,395 +136,32 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
     setSelectedItem(null);
   };
 
-  const validateProcessingSetup = useCallback(async (): Promise<void> => {
-    console.log('🔍 Starting validation...');
-    
-    // Check if model configs are set up
-    if (!settings.modelConfigs || settings.modelConfigs.length === 0) {
-      console.error('❌ No model configurations found');
-      throw new Error('No model configurations found. Please configure models in Settings.');
-    }
-    console.log(`✅ Found ${settings.modelConfigs.length} model configurations`);
-
-    const enabledConfigs = settings.modelConfigs.filter(config => 
-      config.enabled && config.nodeId && config.model
-    );
-    console.log(`✅ Found ${enabledConfigs.length} enabled configurations:`, enabledConfigs);
-
-    if (enabledConfigs.length === 0) {
-      console.error('❌ No enabled model configurations found');
-      throw new Error('No enabled model configurations found. Please enable at least one model configuration in Settings.');
-    }
-
-    // Check if required steps are configured
-    const requiredSteps = ['story', 'shots', 'characters', 'prompts'];
-    const configuredSteps = enabledConfigs.map(config => config.step);
-    const missingSteps = requiredSteps.filter(step => !configuredSteps.includes(step));
-    console.log(`🔍 Required steps: ${requiredSteps.join(', ')}`);
-    console.log(`🔍 Configured steps: ${configuredSteps.join(', ')}`);
-
-    if (missingSteps.length > 0) {
-      console.error(`❌ Missing required steps: ${missingSteps.join(', ')}`);
-      throw new Error(`Missing required model configurations for steps: ${missingSteps.join(', ')}. Please configure these in Settings.`);
-    }
-    console.log('✅ All required steps configured');
-
-    // Verify nodes are reachable
-    const nodes = nodeDiscoveryService.getNodes();
-    console.log(`🔍 Available nodes: ${nodes.length}`, nodes.map(n => ({ id: n.id, name: n.name, status: n.status })));
-    
-    for (const config of enabledConfigs) {
-      console.log(`🔍 Validating config for step '${config.step}': node=${config.nodeId}, model=${config.model}`);
-      
-      const node = nodes.find(n => n.id === config.nodeId);
-      if (!node) {
-        console.error(`❌ Node '${config.nodeId}' not found for step '${config.step}'`);
-        throw new Error(`Node '${config.nodeId}' not found for step '${config.step}'. Please refresh nodes in Settings.`);
-      }
-      console.log(`✅ Found node '${node.name}' (status: ${node.status})`);
-      
-      if (node.status !== 'online') {
-        console.error(`❌ Node '${node.name}' is offline for step '${config.step}'`);
-        throw new Error(`Node '${node.name}' is offline for step '${config.step}'. Please check the node connection.`);
-      }
-      console.log(`✅ Node '${node.name}' is online`);
-      
-      console.log(`🔍 Node models:`, node.models);
-      if (!node.models.includes(config.model)) {
-        console.error(`❌ Model '${config.model}' not available on node '${node.name}'`);
-        throw new Error(`Model '${config.model}' not available on node '${node.name}' for step '${config.step}'. Please select a different model or refresh the node.`);
-      }
-      console.log(`✅ Model '${config.model}' available on node '${node.name}'`);
-    }
-    
-    console.log('🎉 All validation checks passed!');
-  }, [settings.modelConfigs]);
-
-  const processNextQueueItem = useCallback(async (): Promise<void> => {
-    const callTimestamp = new Date().toISOString();
-    addDebugLog(`🔄 [${callTimestamp}] ===== processNextQueueItem ENTRY =====`);
-    addDebugLog(`🔄 [${callTimestamp}] isProcessingRef.current: ${isProcessingRef.current}`);
-    addDebugLog(`🔄 [${callTimestamp}] isProcessing state: ${isProcessing}`);
-    addDebugLog(`🔄 [${callTimestamp}] currentProcessingItem: ${currentProcessingItem}`);
-    addDebugLog(`🔄 [${callTimestamp}] processingItemRef.current: ${processingItemRef.current}`);
-    addDebugLog(`🔄 [${callTimestamp}] globalProcessingState: ${globalProcessingState.isProcessing}, ${globalProcessingState.currentItemId}`);
-    addDebugLog(`🔄 [${callTimestamp}] Queue state: ${queue.length} total items`);
-    
-    queue.forEach((item, index) => {
-      addDebugLog(`🔄 [${callTimestamp}] Item ${index + 1}: ID=${item.id}, status=${item.status}, priority=${item.priority}, prompt="${item.config.prompt.slice(0, 30)}..."`);
-    });
-    
-    if (!isProcessingRef.current) {
-      addDebugLog(`⏹️ [${callTimestamp}] Processing disabled (isProcessingRef.current=false), stopping queue processing`);
-      globalProcessingState.reset();
-      return;
-    }
-
-    // Prevent multiple concurrent calls using global state
-    if (globalProcessingState.isProcessing) {
-      // Check if the item in global state still exists in queue
-      const itemStillExists = queue.some(item => item.id === globalProcessingState.currentItemId);
-      if (!itemStillExists) {
-        addDebugLog(`⚠️ [${callTimestamp}] Global state references non-existent item ${globalProcessingState.currentItemId}, resetting`);
-        globalProcessingState.reset();
-      } else {
-        addDebugLog(`⚠️ [${callTimestamp}] Global processing already active for ${globalProcessingState.currentItemId}, skipping`);
-        return;
-      }
-    }
-    
-    // Prevent multiple concurrent calls to processNextQueueItem
-    if (processingItemRef.current !== null) {
-      addDebugLog(`⚠️ [${callTimestamp}] Already processing item ${processingItemRef.current}, skipping processNextQueueItem call`);
-      return;
-    }
-
-    // Find next queued item by priority (highest priority first)
-    addDebugLog(`🔍 [${callTimestamp}] Finding next queued item from ${queue.length} total items...`);
-    const queuedItems = queue.filter(item => item.status === 'queued');
-    addDebugLog(`🔍 [${callTimestamp}] Found ${queuedItems.length} items with status 'queued'`);
-    queuedItems.forEach((item, index) => {
-      addDebugLog(`🔍 [${callTimestamp}] Queued item ${index + 1}: ID=${item.id}, priority=${item.priority}, prompt="${item.config.prompt.slice(0, 30)}..."`);
-    });
-    
-    const nextItem = queuedItems.sort((a, b) => b.priority - a.priority)[0];
-    if (!nextItem) {
-      addDebugLog(`✅ [${callTimestamp}] Queue processing complete - no pending items`, 'success');
-      setIsProcessing(false);
-      isProcessingRef.current = false;
-      setCurrentProcessingItem(null);
-      processingItemRef.current = null;
-      processingLockRef.current = null;
-      processingLockRef.current = null; // Clear processing lock
-      return;
-    }
-
-    addDebugLog(`🎯 [${callTimestamp}] Selected next item: ID=${nextItem.id}, priority=${nextItem.priority}, status=${nextItem.status}`);
-
-    // Double-check this item hasn't been processed already
-    if (nextItem.status !== 'queued') {
-      addDebugLog(`⚠️ [${callTimestamp}] Item ${nextItem.id} status is ${nextItem.status}, not 'queued' - skipping`);
-      return;
-    }
-    
-    // Set processing lock after validation
-    processingItemRef.current = nextItem.id;
-    processingLockRef.current = nextItem.id;
-    globalProcessingState.isProcessing = true;
-    globalProcessingState.currentItemId = nextItem.id;
-
-    // Prevent concurrent processing of the same item
-    if (currentProcessingItem === nextItem.id) {
-      addDebugLog(`⚠️ [${callTimestamp}] Item ${nextItem.id} already being processed (currentProcessingItem match), skipping`);
-      return;
-    }
-
-    // Additional safety check: verify item is still in queued state in the store
-    const freshQueueItem = queue.find(item => item.id === nextItem.id);
-    if (!freshQueueItem || freshQueueItem.status !== 'queued') {
-      addDebugLog(`⚠️ [${callTimestamp}] Item ${nextItem.id} no longer in queued state (${freshQueueItem?.status || 'not found'}), skipping`);
-      setTimeout(() => processNextQueueItem(), 100);
-      return;
-    }
-
-    addDebugLog(`✅ [${callTimestamp}] All checks passed for item ${nextItem.id}, proceeding with processing...`);
-    addDebugLog(`🚀 [${callTimestamp}] About to set processing states and call enhancedAiPipelineService...`);
-
-    addDebugLog(`📝 Found next item: ${nextItem.config.prompt.slice(0, 50)}... (ID: ${nextItem.id})`);
-    addDebugLog(`📝 Setting currentProcessingItem to: ${nextItem.id}`);
-    setCurrentProcessingItem(nextItem.id);
-    
-    // Update item status to processing
-    addDebugLog(`📝 Updating item status to 'processing'...`);
-    updateQueueItem(nextItem.id, {
-      status: 'processing',
-      startedAt: new Date(),
-      progress: 0
-    });
-    addDebugLog(`📝 Item status updated to processing`);
-
-    // Create abort controller for this processing session
-    abortControllerRef.current = new AbortController();
-
-    try {
-      const processTimestamp = new Date().toISOString();
-      addDebugLog(`🚀 [${processTimestamp}] ===== STARTING AI PIPELINE =====`);
-      addDebugLog(`🚀 [${processTimestamp}] Processing item: ID=${nextItem.id}, prompt="${nextItem.config.prompt.slice(0, 50)}..."`);
-      addDebugLog(`🔧 [${processTimestamp}] Using ${settings.modelConfigs?.filter(c => c.enabled)?.length || 0} enabled model configs`);
-      
-      // Log model config details
-      const enabledConfigs = settings.modelConfigs?.filter(c => c.enabled) || [];
-      enabledConfigs.forEach((config, index) => {
-        addDebugLog(`🔧 [${processTimestamp}] Config ${index + 1}: step="${config.step}" -> nodeId="${config.nodeId}" (model="${config.model}")`);
-      });
-      
-      addDebugLog(`🚀 [${processTimestamp}] ===== CALLING sequentialAiPipelineService.processQueueItem =====`);
-      addDebugLog(`🚀 [${processTimestamp}] Parameters:`);
-      addDebugLog(`🚀 [${processTimestamp}] - nextItem.id: ${nextItem.id}`);
-      addDebugLog(`🚀 [${processTimestamp}] - nextItem.config: ${JSON.stringify(nextItem.config)}`);
-      addDebugLog(`🚀 [${processTimestamp}] - modelConfigs count: ${settings.modelConfigs!.length}`);
-      addDebugLog(`🚀 [${processTimestamp}] - About to await sequentialAiPipelineService.processQueueItem()...`);
-      
-      const story = await sequentialAiPipelineService.processQueueItem(
-        nextItem,
-        settings.modelConfigs!,
-        (progress: any) => {
-          const progressTimestamp = new Date().toISOString();
-          
-          debugService.info('queue', `📈 Step: ${progress.currentStepName || progress.currentStep} (${progress.overallProgress}%)`, {
-            stepId: progress.currentStep,
-            stepName: progress.currentStepName,
-            stepProgress: progress.stepProgress,
-            overallProgress: progress.overallProgress,
-            assignedNode: progress.assignedNode,
-            currentModel: progress.currentModel,
-            status: progress.status
-          });
-          
-          updateQueueItem(nextItem.id, {
-            progress: progress.overallProgress || 0,
-            currentStep: progress.currentStepName || progress.currentStep || 'Unknown',
-            logs: progress.logs || []
-          });
-        }
-      );
-      
-      const returnTimestamp = new Date().toISOString();
-      addDebugLog(`🚀 [${returnTimestamp}] ===== sequentialAiPipelineService.processQueueItem RETURNED! =====`);
-      addDebugLog(`🚀 [${returnTimestamp}] Returned story object: ${story ? 'EXISTS' : 'NULL'}`);
-      if (story) {
-        addDebugLog(`🚀 [${returnTimestamp}] Story object keys: ${Object.keys(story).join(', ')}`);
-        addDebugLog(`🚀 [${returnTimestamp}] Story title: "${story.title || 'NO TITLE'}"`);
-        addDebugLog(`🚀 [${returnTimestamp}] Story ID: "${story.id || 'NO ID'}"`);
-        addDebugLog(`🚀 [${returnTimestamp}] Story status: "${story.status || 'NO STATUS'}"`);
-        addDebugLog(`🚀 [${returnTimestamp}] Story content length: ${story.content?.length || 0} chars`);
-        addDebugLog(`🚀 [${returnTimestamp}] Story shots count: ${story.shots?.length || 0}`);
-      } else {
-        // Story is null, mark as failed
-        throw new Error('Story processing returned null');
-      }
-      
-      // Log ComfyUI prompt generation results
-      if (story?.shots && story.shots.length > 0) {
-        const shotsWithPrompts = story.shots.filter(s => s.comfyUIPositivePrompt);
-        addDebugLog(`🎨 Shots with ComfyUI prompts: ${shotsWithPrompts.length}/${story.shots.length}`);
-        if (shotsWithPrompts.length > 0) {
-          addDebugLog(`🎨 Sample positive prompt: ${shotsWithPrompts[0].comfyUIPositivePrompt?.slice(0, 100)}...`);
-        } else {
-          addDebugLog(`⚠️ No ComfyUI prompts generated - using fallback`, 'error');
-        }
-      }
-    
-
-      addDebugLog(`✅ Pipeline completed successfully: ${story.title}`, 'success');
-      
-      // Save story FIRST before marking queue item as completed
-      // This ensures the story is available when the user views it
-
-      // Convert enhanced story to basic story for store
-      const basicStory: Story = {
-        id: story.id,
-        title: story.title,
-        content: story.content,
-        genre: story.genre,
-        shots: story.shots?.map(shot => ({
-          id: shot.id,
-          storyId: story.id,
-          shotNumber: shot.shotNumber,
-          description: shot.description,
-          duration: shot.duration,
-          frames: Math.floor(shot.duration * 24),
-          camera: shot.cameraMovement || 'medium shot',
-          visualPrompt: shot.visualPrompt,
-          comfyUIPositivePrompt: shot.comfyUIPositivePrompt,
-          comfyUINegativePrompt: shot.comfyUINegativePrompt,
-          narration: shot.narration,
-          musicCue: shot.musicCue,
-          renderStatus: shot.renderStatus as 'pending' | 'rendering' | 'completed' || 'pending'
-        })) || [],
-        characters: story.characters?.map(char => ({
-          name: char.name,
-          role: char.role === 'protagonist' ? 'main' : 'supporting',
-          physical_description: char.physical_description,
-          age_range: char.age_range,
-          importance_level: char.importance_level
-        })) || [],
-        status: 'completed',
-        createdAt: story.createdAt,
-        updatedAt: story.updatedAt
-      };
-      
-      // Save the story to the store
-      addStory(basicStory);
-      addDebugLog(`💾 Story saved: ${story.title} (ID: ${story.id})`, 'success');
-      
-      // NOW mark the queue item as completed with the story ID
-      updateQueueItem(nextItem.id, {
-        status: 'completed',
-        completedAt: new Date(),
-        progress: 100,
-        storyId: story.id
-      });
-      addDebugLog(`✅ Queue item marked as completed with storyId: ${story.id}`, 'success');
-      
-      // Log what was saved
-      const savedShotsWithPrompts = basicStory.shots.filter(s => s.comfyUIPositivePrompt);
-      addDebugLog(`💾 Saved ${savedShotsWithPrompts.length} shots with ComfyUI prompts`, 'success');
-
-    } catch (error: any) {
-      addDebugLog(`❌ Processing failed: ${error.message}`, 'error');
-      addDebugLog(`❌ Error stack: ${error.stack}`, 'error');
-      console.error('❌ Processing failed:', error);
-      console.error('❌ Error stack:', error.stack);
-      
-      // Mark as failed (NOT back to queued to prevent infinite loop)
-      updateQueueItem(nextItem.id, {
-        status: 'failed',
-        error: error.message,
-        completedAt: new Date()
-      });
-
-      // Add to processing errors
-      setProcessingErrors(prev => [...prev, `Failed to process "${nextItem.config.prompt.slice(0, 30)}...": ${error.message}`]);
-    } finally {
-      addDebugLog(`🔄 processNextQueueItem finally block: clearing currentProcessingItem`);
-      setCurrentProcessingItem(null);
-      processingItemRef.current = null;
-      processingLockRef.current = null;
-      globalProcessingState.reset();
-      
-      // Clear abort controller
-      if (abortControllerRef.current) {
-        abortControllerRef.current = null;
-      }
-      
-      // Stop processing - don't automatically continue
-      if (!isProcessingRef.current) {
-        addDebugLog('🏁 Processing stopped by user', 'info');
-        setIsProcessing(false);
-        isProcessingRef.current = false;
-      }
-    }
-  }, [queue, updateQueueItem, settings.modelConfigs, addStory, setProcessingErrors, setCurrentProcessingItem, setIsProcessing, addDebugLog, currentProcessingItem]);
-
-  const handleOpenStory = (item: any) => {
-    if (onOpenStory && item.storyId) {
-      onOpenStory(item.storyId, item.id);
-    }
-  };
-
   const handleToggleProcessing = useCallback(async () => {
-    const newState = !isProcessing;
-    addDebugLog(`🎛️ Toggle processing: ${isProcessing} -> ${newState}`);
+    const isCurrentlyProcessing = processingStatus.isProcessing;
+    addDebugLog(`🎛️ Toggle processing: ${isCurrentlyProcessing} -> ${!isCurrentlyProcessing}`);
     
-    if (newState) {
-      // Clear any stuck global state before starting
-      if (globalProcessingState.isProcessing) {
-        addDebugLog(`⚠️ Clearing stuck global state for item: ${globalProcessingState.currentItemId}`);
-        globalProcessingState.reset();
-      }
-      
-      // Start processing directly
+    if (!isCurrentlyProcessing) {
+      // Start processing
       try {
-        addDebugLog('📋 Validating processing setup...', 'info');
-        await validateProcessingSetup();
-        addDebugLog('✅ Starting queue processing...', 'success');
+        addDebugLog('🚀 Starting queue processing...', 'success');
         
-        setIsProcessing(true);
-        isProcessingRef.current = true;  // Update ref immediately
-        setProcessingErrors([]);
+        // Clear any previous errors
+        queueProcessor.clearErrors();
         
-        // Start processing the first item - need to wait for state update
-        setTimeout(() => {
-          addDebugLog('🚀 Calling processNextQueueItem after state update');
-          processNextQueueItem();
-        }, 100);
+        await queueProcessor.startProcessing(
+          queue,
+          settings.modelConfigs || [],
+          updateQueueItem,
+          addStory
+        );
         
       } catch (error: any) {
         addDebugLog(`❌ Failed to start processing: ${error.message}`, 'error');
-        setProcessingErrors([error.message]);
-        setIsProcessing(false);
-        isProcessingRef.current = false;
       }
     } else {
       // Stop processing
       addDebugLog('🛑 Stopping queue processing');
-      
-      // Call pipeline stop to abort any running AI processes
-      sequentialAiPipelineService.stopAllProcessing();
-      
-      setIsProcessing(false);
-      isProcessingRef.current = false;  // Update ref immediately
-      setCurrentProcessingItem(null);
-      processingItemRef.current = null;
-      processingLockRef.current = null;
-      globalProcessingState.reset();
-      
-      // Abort current controller if exists
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
-        abortControllerRef.current = null;
-      }
+      queueProcessor.stopProcessing();
       
       // Re-queue any processing items for retry
       const processingItems = queue.filter(item => item.status === 'processing');
@@ -565,7 +172,16 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
         });
       }
     }
-  }, [isProcessing, addDebugLog, queue, updateQueueItem, reQueueItem, validateProcessingSetup, processNextQueueItem]);
+  }, [processingStatus.isProcessing, queue, settings.modelConfigs, updateQueueItem, addStory, reQueueItem, addDebugLog]);
+
+  const handleOpenStory = (item: any) => {
+    if (onOpenStory) {
+      // During generation, the story ID is the same as the queue item ID
+      // After completion, item.storyId contains the final story ID
+      const storyId = item.storyId || item.id;
+      onOpenStory(storyId, item.id);
+    }
+  };
 
   const handleCancelItem = (id: string) => {
     // Cancel a specific item
@@ -575,13 +191,15 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
   const getStepDisplayName = (step: string): string => {
     const stepNames: Record<string, string> = {
       'story': '📝 Writing Story',
+      'segments': '📑 Segmenting Story',
       'shots': '🎬 Creating Shots',
       'characters': '👥 Analyzing Characters',
       'prompts': '🎨 Generating Prompts',
       'comfyui_prompts': '🖼️ ComfyUI Prompts',
       'narration': '🎙️ Adding Narration',
       'music': '🎵 Adding Music',
-      'completed': '✅ Finalizing'
+      'completed': '✅ Finalizing',
+      'processing': '⏳ Processing...'
     };
     return stepNames[step] || step;
   };
@@ -623,57 +241,35 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
 
   // Auto-start only for high-priority items (from Generate button)
   useEffect(() => {
-    // Only check for high-priority items that are actually queued (not completed/failed)
     const highPriorityQueuedItems = queue.filter(item => 
       item.status === 'queued' && 
       item.priority >= 10
     );
     
-    // More robust check to prevent duplicate processing using global state
-    const isAlreadyBusy = isProcessing || currentProcessingItem || isProcessingRef.current || processingItemRef.current || processingLockRef.current || globalProcessingState.isProcessing;
-    
-    // Only auto-start if we have genuinely new high-priority items and we're definitely not processing
-    if (highPriorityQueuedItems.length > 0 && !isAlreadyBusy && settings.processingEnabled) {
-      debugService.info('queue', `🚀 High-priority queued items detected! Auto-starting processing for ${highPriorityQueuedItems.length} items`, {
-        highPriorityItems: highPriorityQueuedItems.length,
-        isProcessing,
-        currentProcessingItem,
-        isProcessingRef: isProcessingRef.current,
-        processingItemRef: processingItemRef.current
-      });
+    // Only auto-start if we have genuinely new high-priority items and we're not processing
+    if (highPriorityQueuedItems.length > 0 && !processingStatus.isProcessing && settings.processingEnabled) {
+      debugService.info('queue', `🚀 High-priority queued items detected! Auto-starting processing for ${highPriorityQueuedItems.length} items`);
       
       // Start processing immediately for high-priority items
       const startImmediateProcessing = async () => {
         try {
-          // Double-check we're not already processing before starting
-          if (isProcessingRef.current || processingItemRef.current) {
-            addDebugLog('⚠️ Already processing, skipping auto-start', 'info');
-            return;
-          }
+          addDebugLog('🚀 Starting immediate processing for high-priority items...', 'success');
           
-          addDebugLog('📋 Validating setup for immediate processing...', 'info');
-          await validateProcessingSetup();
-          addDebugLog('✅ Starting immediate processing...', 'success');
-          
-          setIsProcessing(true);
-          isProcessingRef.current = true;  // Update ref immediately
-          setProcessingErrors([]);
-          
-          // Call processNextQueueItem directly
-          addDebugLog('🚀 Starting processNextQueueItem for high-priority item');
-          processNextQueueItem();
+          await queueProcessor.startProcessing(
+            queue,
+            settings.modelConfigs || [],
+            updateQueueItem,
+            addStory
+          );
           
         } catch (error: any) {
           addDebugLog(`❌ Failed to start immediate processing: ${error.message}`, 'error');
-          setProcessingErrors([error.message]);
-          setIsProcessing(false);
-          isProcessingRef.current = false;
         }
       };
       
       startImmediateProcessing();
     }
-  }, [queue, isProcessing, currentProcessingItem, validateProcessingSetup, processNextQueueItem, addDebugLog, settings.processingEnabled]);
+  }, [queue, processingStatus.isProcessing, updateQueueItem, addStory, addDebugLog, settings.processingEnabled, settings.modelConfigs]);
 
   // Manual queue processing only starts when user clicks "Start Processing" button
 
@@ -712,11 +308,11 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
           </Button>
           <Button
             variant="contained"
-            startIcon={isProcessing ? <Pause /> : <PlayArrow />}
+            startIcon={processingStatus.isProcessing ? <Pause /> : <PlayArrow />}
             onClick={handleToggleProcessing}
-            color={isProcessing ? 'error' : 'primary'}
+            color={processingStatus.isProcessing ? 'error' : 'primary'}
           >
-            {isProcessing ? 'Stop Processing' : 'Start Processing'}
+            {processingStatus.isProcessing ? 'Stop Processing' : 'Start Processing'}
           </Button>
         </Box>
       </Box>
@@ -921,10 +517,10 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
                 Processing Settings
               </Typography>
               <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                <Alert severity={isProcessing ? 'success' : 'info'}>
-                  Queue processing is {isProcessing ? 'active' : 'paused'}
-                  {currentProcessingItem && (() => {
-                    const item = queue.find(q => q.id === currentProcessingItem);
+                <Alert severity={processingStatus.isProcessing ? 'success' : 'info'}>
+                  Queue processing is {processingStatus.isProcessing ? 'active' : 'paused'}
+                  {processingStatus.currentItemId && (() => {
+                    const item = queue.find(q => q.id === processingStatus.currentItemId);
                     return item ? (
                       <>
                         <br />
@@ -954,22 +550,20 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
                     console.log('🔍 DEBUG STATE DUMP:');
                     console.log('📊 Queue:', queue);
                     console.log('📊 Settings:', settings);
-                    console.log('📊 isProcessing:', isProcessing);
-                    console.log('📊 currentProcessingItem:', currentProcessingItem);
-                    console.log('📊 processingErrors:', processingErrors);
+                    console.log('📊 Processing Status:', processingStatus);
                     console.log('📊 Available nodes:', nodeDiscoveryService.getNodes());
                     
                     // Show a brief alert
-                    alert(`Debug info logged to console:\n- Queue items: ${queue.length}\n- Processing: ${isProcessing}\n- Current item: ${currentProcessingItem || 'none'}\n- Nodes: ${nodeDiscoveryService.getNodes().length}`);
+                    alert(`Debug info logged to console:\n- Queue items: ${queue.length}\n- Processing: ${processingStatus.isProcessing}\n- Current item: ${processingStatus.currentItemId || 'none'}\n- Errors: ${processingStatus.errors.length}\n- Nodes: ${nodeDiscoveryService.getNodes().length}`);
                   }}
                 >
                   🐛 Debug State
                 </Button>
                 
-                {processingErrors.length > 0 && (
+                {processingStatus.errors.length > 0 && (
                   <Alert severity="error" sx={{ mb: 1 }}>
                     <Typography variant="body2" fontWeight="bold">Processing Errors:</Typography>
-                    {processingErrors.map((error, index) => (
+                    {processingStatus.errors.map((error, index) => (
                       <Typography key={index} variant="body2" component="div">
                         • {error}
                       </Typography>

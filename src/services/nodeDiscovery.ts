@@ -73,22 +73,22 @@ class NodeDiscoveryService {
     }
 
     // Try common IP ranges (works if no CORS restrictions)
+    // Scan the FULL range 1-254 for each common network prefix
     const networkRanges = [
-      '192.168.1.',
       '192.168.0.',
+      '192.168.1.',
+      '192.168.2.',
       '10.0.0.',
       '10.0.1.',
+      '10.1.0.',
+      '172.16.0.',
     ];
-    
+
     for (const range of networkRanges) {
-      // Check a broader range to find remote nodes
-      for (let i = 1; i <= 30; i++) {
+      // Scan FULL IP range 1-254 to find all Ollama nodes
+      for (let i = 1; i <= 254; i++) {
         promises.push(this.checkNode(`${range}${i}`, 11434));
       }
-      // Also check common higher IPs including the .160+ range where your remote is
-      [100, 101, 150, 160, 161, 162, 163, 164, 165, 200, 254].forEach(i => {
-        promises.push(this.checkNode(`${range}${i}`, 11434));
-      });
     }
 
     // Process in larger batches for faster scanning
@@ -219,12 +219,12 @@ class NodeDiscoveryService {
 
   private async checkNode(host: string, port: number): Promise<OllamaNode | null> {
     const id = `${host}:${port}`;
-    
+
     try {
       // Fast connection check with shorter timeout (like Python version)
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 1000); // Reduced to 1s like Python
-      
+      const timeoutId = setTimeout(() => controller.abort(), 2000); // 2s timeout for network latency
+
       const response = await fetch(`http://${host}:${port}/api/tags`, {
         method: 'GET',
         signal: controller.signal,
@@ -240,9 +240,9 @@ class NodeDiscoveryService {
       if (response.ok) {
         const data = await response.json();
         const models = data.models?.map((m: any) => m.name) || [];
-        
+
         console.log(`✅ Found Ollama at ${host}:${port} with ${models.length} models:`, models);
-        
+
         return {
           id,
           name: this.generateNodeName(host, port),
@@ -261,9 +261,21 @@ class NodeDiscoveryService {
     } catch (error: any) {
       // More detailed error logging to debug connection issues
       if (error.name === 'AbortError') {
-        console.log(`⏰ ${host}:${port} timeout (>1s)`);
+        // Only log timeouts for local network IPs (to reduce noise)
+        if (host.startsWith('192.168.') || host.startsWith('10.0.')) {
+          // Silent - too many timeout logs during scan
+        }
       } else if (error.message?.includes('Failed to fetch')) {
-        console.log(`🔒 ${host}:${port} connection blocked (CORS/network)`);
+        // CORS or network block - this is the most common issue for remote Ollama
+        // Log prominently for debugging
+        if (host.startsWith('192.168.') || host.startsWith('10.0.')) {
+          console.warn(`🔒 CORS/Network blocked: ${host}:${port} - Ollama may need OLLAMA_ORIGINS=* env var`);
+        }
+      } else if (error.message?.includes('NetworkError') || error.message?.includes('network')) {
+        // Network-level failure
+        if (host.startsWith('192.168.') || host.startsWith('10.0.')) {
+          console.warn(`🌐 Network error for ${host}:${port}: ${error.message}`);
+        }
       } else {
         console.log(`🚫 ${host}:${port} error: ${error.message}`);
       }
@@ -588,6 +600,140 @@ class NodeDiscoveryService {
 
   getNode(nodeId: string): OllamaNode | undefined {
     return this.nodes.get(nodeId);
+  }
+
+  /**
+   * Node Health Monitoring
+   * Periodically checks the health of all configured nodes
+   */
+  private healthCheckInterval: ReturnType<typeof setInterval> | null = null;
+  private healthCheckCallbacks: Set<(nodes: OllamaNode[]) => void> = new Set();
+
+  /**
+   * Start periodic health monitoring of all nodes
+   * @param intervalMs - Check interval in milliseconds (default: 30 seconds)
+   */
+  startHealthMonitoring(intervalMs: number = 30000): void {
+    if (this.healthCheckInterval) {
+      console.log('⚠️ Health monitoring already running');
+      return;
+    }
+
+    console.log(`🏥 Starting node health monitoring (interval: ${intervalMs / 1000}s)`);
+
+    // Run immediately
+    this.performHealthCheck();
+
+    // Then run periodically
+    this.healthCheckInterval = setInterval(() => {
+      this.performHealthCheck();
+    }, intervalMs);
+  }
+
+  /**
+   * Stop health monitoring
+   */
+  stopHealthMonitoring(): void {
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+      console.log('🛑 Stopped node health monitoring');
+    }
+  }
+
+  /**
+   * Check if health monitoring is active
+   */
+  isHealthMonitoringActive(): boolean {
+    return this.healthCheckInterval !== null;
+  }
+
+  /**
+   * Subscribe to health check updates
+   * @returns Unsubscribe function
+   */
+  onHealthUpdate(callback: (nodes: OllamaNode[]) => void): () => void {
+    this.healthCheckCallbacks.add(callback);
+    return () => {
+      this.healthCheckCallbacks.delete(callback);
+    };
+  }
+
+  /**
+   * Perform health check on all local Ollama nodes
+   */
+  private async performHealthCheck(): Promise<void> {
+    const localNodes = Array.from(this.nodes.values()).filter(
+      node => node.category === 'local' && node.type === 'ollama'
+    );
+
+    if (localNodes.length === 0) {
+      return;
+    }
+
+    console.log(`🏥 Health check: checking ${localNodes.length} local nodes...`);
+
+    const statusChanges: { nodeId: string; oldStatus: string; newStatus: string }[] = [];
+
+    for (const node of localNodes) {
+      const oldStatus = node.status;
+
+      try {
+        const refreshed = await this.refreshNode(node.id);
+        if (refreshed && refreshed.status !== oldStatus) {
+          statusChanges.push({
+            nodeId: node.id,
+            oldStatus,
+            newStatus: refreshed.status
+          });
+        }
+      } catch (error) {
+        console.warn(`❌ Health check failed for ${node.name}:`, error);
+      }
+    }
+
+    // Log status changes
+    if (statusChanges.length > 0) {
+      console.log('🔄 Node status changes detected:');
+      statusChanges.forEach(change => {
+        const icon = change.newStatus === 'online' ? '✅' : '❌';
+        console.log(`   ${icon} ${change.nodeId}: ${change.oldStatus} → ${change.newStatus}`);
+      });
+    }
+
+    // Notify subscribers
+    const updatedNodes = this.getNodes();
+    this.healthCheckCallbacks.forEach(callback => {
+      try {
+        callback(updatedNodes);
+      } catch (error) {
+        console.error('Error in health check callback:', error);
+      }
+    });
+  }
+
+  /**
+   * Get online nodes only
+   */
+  getOnlineNodes(): OllamaNode[] {
+    return Array.from(this.nodes.values()).filter(node => node.status === 'online');
+  }
+
+  /**
+   * Get offline nodes only
+   */
+  getOfflineNodes(): OllamaNode[] {
+    return Array.from(this.nodes.values()).filter(node => node.status === 'offline');
+  }
+
+  /**
+   * Get nodes that were last checked more than X milliseconds ago
+   */
+  getStaleNodes(maxAgeMs: number = 60000): OllamaNode[] {
+    const now = Date.now();
+    return Array.from(this.nodes.values()).filter(
+      node => now - node.lastChecked.getTime() > maxAgeMs
+    );
   }
 
 }

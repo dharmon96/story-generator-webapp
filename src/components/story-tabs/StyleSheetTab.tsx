@@ -19,6 +19,9 @@ import {
   IconButton,
   Paper,
   Alert,
+  Skeleton,
+  Tooltip,
+  alpha,
 } from '@mui/material';
 import {
   ExpandMore,
@@ -29,6 +32,7 @@ import {
   Cancel,
   ContentCopy,
   Refresh,
+  HourglassEmpty,
 } from '@mui/icons-material';
 import { EnhancedCharacter, Location } from '../../types/storyTypes';
 
@@ -55,6 +59,89 @@ const StyleSheetTab: React.FC<StyleSheetTabProps> = ({
   const [locationEdits, setLocationEdits] = useState<Partial<Location>>({});
   const [expandedCharacter, setExpandedCharacter] = useState<string | false>(false);
   const [expandedLocation, setExpandedLocation] = useState<string | false>(false);
+  const [copiedPrompt, setCopiedPrompt] = useState<string | null>(null);
+
+  // Prompt display component with pending state
+  const PromptDisplay: React.FC<{
+    label: string;
+    prompt: string | undefined;
+    entityId: string;
+    onCopy: (text: string, id: string) => void;
+  }> = ({ label, prompt, entityId, onCopy }) => {
+    const isPending = !prompt;
+
+    return (
+      <Paper
+        variant="outlined"
+        sx={{
+          p: 2,
+          mt: 2,
+          bgcolor: theme => isPending
+            ? alpha(theme.palette.action.disabled, 0.05)
+            : theme.palette.mode === 'dark'
+              ? 'grey.900'
+              : 'grey.50',
+          border: '1px solid',
+          borderColor: theme => isPending
+            ? theme.palette.divider
+            : theme.palette.mode === 'dark'
+              ? 'grey.700'
+              : 'grey.300',
+          borderStyle: isPending ? 'dashed' : 'solid',
+        }}
+      >
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
+          <Typography
+            variant="subtitle2"
+            sx={{
+              color: isPending ? 'text.disabled' : 'text.primary',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 0.5,
+            }}
+          >
+            {label}
+            {isPending && (
+              <Chip
+                size="small"
+                icon={<HourglassEmpty sx={{ fontSize: '0.9rem' }} />}
+                label="Pending"
+                sx={{
+                  ml: 1,
+                  height: 20,
+                  fontSize: '0.65rem',
+                  backgroundColor: theme => alpha(theme.palette.warning.main, 0.1),
+                  color: 'warning.main',
+                  '& .MuiChip-icon': { color: 'warning.main' },
+                }}
+              />
+            )}
+          </Typography>
+          {!isPending && (
+            <Tooltip title={copiedPrompt === entityId ? 'Copied!' : 'Copy prompt'}>
+              <IconButton
+                size="small"
+                onClick={() => onCopy(prompt!, entityId)}
+              >
+                <ContentCopy fontSize="small" />
+              </IconButton>
+            </Tooltip>
+          )}
+        </Box>
+        {isPending ? (
+          <Box>
+            <Skeleton variant="text" width="90%" />
+            <Skeleton variant="text" width="75%" />
+            <Skeleton variant="text" width="60%" />
+          </Box>
+        ) : (
+          <Typography variant="body2" sx={{ fontFamily: 'monospace' }}>
+            {prompt}
+          </Typography>
+        )}
+      </Paper>
+    );
+  };
 
   const handleCharacterEdit = (character: EnhancedCharacter) => {
     setEditingCharacter(character.id);
@@ -90,8 +177,12 @@ const StyleSheetTab: React.FC<StyleSheetTabProps> = ({
     setLocationEdits({});
   };
 
-  const copyToClipboard = (text: string) => {
+  const copyToClipboard = (text: string, entityId?: string) => {
     navigator.clipboard.writeText(text);
+    if (entityId) {
+      setCopiedPrompt(entityId);
+      setTimeout(() => setCopiedPrompt(null), 2000);
+    }
   };
 
   const getRoleColor = (role: string) => {
@@ -340,32 +431,23 @@ const StyleSheetTab: React.FC<StyleSheetTabProps> = ({
                             )}
                           </List>
                           
-                          <Paper variant="outlined" sx={{ p: 2, mt: 2, bgcolor: theme => theme.palette.mode === 'dark' ? 'grey.900' : 'grey.50', border: '1px solid', borderColor: theme => theme.palette.mode === 'dark' ? 'grey.700' : 'grey.300' }}>
-                            <Typography variant="subtitle2" gutterBottom>
-                              Visual Prompt for AI Generation
-                            </Typography>
-                            <Typography variant="body2" sx={{ fontFamily: 'monospace', mb: 1 }}>
-                              {character.visualPrompt}
-                            </Typography>
-                            <Box sx={{ display: 'flex', gap: 1 }}>
+                          <PromptDisplay
+                            label="Visual Prompt for AI Generation"
+                            prompt={character.visualPrompt}
+                            entityId={`char-${character.id}`}
+                            onCopy={copyToClipboard}
+                          />
+                          {onUpdateCharacter && character.visualPrompt && (
+                            <Box sx={{ display: 'flex', gap: 1, mt: 1, justifyContent: 'flex-end' }}>
                               <IconButton
                                 size="small"
-                                onClick={() => copyToClipboard(character.visualPrompt)}
-                                title="Copy prompt"
+                                onClick={() => handleCharacterEdit(character)}
+                                title="Edit character"
                               >
-                                <ContentCopy fontSize="small" />
+                                <Edit fontSize="small" />
                               </IconButton>
-                              {onUpdateCharacter && (
-                                <IconButton
-                                  size="small"
-                                  onClick={() => handleCharacterEdit(character)}
-                                  title="Edit character"
-                                >
-                                  <Edit fontSize="small" />
-                                </IconButton>
-                              )}
                             </Box>
-                          </Paper>
+                          )}
                         </Box>
                       )}
                     </AccordionDetails>
@@ -518,32 +600,23 @@ const StyleSheetTab: React.FC<StyleSheetTabProps> = ({
                             </Box>
                           )}
                           
-                          <Paper variant="outlined" sx={{ p: 2, mt: 2, bgcolor: theme => theme.palette.mode === 'dark' ? 'grey.900' : 'grey.50', border: '1px solid', borderColor: theme => theme.palette.mode === 'dark' ? 'grey.700' : 'grey.300' }}>
-                            <Typography variant="subtitle2" gutterBottom>
-                              Visual Prompt for AI Generation
-                            </Typography>
-                            <Typography variant="body2" sx={{ fontFamily: 'monospace', mb: 1 }}>
-                              {location.visualPrompt}
-                            </Typography>
-                            <Box sx={{ display: 'flex', gap: 1 }}>
+                          <PromptDisplay
+                            label="Visual Prompt for AI Generation"
+                            prompt={location.visualPrompt}
+                            entityId={`loc-${location.id}`}
+                            onCopy={copyToClipboard}
+                          />
+                          {onUpdateLocation && location.visualPrompt && (
+                            <Box sx={{ display: 'flex', gap: 1, mt: 1, justifyContent: 'flex-end' }}>
                               <IconButton
                                 size="small"
-                                onClick={() => copyToClipboard(location.visualPrompt)}
-                                title="Copy prompt"
+                                onClick={() => handleLocationEdit(location)}
+                                title="Edit location"
                               >
-                                <ContentCopy fontSize="small" />
+                                <Edit fontSize="small" />
                               </IconButton>
-                              {onUpdateLocation && (
-                                <IconButton
-                                  size="small"
-                                  onClick={() => handleLocationEdit(location)}
-                                  title="Edit location"
-                                >
-                                  <Edit fontSize="small" />
-                                </IconButton>
-                              )}
                             </Box>
-                          </Paper>
+                          )}
                         </Box>
                       )}
                     </AccordionDetails>

@@ -59,10 +59,36 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
   const [currentTab, setCurrentTab] = useState(0);
   const [storyData, setStoryData] = useState<EnhancedStory | null>(null);
   const [aiLogs, setAiLogs] = useState<AILogEntry[]>([]);
+  // Removed updateCounter - using promptSignature instead for reactivity
 
   // Find queue item and story data
   const queueItem = queueItemId ? queue.find(item => item.id === queueItemId) : null;
-  const story = stories.find(story => story.id === storyId);
+  // During generation, story ID equals queue item ID
+  // Try both storyId and queueItemId to find the story
+  const story = stories.find(story => story.id === storyId) ||
+                (queueItemId ? stories.find(story => story.id === queueItemId) : null);
+
+  // Calculate prompts count for reactivity detection
+  const shotsWithPrompts = story?.shots?.filter(s => s.comfyUIPositivePrompt)?.length || 0;
+  const promptSignature = story?.shots?.map(s => s.comfyUIPositivePrompt ? '1' : '0').join('') || '';
+  // Also track character and location prompts for reactivity
+  const characterPromptSignature = story?.characters?.map(c => c.visualPrompt ? '1' : '0').join('') || '';
+  const locationPromptSignature = story?.locations?.map(l => l.visualPrompt ? '1' : '0').join('') || '';
+
+  // Debug logging for story lookup - check for prompt updates
+  console.log('🔍 [StoryDetail] Looking up story:', {
+    storyId,
+    queueItemId,
+    foundStory: !!story,
+    storyTitle: story?.title,
+    storyContentLength: story?.content?.length || 0,
+    storyShotsCount: story?.shots?.length || 0,
+    shotsWithPositivePrompts: shotsWithPrompts,
+    promptSignature,
+    firstShotHasPrompt: !!story?.shots?.[0]?.comfyUIPositivePrompt,
+    storyUpdatedAt: story?.updatedAt,
+    totalStoriesInStore: stories.length
+  });
 
   const handleTabChange = (event: React.SyntheticEvent, newValue: number) => {
     setCurrentTab(newValue);
@@ -168,24 +194,40 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
           renderUrl: shot.renderUrl || undefined,
           createdAt: new Date(),
         })) : [],
-        characters: Array.isArray(story.characters) ? story.characters.map((char, index) => ({
-          id: `char_${char?.name || 'unknown'}_${index}`,
+        characters: Array.isArray(story.characters) ? story.characters.map((char: any, index) => ({
+          id: char?.id || `char_${char?.name || 'unknown'}_${index}`,
           name: char?.name || 'Unknown Character',
-          role: char?.role === 'main' ? 'protagonist' : 'supporting' as const,
-          physicalDescription: char?.physical_description || '',
-          age: char?.age_range || 'adult',
-          gender: 'unspecified',
-          clothing: '',
-          distinctiveFeatures: [],
-          personality: '',
+          role: (char?.role === 'main' ? 'protagonist' : (char?.role || 'supporting')) as 'protagonist' | 'antagonist' | 'supporting' | 'background',
+          physicalDescription: char?.physical_description || char?.physicalDescription || '',
+          age: char?.age_range || char?.age || 'adult',
+          gender: char?.gender || 'unspecified',
+          clothing: char?.clothing || char?.clothing_style || '',
+          distinctiveFeatures: char?.distinctiveFeatures || char?.distinctive_features || [],
+          personality: char?.personality || char?.personality_traits || '',
           motivations: [],
-          visualPrompt: '',
+          visualPrompt: char?.visualPrompt || char?.visual_prompt || '',
           appearanceInShots: [],
-          importanceLevel: (char?.importance_level || 3) as 1 | 2 | 3 | 4 | 5,
-          screenTime: 0,
+          importanceLevel: (char?.importance_level || char?.importanceLevel || 3) as 1 | 2 | 3 | 4 | 5,
+          screenTime: char?.screenTime || char?.screen_time || 0,
           createdAt: new Date(),
         })) : [],
-        locations: [],
+        locations: Array.isArray(story.locations) ? story.locations.map((loc: any, index) => ({
+          id: loc?.id || `loc_${loc?.name || 'unknown'}_${index}`,
+          name: loc?.name || 'Unknown Location',
+          type: (loc?.type || loc?.environment_type || 'interior') as 'interior' | 'exterior' | 'mixed',
+          description: loc?.description || '',
+          atmosphere: loc?.atmosphere || '',
+          lighting: (loc?.lighting || loc?.lighting_style || 'natural') as 'natural' | 'artificial' | 'mixed' | 'dramatic' | 'soft',
+          timeOfDay: (loc?.timeOfDay || loc?.time_of_day || 'day') as 'dawn' | 'morning' | 'midday' | 'afternoon' | 'evening' | 'night' | 'variable',
+          weather: loc?.weather || '',
+          visualStyle: loc?.visualStyle || '',
+          colorPalette: loc?.colorPalette || loc?.color_palette || [],
+          keyElements: loc?.keyElements || loc?.key_elements || [],
+          visualPrompt: loc?.visualPrompt || loc?.visual_prompt || '',
+          usedInShots: loc?.usedInShots || [],
+          estimatedComplexity: (loc?.estimatedComplexity || 'moderate') as 'simple' | 'moderate' | 'complex',
+          createdAt: new Date(),
+        })) : [],
         musicCues: [],
         status: story.status === 'completed' ? 'completed' : 'processing',
         aiLogs: [],
@@ -197,7 +239,18 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
         title: enhancedStory.title,
         shotsCount: enhancedStory.shots.length,
         charactersCount: enhancedStory.characters.length,
-        status: enhancedStory.status
+        locationsCount: enhancedStory.locations.length,
+        status: enhancedStory.status,
+        shotsWithPrompts: enhancedStory.shots.filter(s => s.comfyUIPositivePrompt).length,
+        charactersWithPrompts: enhancedStory.characters.filter(c => c.visualPrompt).length,
+        locationsWithPrompts: enhancedStory.locations.filter(l => l.visualPrompt).length,
+        firstShotPrompts: enhancedStory.shots[0] ? {
+          hasPositive: !!enhancedStory.shots[0].comfyUIPositivePrompt,
+          hasNegative: !!enhancedStory.shots[0].comfyUINegativePrompt,
+          positivePreview: enhancedStory.shots[0].comfyUIPositivePrompt?.slice(0, 50)
+        } : 'no shots',
+        firstCharacterPrompt: enhancedStory.characters[0]?.visualPrompt?.slice(0, 50) || 'none',
+        firstLocationPrompt: enhancedStory.locations[0]?.visualPrompt?.slice(0, 50) || 'none'
       });
       
       setStoryData(enhancedStory);
@@ -229,7 +282,9 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
       console.log('📖 Updating AI logs from queue item:', queueItem.logs.length);
       setAiLogs(queueItem.logs);
     }
-  }, [story, queueItem, storyId]);
+  // Depend on promptSignature to ensure re-render when prompts are updated
+  // This string changes whenever a shot gains a prompt, forcing the useEffect to run
+  }, [story, story?.updatedAt, promptSignature, characterPromptSignature, locationPromptSignature, queueItem, storyId]);
 
   // Enhanced progress calculation that responds to queue item updates
   const overallProgress = React.useMemo(() => {

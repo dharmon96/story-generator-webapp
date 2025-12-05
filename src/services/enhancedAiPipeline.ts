@@ -3,6 +3,7 @@ import { EnhancedStory, AILogEntry } from '../types/storyTypes';
 import { nodeQueueManager } from './nodeQueueManager';
 import { PipelineProgress } from './aiPipeline';
 import { storyDataManager } from './storyDataManager';
+import { validationService } from './validationService';
 
 class EnhancedAIPipelineService {
   private progressCallbacks: Map<string, (progress: PipelineProgress) => void> = new Map();
@@ -53,6 +54,10 @@ class EnhancedAIPipelineService {
       // Step 1: Generate Story (must complete first)
       const story = await this.generateStory(queueItem, progress);
       
+      // Validate story before proceeding
+      const storyValidation = validationService.validateStory(story, 'after story generation');
+      validationService.validateOrThrow(storyValidation, 'Story', 'after story generation');
+      
       // Update story content in data manager
       storyDataManager.updateStory(queueItem.id, {
         id: story.id || queueItem.id,
@@ -64,7 +69,23 @@ class EnhancedAIPipelineService {
       const shotPromise = this.createShotList(story, queueItem, progress);
       const characterPromise = this.analyzeCharacters(story, progress);
       
-      const [shots, characters] = await Promise.all([shotPromise, characterPromise]);
+      const [rawShots, characters] = await Promise.all([shotPromise, characterPromise]);
+      
+      // Create defensive copy of shots to prevent data loss during processing
+      const shots = Array.isArray(rawShots) ? [...rawShots.map(shot => ({...shot}))] : [];
+      
+      // Add shot count validation (legacy method)
+      this.validateShotList(shots, 'after shot list creation');
+      
+      // Comprehensive shots validation using validation service
+      const shotsValidation = validationService.validateShots(shots, 'after shot list creation', 1);
+      validationService.validateOrThrow(shotsValidation, 'Shots', 'after shot list creation');
+      
+      // Validate characters if they exist
+      if (Array.isArray(characters) && characters.length > 0) {
+        const charactersValidation = validationService.validateCharacters(characters, 'after character analysis');
+        validationService.validateOrThrow(charactersValidation, 'Characters', 'after character analysis');
+      }
       
       // Update shots and characters in data manager
       storyDataManager.updateStory(queueItem.id, {
@@ -73,22 +94,36 @@ class EnhancedAIPipelineService {
       }, 'analysis');
       
       // Step 4: Generate visual prompts and ComfyUI prompts for all shots
-      await this.generateVisualPrompts(shots, characters, progress);
+      const updatedShots = await this.generateVisualPrompts([...shots], characters, progress);
+      
+      // Validate shot count after prompts generation (legacy method)
+      this.validateShotList(updatedShots || shots, 'after visual prompts generation');
+      
+      // Comprehensive visual prompts validation using validation service
+      const finalShotsForValidation = updatedShots || shots;
+      const promptsValidation = validationService.validateVisualPrompts(finalShotsForValidation, 'after visual prompts generation');
+      validationService.validateOrThrow(promptsValidation, 'Visual Prompts', 'after visual prompts generation');
+      
+      // Use the updated shots for audio generation
+      const finalShots = updatedShots || shots;
       
       // Step 6 & 7: Generate narration and music in parallel (if enabled)
       const audioPromises = [];
       
       if (queueItem.config.narrationGeneration) {
-        audioPromises.push(this.generateNarration(shots, progress));
+        audioPromises.push(this.generateNarration([...finalShots], progress));
       }
       
       if (queueItem.config.musicGeneration) {
-        audioPromises.push(this.generateMusicCues(shots, progress));
+        audioPromises.push(this.generateMusicCues([...finalShots], progress));
       }
       
       if (audioPromises.length > 0) {
         await Promise.all(audioPromises);
       }
+
+      // Final shot count validation before creating story (legacy method)
+      this.validateShotList(finalShots, 'before creating enhanced story');
 
       // Create enhanced story object with proper type validation
       const enhancedStory: EnhancedStory = {
@@ -97,7 +132,7 @@ class EnhancedAIPipelineService {
         content: story.content || '',
         genre: queueItem.config.genre,
         characters: Array.isArray(characters) ? characters : [],
-        shots: Array.isArray(shots) ? shots : [],
+        shots: Array.isArray(finalShots) ? finalShots : [],
         locations: [], // Will be populated by character analysis
         musicCues: [],
         status: 'completed',
@@ -105,6 +140,13 @@ class EnhancedAIPipelineService {
         createdAt: new Date(),
         updatedAt: new Date()
       };
+      
+      // Final comprehensive validation of complete story
+      const completeStoryValidation = validationService.validateCompleteStory(enhancedStory, 'before final save');
+      if (!completeStoryValidation.isValid) {
+        // Log validation errors but don't fail - save partial story anyway
+        console.warn('⚠️ Complete story validation failed but proceeding with save:', completeStoryValidation.errors);
+      }
       
       // Final update to data manager with complete story
       storyDataManager.updateStory(queueItem.id, enhancedStory, 'completed');
@@ -193,20 +235,24 @@ class EnhancedAIPipelineService {
           },
           maxAttempts: 3
         },
-        (result) => {
+        (wrappedResult) => {
           const callbackTimestamp = new Date().toISOString();
           console.log(`📥 [${callbackTimestamp}] ===== STORY GENERATION CALLBACK RECEIVED =====`);
-          console.log(`📥 [${callbackTimestamp}] Result:`, result);
-          if (!result || !result.result) {
-            console.error(`❌ [${callbackTimestamp}] Invalid result structure:`, result);
+          console.log(`📥 [${callbackTimestamp}] Wrapped Result:`, wrappedResult);
+
+          // FIX BUG #1: Properly unwrap result - handle both wrapped and unwrapped formats
+          const result = wrappedResult?.result || wrappedResult;
+
+          if (!result || (!result.title && !result.content)) {
+            console.error(`❌ [${callbackTimestamp}] Invalid result structure:`, wrappedResult);
             reject(new Error('Invalid result from story generation'));
             return;
           }
-          console.log(`✅ [${callbackTimestamp}] Story title: "${result.result.title}"`);
-          console.log(`✅ [${callbackTimestamp}] Story content length: ${result.result.content?.length || 0}`);
-          this.completeStep(progress, 'story', `Generated: ${result.result.title}`);
+          console.log(`✅ [${callbackTimestamp}] Story title: "${result.title}"`);
+          console.log(`✅ [${callbackTimestamp}] Story content length: ${result.content?.length || 0}`);
+          this.completeStep(progress, 'story', `Generated: ${result.title}`);
           console.log(`✅ [${callbackTimestamp}] About to resolve Promise with story result`);
-          resolve(result.result);
+          resolve(result);
         },
         (error) => {
           const errorTimestamp = new Date().toISOString();
@@ -292,12 +338,17 @@ class EnhancedAIPipelineService {
           maxAttempts: 3,
           dependencies: [] // Can run after story completes
         },
-        (result) => {
+        (wrappedResult) => {
           const callbackTimestamp = new Date().toISOString();
           console.log(`🎬 [${callbackTimestamp}] ===== SHOT LIST CALLBACK RECEIVED =====`);
-          console.log('Shot list callback received:', result);
-          this.completeStep(progress, 'shots', `Generated ${result.result.length} shots`);
-          resolve(result.result);
+          console.log('Shot list callback received:', wrappedResult);
+
+          // FIX BUG #1: Properly unwrap result - handle both wrapped and unwrapped formats
+          const result = wrappedResult?.result || wrappedResult;
+          const shots = Array.isArray(result) ? result : [];
+
+          this.completeStep(progress, 'shots', `Generated ${shots.length} shots`);
+          resolve(shots);
         },
         (error) => {
           const errorTimestamp = new Date().toISOString();
@@ -373,12 +424,17 @@ class EnhancedAIPipelineService {
           maxAttempts: 3,
           dependencies: [] // Can run after story completes
         },
-        (result) => {
+        (wrappedResult) => {
           const callbackTimestamp = new Date().toISOString();
           console.log(`👥 [${callbackTimestamp}] ===== CHARACTER ANALYSIS CALLBACK RECEIVED =====`);
-          console.log('Character analysis callback received:', result);
-          this.completeStep(progress, 'characters', `Analyzed ${result.result.length} characters`);
-          resolve(result.result);
+          console.log('Character analysis callback received:', wrappedResult);
+
+          // FIX BUG #1: Properly unwrap result - handle both wrapped and unwrapped formats
+          const result = wrappedResult?.result || wrappedResult;
+          const characters = Array.isArray(result) ? result : [];
+
+          this.completeStep(progress, 'characters', `Analyzed ${characters.length} characters`);
+          resolve(characters);
         },
         (error) => {
           const errorTimestamp = new Date().toISOString();
@@ -426,7 +482,7 @@ class EnhancedAIPipelineService {
     });
   }
 
-  private async generateVisualPrompts(shots: any[], characters: any[], progress: PipelineProgress): Promise<void> {
+  private async generateVisualPrompts(shots: any[], characters: any[], progress: PipelineProgress): Promise<any[]> {
     this.updateStep(progress, 'prompts', 'running');
     
     this.addLog(progress, {
@@ -454,17 +510,22 @@ class EnhancedAIPipelineService {
             },
             maxAttempts: 2
           },
-          (result) => {
+          (wrappedResult) => {
+            // FIX BUG #6: Properly unwrap result - handle both wrapped and unwrapped formats
+            const result = wrappedResult?.result || wrappedResult;
+            const positivePrompt = result?.positivePrompt || '';
+            const negativePrompt = result?.negativePrompt || '';
+
             // Set both ComfyUI prompts and a basic visual prompt for compatibility
-            shot.comfyUIPositivePrompt = result.result.positivePrompt;
-            shot.comfyUINegativePrompt = result.result.negativePrompt;
-            shot.visualPrompt = result.result.positivePrompt; // Use positive prompt as visual prompt
-            
+            shot.comfyUIPositivePrompt = positivePrompt;
+            shot.comfyUINegativePrompt = negativePrompt;
+            shot.visualPrompt = positivePrompt; // Use positive prompt as visual prompt
+
             // Update shot in data manager immediately
             storyDataManager.updateShot(shot.storyId, shot.id, {
-              comfyUIPositivePrompt: result.result.positivePrompt,
-              comfyUINegativePrompt: result.result.negativePrompt,
-              visualPrompt: result.result.positivePrompt
+              comfyUIPositivePrompt: positivePrompt,
+              comfyUINegativePrompt: negativePrompt,
+              visualPrompt: positivePrompt
             });
             
             this.addLog(progress, {
@@ -476,9 +537,9 @@ class EnhancedAIPipelineService {
             });
             
             console.log(`🎨 Generated ComfyUI prompts for shot ${shot.shotNumber}`);
-            console.log(`🎨 Positive: ${result.result.positivePrompt.slice(0, 100)}...`);
-            console.log(`🎨 Negative: ${result.result.negativePrompt.slice(0, 100)}...`);
-            resolve(result.result);
+            console.log(`🎨 Positive: ${positivePrompt.slice(0, 100)}...`);
+            console.log(`🎨 Negative: ${negativePrompt.slice(0, 100)}...`);
+            resolve(result);
           },
           (error) => {
             console.error(`Failed to generate ComfyUI prompts for shot ${shot.shotNumber}:`, error);
@@ -541,12 +602,18 @@ class EnhancedAIPipelineService {
 
     await Promise.all(promptTasks);
     
+    // Validate shots array integrity after prompt generation
+    this.validateShotList(shots, 'during visual prompts generation');
+    
     // Final update to ensure all prompts are saved
     storyDataManager.updateStory(progress.storyId, {
       shots: shots
     }, 'prompts');
     
     this.completeStep(progress, 'prompts', `Generated ComfyUI prompts for ${shots.length} shots`);
+    
+    // Return the updated shots array
+    return shots;
   }
 
   private async generateNarration(shots: any[], progress: PipelineProgress): Promise<void> {
@@ -634,6 +701,39 @@ class EnhancedAIPipelineService {
       shotDesc.includes(char.name.toLowerCase()) ||
       shotDesc.includes(char.role.toLowerCase())
     );
+  }
+
+  private validateShotList(shots: any[], stepName: string): void {
+    if (!Array.isArray(shots)) {
+      console.error(`❌ Shot validation failed at ${stepName}: not an array`, shots);
+      throw new Error(`Invalid shot list at step ${stepName}: expected array but got ${typeof shots}`);
+    }
+    
+    if (shots.length === 0) {
+      console.warn(`⚠️ Shot validation warning at ${stepName}: empty shot list`);
+      return;
+    }
+    
+    // Check for required fields in each shot
+    for (let i = 0; i < shots.length; i++) {
+      const shot = shots[i];
+      if (!shot || typeof shot !== 'object') {
+        console.error(`❌ Shot validation failed at ${stepName}: shot ${i} is not an object`, shot);
+        throw new Error(`Invalid shot data at step ${stepName}: shot ${i} is not an object`);
+      }
+      
+      if (!shot.description || typeof shot.description !== 'string') {
+        console.error(`❌ Shot validation failed at ${stepName}: shot ${i} missing description`, shot);
+        throw new Error(`Invalid shot data at step ${stepName}: shot ${i} missing description`);
+      }
+      
+      if (typeof shot.duration !== 'number' || shot.duration <= 0) {
+        console.error(`❌ Shot validation failed at ${stepName}: shot ${i} invalid duration`, shot);
+        throw new Error(`Invalid shot data at step ${stepName}: shot ${i} has invalid duration`);
+      }
+    }
+    
+    console.log(`✅ Shot list validation passed at ${stepName}: ${shots.length} shots`);
   }
 
   private updateStep(progress: PipelineProgress, stepId: string, status: 'running' | 'completed' | 'failed') {
@@ -730,7 +830,15 @@ class EnhancedAIPipelineService {
   }
 
   private addLog(progress: PipelineProgress, log: AILogEntry): void {
+    // FIX BUG #2: Implement log rotation to prevent memory bloat
+    const MAX_LOGS = 500;
     progress.logs.unshift(log); // Add to beginning for latest first
+
+    // Trim logs if exceeding maximum
+    if (progress.logs.length > MAX_LOGS) {
+      progress.logs = progress.logs.slice(0, MAX_LOGS);
+    }
+
     this.notifyProgress(progress);
   }
 

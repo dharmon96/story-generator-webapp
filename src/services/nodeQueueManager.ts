@@ -210,16 +210,36 @@ class NodeQueueManager {
   private async processTaskDirectly(task: QueueTask, queue: ProcessingQueue) {
     const timestamp = new Date().toISOString();
     console.log(`🔧 [${timestamp}] processTaskDirectly() - START for task:`, task.id);
-    
+
     try {
-      // Find best available node for this task
-      const nodeAssignment = this.findBestNodeForTask(task);
-      
+      // Wait for an available node with retry logic
+      const maxWaitTime = 120000; // 2 minutes max wait
+      const retryInterval = 500; // Check every 500ms
+      let waitTime = 0;
+      let nodeAssignment = null;
+
+      while (!nodeAssignment && waitTime < maxWaitTime) {
+        nodeAssignment = this.findBestNodeForTask(task);
+
+        if (!nodeAssignment) {
+          if (waitTime === 0) {
+            console.log(`⏳ [${timestamp}] No node available for task ${task.id}, waiting for node...`);
+          }
+          await new Promise(resolve => setTimeout(resolve, retryInterval));
+          waitTime += retryInterval;
+
+          // Log every 5 seconds of waiting
+          if (waitTime % 5000 === 0) {
+            console.log(`⏳ Waiting for node for task ${task.id}... (${waitTime / 1000}s elapsed)`);
+          }
+        }
+      }
+
       if (!nodeAssignment) {
-        console.log(`🔧 [${timestamp}] No available node for task ${task.id}, calling error callback`);
+        console.log(`❌ [${timestamp}] Timeout waiting for node for task ${task.id} after ${waitTime}ms`);
         const errorCallback = this.errorCallbacks.get(task.id);
         if (errorCallback) {
-          errorCallback(new Error('No available node for task processing'));
+          errorCallback(new Error(`Timeout waiting for available node (waited ${waitTime}ms)`));
         }
         // Clean up callbacks
         this.taskCallbacks.delete(task.id);
@@ -228,18 +248,18 @@ class NodeQueueManager {
         return;
       }
 
-    // Assign and start processing
-    task.status = 'assigned';
-    task.assignedNode = nodeAssignment.nodeId;
-    task.assignedModel = nodeAssignment.model;
-    console.log(`🔧 [${timestamp}] Task ${task.id} assigned to node ${nodeAssignment.nodeId} with model ${nodeAssignment.model}`);
+      // Assign and start processing
+      task.status = 'assigned';
+      task.assignedNode = nodeAssignment.nodeId;
+      task.assignedModel = nodeAssignment.model;
+      console.log(`✅ [${timestamp}] Task ${task.id} assigned to node ${nodeAssignment.nodeId} with model ${nodeAssignment.model}`);
 
-    // Remove from queue tasks array
-    const taskIndex = queue.tasks.indexOf(task);
-    if (taskIndex > -1) {
-      queue.tasks.splice(taskIndex, 1);
-      console.log(`🔧 [${timestamp}] Removed task ${task.id} from queue, remaining: ${queue.tasks.length}`);
-    }
+      // Remove from queue tasks array
+      const taskIndex = queue.tasks.indexOf(task);
+      if (taskIndex > -1) {
+        queue.tasks.splice(taskIndex, 1);
+        console.log(`🔧 [${timestamp}] Removed task ${task.id} from queue, remaining: ${queue.tasks.length}`);
+      }
 
       // Start async processing
       console.log(`🔧 [${timestamp}] Starting async processing for task:`, task.id);
@@ -597,7 +617,7 @@ class NodeQueueManager {
     console.log('🎬 executeStoryTask called for task:', task.id);
     
     // Call AI service directly for story generation
-    const { SYSTEM_PROMPTS } = await import('./aiPipeline');
+    const { SYSTEM_PROMPTS } = await import('./systemPrompts');
     
     const prompt = `Genre: ${task.data.genre}
 Length: ${task.data.length}
@@ -672,14 +692,14 @@ Concept: ${task.data.prompt}`;
   }
 
   private async executeSegmentTask(task: QueueTask, node: any, model: string): Promise<any> {
-    const { SYSTEM_PROMPTS } = await import('./aiPipeline');
-    
+    const { SYSTEM_PROMPTS } = await import('./systemPrompts');
+
     debugService.info('ai', '📑 SEGMENT TASK DATA:', {
       hasStory: !!task.data?.story,
       storyKeys: task.data?.story ? Object.keys(task.data.story) : [],
       storyContent: task.data?.story?.content ? `${task.data.story.content.length} chars` : 'UNDEFINED'
     });
-    
+
     const prompt = `Story Title: ${task.data.story?.title || 'Untitled'}
 Genre: ${task.data.story?.genre || 'Unknown'}
 
@@ -690,36 +710,20 @@ ${task.data.story?.content || 'NO CONTENT PROVIDED'}`;
       promptLength: prompt.length,
       hasStoryContent: !!task.data.story?.content
     });
-    
+
     const response = await this.callAI(node, model, SYSTEM_PROMPTS.story_segmenter, prompt, task.id);
-    
+
     debugService.info('ai', '📑 Segmentation response received:', {
       responseLength: response.length,
       preview: response.slice(0, 200),
       containsJSON: response.includes('{'),
       containsParts: response.includes('parts')
     });
-    
+
     try {
-      // Simple direct JSON parsing - the prompt should generate clean JSON
-      let data = null;
-      
-      try {
-        data = JSON.parse(response.trim());
-        debugService.success('ai', '📑 Direct JSON parsing succeeded');
-      } catch (e: any) {
-        debugService.warn('ai', '📑 Direct JSON parsing failed, trying fallback', { error: e.message });
-        
-        // Fallback: Extract JSON from markdown if present
-        const jsonMatch = response.match(/```(?:json)?\s*([\s\S]*?)\s*```/) || 
-                         response.match(/\{[\s\S]*\}/);
-        if (jsonMatch) {
-          const extractedJson = jsonMatch[1] || jsonMatch[0];
-          data = JSON.parse(extractedJson.trim());
-          debugService.success('ai', '📑 Extracted JSON parsing worked');
-        }
-      }
-      
+      // Try to parse JSON with multiple fallback strategies
+      const data = this.parseJSONResponse(response, 'segmentation');
+
       if (data && data.parts && Array.isArray(data.parts) && data.parts.length > 0) {
         debugService.success('ai', `📑 Successfully parsed ${data.parts.length} story parts`);
         return data.parts;
@@ -738,40 +742,226 @@ ${task.data.story?.content || 'NO CONTENT PROVIDED'}`;
     }
   }
 
+  /**
+   * Robust JSON parsing with multiple fallback strategies
+   * Handles common AI JSON generation issues like:
+   * - Truncated responses
+   * - Extra text before/after JSON
+   * - Markdown code blocks
+   * - Unescaped characters in strings
+   */
+  private parseJSONResponse(response: string, context: string): any {
+    // Strategy 1: Direct parsing
+    try {
+      const parsed = JSON.parse(response.trim());
+      debugService.success('ai', `📑 ${context}: Direct JSON parsing succeeded`);
+      return parsed;
+    } catch (e: any) {
+      debugService.warn('ai', `📑 ${context}: Direct JSON parsing failed`, { error: e.message });
+    }
+
+    // Strategy 2: Extract from markdown code blocks
+    const codeBlockMatch = response.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (codeBlockMatch) {
+      try {
+        const parsed = JSON.parse(codeBlockMatch[1].trim());
+        debugService.success('ai', `📑 ${context}: Markdown code block extraction succeeded`);
+        return parsed;
+      } catch (e: any) {
+        debugService.warn('ai', `📑 ${context}: Markdown extraction failed`, { error: e.message });
+      }
+    }
+
+    // Strategy 3: Extract JSON object using balanced braces
+    const jsonStart = response.indexOf('{');
+    if (jsonStart !== -1) {
+      let braceCount = 0;
+      let jsonEnd = -1;
+
+      for (let i = jsonStart; i < response.length; i++) {
+        if (response[i] === '{') braceCount++;
+        else if (response[i] === '}') braceCount--;
+
+        if (braceCount === 0) {
+          jsonEnd = i + 1;
+          break;
+        }
+      }
+
+      if (jsonEnd > jsonStart) {
+        const extractedJson = response.substring(jsonStart, jsonEnd);
+        try {
+          const parsed = JSON.parse(extractedJson);
+          debugService.success('ai', `📑 ${context}: Balanced brace extraction succeeded`);
+          return parsed;
+        } catch (e: any) {
+          debugService.warn('ai', `📑 ${context}: Balanced brace extraction failed`, { error: e.message });
+
+          // Strategy 4: Try to repair common JSON issues
+          try {
+            const repaired = this.repairJSON(extractedJson);
+            const parsed = JSON.parse(repaired);
+            debugService.success('ai', `📑 ${context}: JSON repair succeeded`);
+            return parsed;
+          } catch (repairError: any) {
+            debugService.warn('ai', `📑 ${context}: JSON repair failed`, { error: repairError.message });
+          }
+        }
+      }
+    }
+
+    // Strategy 5: Try to find and parse just the array if looking for parts/shots
+    const arrayMatch = response.match(/\[\s*\{[\s\S]*?\}\s*(?:,\s*\{[\s\S]*?\}\s*)*\]/);
+    if (arrayMatch) {
+      try {
+        const parsed = JSON.parse(arrayMatch[0]);
+        debugService.success('ai', `📑 ${context}: Array extraction succeeded`);
+        // Wrap in expected format
+        if (context === 'segmentation') {
+          return { parts: parsed };
+        } else if (context === 'shots') {
+          return { shots: parsed };
+        }
+        return parsed;
+      } catch (e: any) {
+        debugService.warn('ai', `📑 ${context}: Array extraction failed`, { error: e.message });
+      }
+    }
+
+    throw new Error(`Could not parse JSON from ${context} response after all strategies failed`);
+  }
+
+  /**
+   * Attempt to repair common JSON issues from AI output
+   */
+  private repairJSON(json: string): string {
+    let repaired = json;
+
+    // Fix trailing commas in arrays and objects
+    repaired = repaired.replace(/,\s*([}\]])/g, '$1');
+
+    // Fix missing commas between array elements (common AI error)
+    repaired = repaired.replace(/}\s*{/g, '},{');
+
+    // Fix unescaped newlines in strings (very common)
+    repaired = repaired.replace(/:\s*"([^"]*)\n([^"]*)"/, ': "$1\\n$2"');
+
+    // Truncated JSON - try to close unclosed structures
+    const openBraces = (repaired.match(/{/g) || []).length;
+    const closeBraces = (repaired.match(/}/g) || []).length;
+    const openBrackets = (repaired.match(/\[/g) || []).length;
+    const closeBrackets = (repaired.match(/\]/g) || []).length;
+
+    // Add missing closing brackets/braces
+    for (let i = 0; i < openBrackets - closeBrackets; i++) {
+      // Find if we're in a string context and close array properly
+      if (repaired.endsWith('"')) {
+        repaired += ']';
+      } else if (repaired.match(/"\s*$/)) {
+        repaired += ']';
+      } else {
+        repaired += '"]';
+      }
+    }
+
+    for (let i = 0; i < openBraces - closeBraces; i++) {
+      repaired += '}';
+    }
+
+    debugService.info('ai', '🔧 JSON repair attempted', {
+      originalLength: json.length,
+      repairedLength: repaired.length,
+      addedClosingBrackets: openBrackets - closeBrackets,
+      addedClosingBraces: openBraces - closeBraces
+    });
+
+    return repaired;
+  }
+
   private async executeShotTask(task: QueueTask, node: any, model: string): Promise<any> {
     // This would handle shot list creation
-    const { SYSTEM_PROMPTS } = await import('./aiPipeline');
-    
+    const { SYSTEM_PROMPTS } = await import('./systemPrompts');
+
     // Debug to in-app console - show exactly what we have
     debugService.info('ai', '🎬 SHOT TASK DATA:', {
+      hasMasterStory: !!task.data?.masterStory,
       hasStory: !!task.data?.story,
       hasStoryPart: !!task.data?.storyPart,
-      storyKeys: task.data?.story ? Object.keys(task.data.story) : [],
-      storyContent: task.data?.story?.content ? `${task.data.story.content.length} chars` : 'UNDEFINED',
+      masterStoryContent: task.data?.masterStory?.fullStoryContent ? `${task.data.masterStory.fullStoryContent.length} chars` : 'UNDEFINED',
       partContent: task.data?.storyPart?.content ? `${task.data.storyPart.content.length} chars` : 'UNDEFINED',
       partNumber: task.data?.partNumber,
       totalParts: task.data?.totalParts,
       startingShotNumber: task.data?.startingShotNumber,
-      fullData: task.data
+      previousShotsCount: task.data?.previousPartLastShots?.length || 0,
+      isFirstPart: task.data?.isFirstPart,
+      isLastPart: task.data?.isLastPart
     });
-    
+
     // Use story part if available, otherwise use full story
     const contentToProcess = task.data?.storyPart?.content || task.data.story?.content || 'NO CONTENT PROVIDED';
     const isPartMode = !!task.data?.storyPart;
-    
-    let prompt = `Story Title: ${task.data.story?.title || 'Untitled'}
-Genre: ${task.data.story?.genre || 'Unknown'}
+    const hasMasterContext = !!task.data?.masterStory;
+
+    let prompt = `Story Title: ${task.data.masterStory?.title || task.data.story?.title || 'Untitled'}
+Genre: ${task.data.masterStory?.genre || task.data.story?.genre || 'Unknown'}
 Length: ${task.data?.length || 'Medium'}`;
+
+    // Add MASTER STORY context for coherence (critical!)
+    if (hasMasterContext && task.data.masterStory.fullStoryContent) {
+      prompt += `
+
+=== MASTER STORY (FULL CONTEXT - READ FOR CHARACTER AND PLOT CONSISTENCY) ===
+${task.data.masterStory.fullStoryContent}
+=== END OF MASTER STORY ===
+
+=== ALL STORY PARTS OVERVIEW ===`;
+      if (task.data.masterStory.allParts && task.data.masterStory.allParts.length > 0) {
+        task.data.masterStory.allParts.forEach((p: any) => {
+          prompt += `\nPart ${p.partNumber}: "${p.title}"`;
+          if (p.keyPlotPoints && p.keyPlotPoints.length > 0) {
+            prompt += ` - Key points: ${p.keyPlotPoints.join(', ')}`;
+          }
+        });
+      }
+      prompt += `\n=== END OF PARTS OVERVIEW ===`;
+    }
 
     if (isPartMode) {
       prompt += `
-Part: ${task.data.partNumber}/${task.data.totalParts} - ${task.data.storyPart.title}
+
+=== CURRENT PART TO BREAK INTO SHOTS ===
+Part: ${task.data.partNumber}/${task.data.totalParts} - "${task.data.storyPart.title}"
 Starting Shot Number: ${task.data.startingShotNumber}
+${task.data.isFirstPart ? '(This is the FIRST part - establish characters and setting)' : ''}
+${task.data.isLastPart ? '(This is the FINAL part - provide satisfying conclusion)' : ''}
 
-Story Part Content:
+Part Content:
 ${contentToProcess}
+=== END OF CURRENT PART ===`;
 
-IMPORTANT: This is part ${task.data.partNumber} of ${task.data.totalParts}. Generate shots starting from shot number ${task.data.startingShotNumber}. Ensure shot transitions work with previous and next parts.`;
+      // Add previous shots context for smooth transitions
+      if (task.data.previousPartLastShots && task.data.previousPartLastShots.length > 0) {
+        prompt += `
+
+=== LAST SHOTS FROM PREVIOUS PART (FOR SMOOTH TRANSITION) ===`;
+        task.data.previousPartLastShots.forEach((shot: any) => {
+          prompt += `\nShot ${shot.shotNumber}: ${shot.description} (Camera: ${shot.camera})`;
+        });
+        prompt += `
+=== END OF PREVIOUS SHOTS ===
+
+IMPORTANT: Your first shot should transition smoothly from the last shot of the previous part shown above.`;
+      }
+
+      prompt += `
+
+CRITICAL INSTRUCTIONS:
+1. Generate shots ONLY for this part (Part ${task.data.partNumber})
+2. Start shot numbering from ${task.data.startingShotNumber}
+3. Use EXACT same character descriptions as in the master story above
+4. Maintain visual and narrative consistency with other parts
+5. ${task.data.isFirstPart ? 'Establish the setting and introduce characters clearly' : 'Continue naturally from where the previous part ended'}
+6. ${task.data.isLastPart ? 'Provide a satisfying visual conclusion' : 'End with a shot that creates a hook or cliffhanger to the next part'}`;
     } else {
       prompt += `
 
@@ -965,7 +1155,10 @@ ${contentToProcess}`;
           narration: shot.narration || shot.dialogue || '',
           musicCue: shot.music_cue === null || shot.music_cue === '' ? null : (shot.music_cue || shot.musicCue || null),
           renderStatus: 'pending' as const,
-          visualPrompt: ''
+          visualPrompt: '',
+          // Scene elements - characters and locations in this shot
+          characters: shot.characters_in_shot || shot.characters || [],
+          locations: shot.locations_in_shot || shot.locations || (shot.location_in_shot ? [shot.location_in_shot] : (shot.location ? [shot.location] : []))
         }));
         
         console.log('🎬 executeShotTask: Successfully formatted', shots.length, 'shots');
@@ -995,91 +1188,96 @@ ${contentToProcess}`;
   }
 
   private async executeCharacterTask(task: QueueTask, node: any, model: string): Promise<any> {
-    const { SYSTEM_PROMPTS } = await import('./aiPipeline');
-    
+    const { SYSTEM_PROMPTS } = await import('./systemPrompts');
+
     const prompt = `Story: ${task.data.story.title}
 Genre: ${task.data.story.genre}
 
 ${task.data.story.content}
 
-Analyze all characters and provide detailed style sheet information for visual consistency.
-For each character, include:
-1. Physical appearance (height, build, hair, eyes, skin tone, age)
-2. Distinctive features (scars, tattoos, accessories)
-3. Clothing style and colors
-4. Personality traits that affect appearance
-5. Importance level (1-5, where 5 is protagonist)
-6. Estimated screen time in seconds
-7. Visual reference prompt for AI generation`;
+Analyze all characters AND locations and provide detailed style sheet information for visual consistency.
+For each character, include physical appearance, clothing, distinctive features, and a complete visual_prompt for AI generation.
+For each location, include environment details, lighting, atmosphere, and a complete visual_prompt for AI generation.`;
 
-    console.log('👥 executeCharacterTask: Calling AI for character analysis');
+    debugService.info('ai', '👥 Calling AI for character & location analysis');
     const response = await this.callAI(node, model, SYSTEM_PROMPTS.character_analyzer, prompt, task.id);
-    console.log('👥 executeCharacterTask: Response length:', response.length);
-    
+    debugService.info('ai', '👥 Character & location analysis response received', { responseLength: response.length });
+
     try {
-      // Parse JSON response
-      const jsonStart = response.indexOf('{');
-      const jsonEnd = response.lastIndexOf('}') + 1;
-      
-      if (jsonStart >= 0 && jsonEnd > jsonStart) {
-        const jsonResponse = response.slice(jsonStart, jsonEnd);
-        console.log('👥 executeCharacterTask: Attempting to parse JSON');
-        const data = JSON.parse(jsonResponse);
-        
-        if (!data.characters || !Array.isArray(data.characters)) {
-          console.error('👥 executeCharacterTask: No characters array found');
-          throw new Error('Invalid character list format');
-        }
-        
-        const characters = data.characters.map((char: any, index: number) => ({
-          id: `char_${Date.now()}_${index}`,
-          storyId: task.data.story.id,
-          name: char.name || `Character ${index + 1}`,
-          role: char.role || 'supporting',
-          physicalDescription: char.physical_description || char.physicalDescription || '',
-          age: char.age_range || char.age || 'adult',
-          gender: char.gender || 'unspecified',
-          clothing: char.clothing_style || char.clothing || '',
-          distinctiveFeatures: char.distinctive_features || char.distinctiveFeatures || [],
-          personality: char.personality_traits || char.personality || '',
-          importanceLevel: char.importance_level || char.importanceLevel || 3,
-          screenTime: char.screen_time || char.screenTime || 0,
-          visualPrompt: char.visual_prompt || char.visualPrompt || `${char.name || 'Character'}: ${char.physical_description || ''}`,
-          createdAt: new Date()
-        }));
-        
-        console.log('👥 executeCharacterTask: Successfully parsed', characters.length, 'characters');
-        return characters;
-      } else {
-        throw new Error('No JSON found in response');
-      }
+      // Use robust JSON parsing
+      const data = this.parseJSONResponse(response, 'characters');
+
+      // Parse characters
+      const characters = (data.characters || []).map((char: any, index: number) => ({
+        id: `char_${Date.now()}_${index}`,
+        storyId: task.data.story.id,
+        name: char.name || `Character ${index + 1}`,
+        role: char.role || 'supporting',
+        physicalDescription: char.physical_description || char.physicalDescription || '',
+        age: char.age_range || char.age || 'adult',
+        gender: char.gender || 'unspecified',
+        clothing: char.clothing_style || char.clothing || '',
+        distinctiveFeatures: char.distinctive_features || char.distinctiveFeatures || [],
+        personality: char.personality_traits || char.personality || '',
+        importanceLevel: char.importance_level || char.importanceLevel || 3,
+        screenTime: char.screen_time || char.screenTime || 0,
+        visualPrompt: char.visual_prompt || char.visualPrompt || `${char.name || 'Character'}: ${char.physical_description || char.physicalDescription || ''}`,
+        createdAt: new Date()
+      }));
+
+      // Parse locations
+      const locations = (data.locations || []).map((loc: any, index: number) => ({
+        id: `loc_${Date.now()}_${index}`,
+        storyId: task.data.story.id,
+        name: loc.name || `Location ${index + 1}`,
+        type: loc.environment_type || loc.type || 'interior',
+        description: loc.description || '',
+        atmosphere: loc.atmosphere || '',
+        lighting: loc.lighting_style || loc.lighting || 'natural',
+        timeOfDay: loc.time_of_day || loc.timeOfDay || 'day',
+        weather: loc.weather || '',
+        keyElements: loc.key_elements || loc.keyElements || [],
+        colorPalette: loc.color_palette || loc.colorPalette || [],
+        visualPrompt: loc.visual_prompt || loc.visualPrompt || `${loc.name || 'Location'}: ${loc.description || ''}`,
+        usedInShots: [],
+        estimatedComplexity: loc.importance_level > 3 ? 'complex' : (loc.importance_level > 1 ? 'moderate' : 'simple'),
+        createdAt: new Date()
+      }));
+
+      debugService.success('ai', `👥 Successfully parsed ${characters.length} characters and ${locations.length} locations`);
+
+      // Return both characters and locations
+      return { characters, locations };
     } catch (error) {
-      console.error('👥 executeCharacterTask: Error parsing response:', error);
-      
-      // Return fallback characters
-      return [
-        {
-          id: `char_${Date.now()}_0`,
-          storyId: task.data.story.id,
-          name: 'Main Character',
-          role: 'protagonist',
-          physicalDescription: 'To be defined',
-          age: 'adult',
-          gender: 'unspecified',
-          clothing: '',
-          distinctiveFeatures: [],
-          personality: '',
-          importanceLevel: 5,
-          screenTime: 60,
-          visualPrompt: 'Main character of the story',
-          createdAt: new Date()
-        }
-      ];
+      debugService.error('ai', `👥 Character/location parsing error: ${error}`);
+
+      // Return fallback with both characters and locations
+      return {
+        characters: [
+          {
+            id: `char_${Date.now()}_0`,
+            storyId: task.data.story.id,
+            name: 'Main Character',
+            role: 'protagonist',
+            physicalDescription: 'To be defined',
+            age: 'adult',
+            gender: 'unspecified',
+            clothing: '',
+            distinctiveFeatures: [],
+            personality: '',
+            importanceLevel: 5,
+            screenTime: 60,
+            visualPrompt: 'Main character of the story',
+            createdAt: new Date()
+          }
+        ],
+        locations: []
+      };
     }
   }
 
   private async executePromptTask(task: QueueTask, node: any, model: string): Promise<any> {
-    const { SYSTEM_PROMPTS } = await import('./aiPipeline');
+    const { SYSTEM_PROMPTS } = await import('./systemPrompts');
     
     let prompt = `Shot: ${task.data.shot.description}
 Duration: ${task.data.shot.duration}s
@@ -1118,7 +1316,7 @@ Camera Angle: ${task.data.shot.angle || 'eye-level'}`;
   private async executeComfyUIPromptTask(task: QueueTask, node: any, model: string): Promise<any> {
     console.log('🎨 executeComfyUIPromptTask called for shot:', task.data.shotNumber);
     
-    const { SYSTEM_PROMPTS } = await import('./aiPipeline');
+    const { SYSTEM_PROMPTS } = await import('./systemPrompts');
     
     // Extract important shot details with defaults
     const shotType = task.data.shot.shotType || 'medium shot';
@@ -1299,7 +1497,7 @@ NEGATIVE: [comprehensive negative prompt]`;
   }
 
   private async executeNarrationTask(task: QueueTask, node: any, model: string): Promise<any> {
-    const { SYSTEM_PROMPTS } = await import('./aiPipeline');
+    const { SYSTEM_PROMPTS } = await import('./systemPrompts');
     
     const prompt = `Shot: ${task.data.shot.description}
 Duration: ${task.data.shot.duration}s
@@ -1311,7 +1509,7 @@ Shot #${task.data.shot.shotNumber}`;
   }
 
   private async executeMusicTask(task: QueueTask, node: any, model: string): Promise<any> {
-    const { SYSTEM_PROMPTS } = await import('./aiPipeline');
+    const { SYSTEM_PROMPTS } = await import('./systemPrompts');
     
     const prompt = `Shot: ${task.data.shot.description}
 Music: ${task.data.shot.musicCue}

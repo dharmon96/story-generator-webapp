@@ -1,246 +1,19 @@
 import { QueueItem, ModelConfig, Shot, Character } from '../store/useStore';
 import { nodeDiscoveryService, OllamaNode } from './nodeDiscovery';
 import { EnhancedStory, AILogEntry } from '../types/storyTypes';
+import { SYSTEM_PROMPTS } from './systemPrompts';
+
+// Re-export SYSTEM_PROMPTS for backward compatibility
+export { SYSTEM_PROMPTS };
 
 // Use Character from store for now
 type StoryCharacter = Character;
 
-// System prompts from legacy config
-export const SYSTEM_PROMPTS = {
-  story_writer: `Write a compelling short story. Focus ONLY on storytelling - no camera directions, shots, or filming instructions. Follow this exact format:
-
-Title: [write 3-5 words only]
-Logline: [write 10-15 words explaining the story]  
-Duration: [write total minutes like "3 minutes"]
-
-PART 1 [0:00]
-[Write 40-60 words. Focus on character actions, emotions, and dialogue. Put dialogue in "quotes". Describe what happens, not how to film it.]
-HOOK: [Write 5-10 words that create suspense and make viewers want more]
-
-PART 2 [1:00] 
-[Write 40-60 words. Develop the conflict and tension. Show character reactions and escalating problems.]
-HOOK: [Write 5-10 words for the next cliffhanger]
-
-Continue this pattern for each part.
-
-STORYTELLING RULES:
-- Write pure narrative - describe actions, emotions, dialogue
-- Focus on character development and plot progression  
-- Create visual moments through vivid description
-- Each part builds tension toward the climax
-- Show character emotions through actions and words
-- End with a satisfying resolution or twist
-- Write engagingly but leave all filming decisions to others
-- NO camera angles, shot types, or technical directions`,
-
-  shot_list_creator: `Analyze this story part and create a detailed shot list that breaks it into filmable segments.
-
-IMPORTANT: Return ONLY valid JSON. Do not use markdown code blocks, backticks, or any formatting. Start your response directly with { and end with }.
-
-Use this exact JSON format:
-
-{
-  "shots": [
-    {
-      "shot_number": 1,
-      "description": "Maya, a worried 30-year-old woman in casual clothes, approaches the weathered wooden front door of an old Victorian house, her steps hesitant and cautious", 
-      "duration": 4.0,
-      "frames": 96,
-      "camera": "medium shot tracking",
-      "narration": "words spoken here",
-      "music_cue": "dramatic tense"
-    },
-    {
-      "shot_number": 2,
-      "description": "Maya's trembling hand with chipped nail polish slowly turns the ornate brass doorknob, the metal creaking softly in the dim porch lighting",
-      "duration": 3.0,
-      "frames": 72,
-      "camera": "close up static",
-      "narration": "",
-      "music_cue": null
-    }
-  ],
-  "total_duration": 7.0
-}
-
-CINEMATOGRAPHY ANALYSIS RULES:
-- Read each story segment and determine the best shots to tell that part
-- Vary shot lengths: 3-8 seconds each, with key moments getting longer shots
-- Calculate frames based on duration (frames = duration × fps, assume 24fps for calculation)
-- Create visual flow: wide establishing shots, medium for dialogue, close-ups for emotion
-- Camera types: wide shot, medium shot, close up, extreme close up  
-- Camera movements: static, tracking, pan, tilt, zoom in, zoom out
-
-DESCRIPTION REQUIREMENTS (CRITICAL FOR AI GENERATION):
-- CHARACTER DETAILS: Always specify character name, age/appearance, clothing, emotional state
-- LOCATION SPECIFICS: Describe the setting with environmental details, lighting, atmosphere
-- CHARACTER ACTIONS: Detail specific movements, gestures, facial expressions, body language  
-- PHYSICAL DETAILS: Include props, textures, colors, materials that add visual richness
-- MOOD/ATMOSPHERE: Convey the emotional tone through environmental and character descriptions
-- FORMAT: [Character with details] [specific action with context] [in detailed location setting]
-- EXAMPLES:
-  * BAD: "Maya goes into kitchen"
-  * GOOD: "Maya, disheveled and anxious in her wrinkled pajamas, cautiously enters the dimly lit kitchen with peeling wallpaper, morning sunlight filtering through dirty windows"
-  * BAD: "Man opens box"  
-  * GOOD: "Thomas, elderly man with weathered hands, carefully lifts the ornate wooden lid of an antique jewelry box, revealing velvet-lined compartments in the golden lamplight"
-
-- Add narration ONLY when characters speak dialogue from the story
-- Add music cues ONLY at major emotional beats (max 3-4 per story)
-- Leave music_cue as null for most shots - silence is powerful
-- Ensure total duration matches story requirements
-- Create smooth visual transitions between story segments`,
-
-  story_segmenter: `Analyze this story and break it into logical narrative parts for video production.
-
-IMPORTANT: Return ONLY valid JSON. Do not use markdown code blocks, backticks, or any formatting. Start your response directly with { and end with }.
-
-Use this exact JSON format:
-
-{
-  "parts": [
-    {
-      "part_number": 1,
-      "title": "Opening/Setup",
-      "content": "The specific story content for this part...",
-      "duration_estimate": 15.0,
-      "narrative_purpose": "introduction/conflict/climax/resolution"
-    },
-    {
-      "part_number": 2,
-      "title": "Development",
-      "content": "The specific story content for this part...",
-      "duration_estimate": 20.0,
-      "narrative_purpose": "conflict"
-    }
-  ],
-  "total_parts": 2,
-  "story_title": "Story Title"
-}
-
-SEGMENTATION RULES:
-- Break story into 3-5 logical parts based on narrative structure
-- Each part should be 100-400 words for manageable shot generation
-- Maintain story flow and character continuity between parts
-- Parts should have clear beginning, middle, end within the larger story
-- Include key dialogue and action beats in appropriate parts
-- Estimate realistic duration for each part (10-30 seconds typical)`,
-
-  character_analyzer: `Analyze the story content and extract character and location information for visual consistency.
-
-IMPORTANT: Return ONLY valid JSON. Do not use markdown code blocks, backticks, or any formatting. Start your response directly with { and end with }.
-
-Use this exact JSON format:
-
-{
-  "characters": [
-    {
-      "name": "Main Character Name",
-      "role": "protagonist/antagonist/supporting",
-      "physical_description": "detailed physical appearance for AI art generation",
-      "age_range": "young adult/middle-aged/elderly",
-      "clothing_style": "casual modern/formal business/period costume/etc",
-      "personality_traits": "key personality elements that affect appearance",
-      "importance_level": 3
-    }
-  ],
-  "locations": [
-    {
-      "name": "Location Name",
-      "description": "detailed environment description",
-      "environment_type": "indoor/outdoor/urban/rural/fantasy/etc",
-      "time_of_day": "morning/afternoon/evening/night",
-      "lighting_style": "natural/dramatic/soft/harsh/neon/etc",
-      "importance_level": 2
-    }
-  ]
-}
-
-CHARACTER EXTRACTION RULES:
-- Extract 2-4 main characters maximum
-- Focus on characters who appear in multiple scenes
-- Provide detailed physical descriptions suitable for AI art generation
-- Include clothing/style that fits the story's setting and era`,
-
-  prompt_engineer: `Create detailed AI video generation prompts from the shot description and camera information. Use this exact format:
-
-Positive: [create rich visual description - use 30-50 words total]
-Negative: text, watermark, blurry, distorted, extra limbs, low quality, bad anatomy
-
-CHARACTER CONSISTENCY RULES (PRIORITY):
-- If character descriptions are provided, incorporate them precisely into the positive prompt
-- Use exact physical descriptions: age, hair color/style, clothing, distinctive features
-- Character descriptions should come FIRST in the positive prompt before scene elements
-
-PROMPT STRUCTURE (MANDATORY ORDER):
-1. Character description with appearance details
-2. Specific action/movement with body language  
-3. Environmental/scene details with textures
-4. Camera shot type and movement
-5. Lighting and atmosphere
-6. Technical quality: "photorealistic style, sharp focus, high detail"`,
-
-  narration_writer: `Write voice-over narration with timestamps. Use this format:
-
-[0:00] "First sentence here."
-[0:04] "Second sentence here." 
-[0:08] "Third sentence here."
-
-RULES:
-- Speak 2-3 words per second (count the words)
-- Use short sentences (5-10 words each)
-- Use simple words that sound good when spoken
-- Add ... for pauses like "Wait... what was that?"
-- Match the time stamps to when each line should start
-- Write like people actually talk, not like a book`,
-
-  music_director: `List music cues with timestamps. Use this format:
-
-[0:00] ambient mysterious 3 15s
-[0:45] electronic tense 7 30s  
-[2:30] orchestral triumphant 9 20s
-
-FORMAT EXPLANATION:
-[time] [music style] [emotion] [volume 1-10] [how long]
-
-MUSIC STYLES: ambient, electronic, orchestral, rock, acoustic, cinematic
-EMOTIONS: mysterious, tense, triumphant, sad, happy, scary, romantic
-VOLUME: 1=very quiet, 5=medium, 10=very loud
-
-RULES:
-- Only add music at the most important emotional moments
-- Use 3-4 music cues maximum per video
-- Include quiet moments with no music`,
-
-  comfyui_prompt_generator: `You are a professional ComfyUI/Stable Diffusion prompt engineer. Create detailed positive and negative prompts for high-quality image generation.
-
-Your task is to generate optimized prompts that will create cinematic, professional-quality images.
-
-FORMAT YOUR RESPONSE EXACTLY AS:
-
-{
-  "positive": "[your detailed positive prompt here]",
-  "negative": "[your comprehensive negative prompt here]"
-}
-
-POSITIVE PROMPT GUIDELINES:
-- Start with the main subject and action
-- Include specific cinematographic terms (shot type, lighting, composition)
-- Add quality descriptors: "masterpiece", "best quality", "highly detailed", "8k", "photorealistic"
-- Include character descriptions with consistent physical details
-- Describe environment, lighting, and atmosphere
-- Add artistic style if relevant (e.g., "cinematic", "film noir", "fantasy")
-- Maximum 200 words
-
-NEGATIVE PROMPT GUIDELINES:
-- Include all common AI generation problems: "blurry", "low quality", "distorted", "deformed"
-- Add anatomical issues: "bad anatomy", "extra limbs", "bad hands", "bad face"
-- Include unwanted elements: "watermark", "text", "logo", "signature"
-- Add quality issues: "jpeg artifacts", "pixelated", "low resolution"
-- Include composition problems: "cropped", "out of frame", "duplicate"
-- Maximum 150 words
-
-ALWAYS respond with valid JSON format. Do not include any text before or after the JSON.`
-};
+/**
+ * @deprecated This file is deprecated. Use sequentialAiPipeline.ts instead.
+ * The SYSTEM_PROMPTS have been moved to systemPrompts.ts
+ * PipelineProgress and PipelineStep interfaces are kept for compatibility.
+ */
 
 export interface PipelineStep {
   id: string;
@@ -937,7 +710,15 @@ Shot #${shot.shotNumber}`;
   }
 
   private addLog(progress: PipelineProgress, log: AILogEntry): void {
+    // FIX BUG #2: Implement log rotation to prevent memory bloat
+    const MAX_LOGS = 500;
     progress.logs.unshift(log); // Add to beginning for latest first
+
+    // Trim logs if exceeding maximum
+    if (progress.logs.length > MAX_LOGS) {
+      progress.logs = progress.logs.slice(0, MAX_LOGS);
+    }
+
     this.notifyProgress(progress);
   }
 

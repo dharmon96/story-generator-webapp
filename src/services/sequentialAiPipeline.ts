@@ -1,19 +1,118 @@
-import { QueueItem, Story, ModelConfig } from '../store/useStore';
+import { QueueItem, Story, ModelConfig, useStore } from '../store/useStore';
 import { nodeQueueManager } from './nodeQueueManager';
 import { debugService } from './debugService';
+import { validationService } from './validationService';
+// Note: We don't use the imported storyDataManager directly, but define our own wrapper below
+// that syncs to the Zustand store for live UI updates
 
-// Simple in-memory story data manager for partial saves
+/**
+ * Story data manager wrapper that syncs to both in-memory cache and the store
+ * This ensures live updates in the UI during generation
+ */
 const storyDataManager = {
   partialStories: new Map<string, Story>(),
-  
+
   savePartialStory(story: Story) {
     this.partialStories.set(story.id, { ...story });
+
+    // CRITICAL: Also sync to the actual store for live UI updates
+    const store = useStore.getState();
+
+    // Convert to store-compatible format
+    const storeStory = {
+      id: story.id,
+      title: story.title || 'Generating...',
+      content: story.content || '',
+      genre: story.genre || 'Auto',
+      shots: (story.shots || []).map((shot: any) => ({
+        id: shot.id || `shot_${shot.shotNumber || shot.shot_number}`,
+        storyId: story.id,
+        shotNumber: shot.shotNumber || shot.shot_number,
+        description: shot.description || '',
+        duration: shot.duration || 3,
+        frames: Math.floor((shot.duration || 3) * 24),
+        camera: shot.cameraMovement || shot.camera || 'medium shot',
+        visualPrompt: shot.visualPrompt || shot.visual_prompt || '',
+        comfyUIPositivePrompt: shot.comfyUIPositivePrompt || '',
+        comfyUINegativePrompt: shot.comfyUINegativePrompt || '',
+        narration: shot.narration || '',
+        musicCue: shot.musicCue || shot.music_cue,
+        renderStatus: (shot.renderStatus || 'pending') as 'pending' | 'rendering' | 'completed',
+        characters: shot.characters || [],
+        locations: shot.locations || [],
+        // Part reference for multi-video coherence
+        partNumber: shot.partNumber || shot.part_number,
+        partTitle: shot.partTitle || shot.part_title
+      })),
+      characters: (story.characters || []).map((char: any) => ({
+        id: char.id || `char_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+        name: char.name,
+        role: char.role === 'protagonist' ? 'main' : (char.role === 'main' ? 'main' : 'supporting'),
+        physical_description: char.physicalDescription || char.physical_description || '',
+        age_range: char.age || char.age_range || '',
+        gender: char.gender || 'unspecified',
+        clothing: char.clothing || char.clothing_style || '',
+        distinctiveFeatures: char.distinctiveFeatures || char.distinctive_features || [],
+        personality: char.personality || char.personality_traits || '',
+        importance_level: char.importanceLevel || char.importance_level || 3,
+        screenTime: char.screenTime || char.screen_time || 0,
+        visualPrompt: char.visualPrompt || char.visual_prompt || ''
+      })),
+      locations: (story.locations || []).map((loc: any) => ({
+        id: loc.id || `loc_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+        name: loc.name,
+        type: loc.type || loc.environment_type || 'interior',
+        description: loc.description || '',
+        atmosphere: loc.atmosphere || '',
+        lighting: loc.lighting || loc.lighting_style || 'natural',
+        timeOfDay: loc.timeOfDay || loc.time_of_day || 'day',
+        weather: loc.weather || '',
+        keyElements: loc.keyElements || loc.key_elements || [],
+        colorPalette: loc.colorPalette || loc.color_palette || [],
+        visualPrompt: loc.visualPrompt || loc.visual_prompt || '',
+        usedInShots: loc.usedInShots || []
+      })),
+      status: 'generating' as const,
+      createdAt: story.createdAt || new Date(),
+      updatedAt: new Date()
+    };
+
+    // Upsert to store for live UI updates
+    store.upsertStory(storeStory);
+
+    // Debug: Log the actual stories in store after update
+    const storiesAfterUpdate = useStore.getState().stories;
+    const matchingStory = storiesAfterUpdate.find(s => s.id === story.id);
+
+    // Count shots with prompts for debugging
+    const shotsWithPositivePrompt = storeStory.shots.filter((s: any) => s.comfyUIPositivePrompt).length;
+    const shotsWithNegativePrompt = storeStory.shots.filter((s: any) => s.comfyUINegativePrompt).length;
+
+    debugService.info('pipeline', `📊 [LIVE UPDATE] Story ${story.id} synced to store`, {
+      title: storeStory.title,
+      hasContent: !!storeStory.content,
+      contentLength: storeStory.content?.length || 0,
+      shotsCount: storeStory.shots.length,
+      shotsWithPositivePrompt,
+      shotsWithNegativePrompt,
+      charactersCount: storeStory.characters.length,
+      storeHasStory: !!matchingStory,
+      totalStoriesInStore: storiesAfterUpdate.length
+    });
+
+    console.log(`📊 [LIVE UPDATE] Story ${story.id} synced to store:`, {
+      title: storeStory.title,
+      hasContent: !!storeStory.content,
+      shotsCount: storeStory.shots.length,
+      charactersCount: storeStory.characters.length,
+      storeHasStory: !!matchingStory
+    });
   },
-  
+
   getPartialStory(id: string): Story | undefined {
     return this.partialStories.get(id);
   },
-  
+
   clearPartialStory(id: string) {
     this.partialStories.delete(id);
   }
@@ -42,6 +141,7 @@ interface StepDefinition {
   id: string;
   name: string;
   required: boolean;
+  dependencies?: string[]; // Steps that must be completed first
   configCheck?: (config: any) => boolean;
 }
 
@@ -128,23 +228,50 @@ class SequentialAiPipelineService {
     try {
       debugService.info('pipeline', `🚀 Starting sequential pipeline for: ${queueItem.config.prompt.slice(0, 50)}...`);
       
-      // Define processing steps
+      // Define processing steps with explicit dependencies
       const steps: StepDefinition[] = [
-        { id: 'story', name: 'Story Generation', required: true },
-        { id: 'segments', name: 'Story Segmentation', required: true },
-        { id: 'shots', name: 'Shot Breakdown', required: true },
-        { id: 'characters', name: 'Character Analysis', required: true },
-        { id: 'prompts', name: 'Visual Prompts', required: true },
+        { 
+          id: 'story', 
+          name: 'Story Generation', 
+          required: true,
+          dependencies: [] // No dependencies - can run first
+        },
+        { 
+          id: 'segments', 
+          name: 'Story Segmentation', 
+          required: true,
+          dependencies: ['story'] // Must wait for story
+        },
+        { 
+          id: 'shots', 
+          name: 'Shot Breakdown', 
+          required: true,
+          dependencies: ['story', 'segments'] // Must wait for story and segments
+        },
+        { 
+          id: 'characters', 
+          name: 'Character Analysis', 
+          required: true,
+          dependencies: ['story'] // Can run after story, parallel with shots
+        },
+        { 
+          id: 'prompts', 
+          name: 'Visual Prompts', 
+          required: true,
+          dependencies: ['shots', 'characters'] // Must wait for both shots and characters
+        },
         { 
           id: 'narration', 
           name: 'Narration Generation', 
           required: false,
+          dependencies: ['shots'], // Must wait for shots
           configCheck: (config) => config.narrationGeneration
         },
         { 
           id: 'music', 
           name: 'Music Cue Generation', 
           required: false,
+          dependencies: ['shots'], // Must wait for shots
           configCheck: (config) => config.musicGeneration
         }
       ];
@@ -161,9 +288,11 @@ class SequentialAiPipelineService {
       let storyParts: any[] = [];
       let shots: any[] = [];
       let characters: any[] = [];
+      let locations: any[] = [];
       let partialStory: Story | null = null;
+      const completedSteps = new Set<string>(); // Track completed steps for dependency validation
 
-      // Process each step sequentially
+      // Process each step sequentially with dependency validation
       for (let i = 0; i < activeSteps.length; i++) {
         const step = activeSteps[i];
         const overallProgress = Math.round((i / activeSteps.length) * 100);
@@ -171,6 +300,15 @@ class SequentialAiPipelineService {
         // Check for abort signal before each step
         if (abortController.signal.aborted) {
           throw new Error('Processing aborted by user');
+        }
+
+        // Validate dependencies before proceeding
+        if (step.dependencies && step.dependencies.length > 0) {
+          const missingDeps = step.dependencies.filter(dep => !completedSteps.has(dep));
+          if (missingDeps.length > 0) {
+            throw new Error(`Step '${step.id}' cannot proceed: missing dependencies [${missingDeps.join(', ')}]`);
+          }
+          debugService.info('pipeline', `✅ Dependencies satisfied for step '${step.id}': [${step.dependencies.join(', ')}]`);
         }
         
         this.updateProgress(progress, step.id, step.name, overallProgress, 0);
@@ -183,6 +321,12 @@ class SequentialAiPipelineService {
           assignedModel: nodeInfo?.model
         });
 
+        // Log step start
+        this.addLog(progress, step.id, 'info', `Starting: ${step.name}`, {
+          node: nodeInfo?.name,
+          model: nodeInfo?.model
+        });
+
         if (nodeInfo) {
           this.assignNode(nodeInfo.id, queueItem.id, step.id, nodeInfo.model);
         }
@@ -190,6 +334,13 @@ class SequentialAiPipelineService {
         switch (step.id) {
           case 'story':
             story = await this.executeStoryStep(queueItem, nodeInfo, progress);
+            
+            // Validate story before proceeding
+            if (story) {
+              const storyValidation = validationService.validateStory(story, 'after story generation');
+              validationService.validateOrThrow(storyValidation, 'Story', 'after story generation');
+            }
+            
             // Create partial story immediately after story generation
             if (story) {
               partialStory = {
@@ -213,12 +364,27 @@ class SequentialAiPipelineService {
           case 'segments':
             if (!story) throw new Error('Story required for segmentation');
             storyParts = await this.executeSegmentationStep(story, queueItem, nodeInfo, progress);
-            
+
             // Validate parts were generated
             if (!storyParts || storyParts.length === 0) {
               throw new Error('Story segmentation failed to generate any parts');
             }
-            
+
+            // Store story parts in the partial story for reference
+            if (partialStory) {
+              partialStory.storyParts = storyParts.map((part: any) => ({
+                partNumber: part.part_number,
+                title: part.title,
+                content: part.content,
+                narrativePurpose: part.narrative_purpose || 'development',
+                durationEstimate: part.duration_estimate || 15
+              }));
+              partialStory.totalParts = storyParts.length;
+              partialStory.updatedAt = new Date();
+              storyDataManager.savePartialStory(partialStory);
+              debugService.info('pipeline', `💾 Saved ${storyParts.length} story parts to master story`);
+            }
+
             debugService.success('pipeline', `✅ Generated ${storyParts.length} story parts`);
             break;
           
@@ -226,10 +392,14 @@ class SequentialAiPipelineService {
             if (!storyParts || storyParts.length === 0) throw new Error('Story parts required for shot breakdown');
             shots = await this.executeShotsForPartsStep(storyParts, story, queueItem, nodeInfo, progress);
             
-            // Validate shots were generated
+            // Validate shots were generated (basic check)
             if (!shots || shots.length === 0) {
               throw new Error('Shot breakdown failed to generate any shots');
             }
+            
+            // Comprehensive shots validation
+            const shotsValidation = validationService.validateShots(shots, 'after shot breakdown', 1);
+            validationService.validateOrThrow(shotsValidation, 'Shots', 'after shot breakdown');
             
             debugService.success('pipeline', `✅ Generated ${shots.length} total shots from ${storyParts.length} parts`);
             
@@ -244,31 +414,141 @@ class SequentialAiPipelineService {
           
           case 'characters':
             if (!story) throw new Error('Story required for character analysis');
-            characters = await this.executeCharactersStep(story, queueItem, nodeInfo, progress);
-            // Update partial story with characters
-            if (partialStory && characters.length > 0) {
-              partialStory.characters = characters;
+            // executeCharactersStep now returns { characters, locations }
+            const analysisResult: any = await this.executeCharactersStep(story, queueItem, nodeInfo, progress);
+
+            // Handle both old format (array) and new format ({ characters, locations })
+            if (Array.isArray(analysisResult)) {
+              characters = analysisResult;
+              locations = [];
+            } else {
+              characters = analysisResult?.characters || [];
+              locations = analysisResult?.locations || [];
+            }
+
+            // Validate characters if any were generated
+            if (characters && characters.length > 0) {
+              const charactersValidation = validationService.validateCharacters(characters, 'after character analysis');
+              validationService.validateOrThrow(charactersValidation, 'Characters', 'after character analysis');
+            }
+
+            // Update partial story with characters AND locations
+            if (partialStory) {
+              if (characters.length > 0) {
+                partialStory.characters = characters;
+              }
+              if (locations.length > 0) {
+                partialStory.locations = locations;
+              }
               partialStory.updatedAt = new Date();
               storyDataManager.savePartialStory(partialStory);
-              debugService.info('pipeline', `💾 Updated story with ${characters.length} characters`);
+              debugService.info('pipeline', `💾 Updated story with ${characters.length} characters and ${locations.length} locations`);
             }
             break;
           
           case 'prompts':
             if (!shots.length) throw new Error('Shots required for prompt generation');
-            await this.executePromptsStep(shots, characters, queueItem, modelConfigs, progress);
+            // Pass partialStory so it can save after each prompt for live UI updates
+            await this.executePromptsStep(shots, characters, queueItem, modelConfigs, progress, partialStory);
+
+            // Debug: Check what prompts are on shots after executePromptsStep
+            const shotsWithPositiveAfterStep = shots.filter((s: any) => s.comfyUIPositivePrompt);
+            const shotsWithNegativeAfterStep = shots.filter((s: any) => s.comfyUINegativePrompt);
+            debugService.info('pipeline', `🎨 After executePromptsStep - shots with prompts:`, {
+              total: shots.length,
+              withPositive: shotsWithPositiveAfterStep.length,
+              withNegative: shotsWithNegativeAfterStep.length,
+              firstShotPositive: shots[0]?.comfyUIPositivePrompt?.slice(0, 50) || 'NONE',
+              firstShotNegative: shots[0]?.comfyUINegativePrompt?.slice(0, 50) || 'NONE'
+            });
+
+            // Validate visual prompts after generation
+            const promptsValidation = validationService.validateVisualPrompts(shots, 'after visual prompts generation');
+            validationService.validateOrThrow(promptsValidation, 'Visual Prompts', 'after visual prompts generation');
+
+            // Save partial story with updated prompts for live UI updates
+            if (partialStory) {
+              // Make sure we're using the updated shots array
+              partialStory.shots = shots.map((shot: any) => ({
+                ...shot,
+                // Ensure prompts are copied
+                comfyUIPositivePrompt: shot.comfyUIPositivePrompt || '',
+                comfyUINegativePrompt: shot.comfyUINegativePrompt || ''
+              }));
+              partialStory.updatedAt = new Date();
+
+              debugService.info('pipeline', `💾 About to save story with prompts:`, {
+                storyId: partialStory.id,
+                shotsCount: partialStory.shots.length,
+                firstShotHasPositive: !!partialStory.shots[0]?.comfyUIPositivePrompt,
+                firstShotHasNegative: !!partialStory.shots[0]?.comfyUINegativePrompt
+              });
+
+              storyDataManager.savePartialStory(partialStory);
+              debugService.info('pipeline', `💾 Updated story with visual prompts for ${shots.length} shots`);
+            }
             break;
-          
+
           case 'narration':
             if (!shots.length) throw new Error('Shots required for narration');
             await this.executeNarrationStep(shots, queueItem, modelConfigs, progress);
+
+            // Save partial story with narration for live UI updates
+            if (partialStory) {
+              partialStory.shots = shots;
+              partialStory.updatedAt = new Date();
+              storyDataManager.savePartialStory(partialStory);
+              debugService.info('pipeline', `💾 Updated story with narration`);
+            }
             break;
-          
+
           case 'music':
             if (!shots.length) throw new Error('Shots required for music generation');
             await this.executeMusicStep(shots, queueItem, modelConfigs, progress);
+
+            // Save partial story with music cues for live UI updates
+            if (partialStory) {
+              partialStory.shots = shots;
+              partialStory.updatedAt = new Date();
+              storyDataManager.savePartialStory(partialStory);
+              debugService.info('pipeline', `💾 Updated story with music cues`);
+            }
             break;
         }
+
+        // Mark step as completed for dependency tracking
+        completedSteps.add(step.id);
+        debugService.success('pipeline', `✅ Step '${step.id}' completed successfully`);
+
+        // Log step completion with relevant details
+        let completionMessage = `Completed: ${step.name}`;
+        let completionDetails: any = {};
+        switch (step.id) {
+          case 'story':
+            completionMessage = `Story generated: "${story?.title || 'Untitled'}"`;
+            completionDetails = { contentLength: story?.content?.length || 0 };
+            break;
+          case 'segments':
+            completionMessage = `Story segmented into ${storyParts?.length || 0} parts`;
+            break;
+          case 'shots':
+            completionMessage = `Generated ${shots?.length || 0} shots`;
+            completionDetails = { totalDuration: shots?.reduce((acc: number, s: any) => acc + (s.duration || 0), 0) };
+            break;
+          case 'characters':
+            completionMessage = `Analyzed ${characters?.length || 0} characters`;
+            break;
+          case 'prompts':
+            completionMessage = `Generated visual prompts for ${shots?.length || 0} shots`;
+            break;
+          case 'narration':
+            completionMessage = `Added narration to shots`;
+            break;
+          case 'music':
+            completionMessage = `Added music cues to shots`;
+            break;
+        }
+        this.addLog(progress, step.id, 'success', completionMessage, completionDetails);
 
         // Release node and mark step complete
         if (nodeInfo) {
@@ -298,21 +578,45 @@ class SequentialAiPipelineService {
         updatedAt: new Date()
       };
 
+      // Final comprehensive validation of complete story
+      const completeStoryValidation = validationService.validateCompleteStory(finalStory, 'before final save');
+      if (!completeStoryValidation.isValid) {
+        // Log validation errors but don't fail - save story anyway for user review
+        debugService.warn('validation', `⚠️ Complete story validation failed but proceeding with save:`, {
+          errors: completeStoryValidation.errors,
+          warnings: completeStoryValidation.warnings
+        });
+      }
+
       // Final progress update
       this.updateProgress(progress, 'completed', 'Complete', 100, 100);
       progress.status = 'completed';
 
+      // Log final completion
+      this.addLog(progress, 'completed', 'success', `Pipeline completed: "${finalStory.title}"`, {
+        shotCount: shots.length,
+        characterCount: characters.length,
+        validationPassed: completeStoryValidation.isValid
+      });
+
       debugService.success('pipeline', `🎉 Sequential pipeline completed: ${finalStory.title}`, {
         storyId: finalStory.id,
         shotCount: shots.length,
-        characterCount: characters.length
+        characterCount: characters.length,
+        validationPassed: completeStoryValidation.isValid
       });
 
       return finalStory;
 
-    } catch (error) {
+    } catch (error: any) {
       progress.status = 'failed';
-      debugService.error('pipeline', `❌ Sequential pipeline failed: ${error}`, { 
+
+      // Log error
+      this.addLog(progress, progress.currentStep, 'error', `Pipeline failed: ${error.message || error}`, {
+        step: progress.currentStep
+      });
+
+      debugService.error('pipeline', `❌ Sequential pipeline failed: ${error}`, {
         storyId: queueItem.id,
         currentStep: progress.currentStep
       });
@@ -342,6 +646,42 @@ class SequentialAiPipelineService {
     if (currentModel) progress.currentModel = currentModel;
 
     // Notify callback
+    const callback = this.progressCallbacks.get(progress.storyId);
+    if (callback) {
+      callback({ ...progress });
+    }
+  }
+
+  /**
+   * Add a log entry to the progress object
+   * FIX: Added missing log functionality that was causing empty logs in UI
+   */
+  private addLog(
+    progress: SequentialProgress,
+    step: string,
+    level: 'info' | 'success' | 'warn' | 'error',
+    message: string,
+    details?: any
+  ) {
+    const MAX_LOGS = 500;
+
+    const log = {
+      id: `${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      timestamp: new Date(),
+      step,
+      level,
+      message,
+      details
+    };
+
+    progress.logs.unshift(log); // Add to beginning for latest first
+
+    // Implement log rotation to prevent memory bloat
+    if (progress.logs.length > MAX_LOGS) {
+      progress.logs = progress.logs.slice(0, MAX_LOGS);
+    }
+
+    // Notify callback with updated progress
     const callback = this.progressCallbacks.get(progress.storyId);
     if (callback) {
       callback({ ...progress });
@@ -658,21 +998,56 @@ class SequentialAiPipelineService {
     characters: any[],
     queueItem: QueueItem,
     modelConfigs: ModelConfig[],
-    progress: SequentialProgress
+    progress: SequentialProgress,
+    partialStory?: any
   ): Promise<void> {
-    debugService.info('ai', `🎨 Starting visual prompts for ${shots.length} shots`);
+    // Count available nodes from settings for this step
+    const promptNodes = modelConfigs.filter(c => c.enabled && c.step === 'prompts');
+    const nodeCount = promptNodes.length || 1;
 
-    // Process prompts for all shots concurrently (this step can use multiple nodes)
-    const promptPromises = shots.map((shot, index) => {
-      const nodeInfo = this.getNextAvailableNode(modelConfigs, 'prompts', queueItem.id);
-      if (!nodeInfo) throw new Error('No node available for prompt generation');
+    debugService.info('ai', `🎨 Starting visual prompts for ${shots.length} shots`, {
+      availableNodes: nodeCount,
+      nodeConfigs: promptNodes.map(n => `${n.nodeId}:${n.model}`)
+    });
 
-      return new Promise((resolve, reject) => {
-        const taskId = nodeQueueManager.addTask(
+    let completedCount = 0;
+
+    // Helper to save story and update UI after each prompt completes
+    const saveAndUpdateUI = () => {
+      if (partialStory) {
+        // Create NEW shot objects to ensure React detects the change
+        partialStory.shots = shots.map((s: any) => ({
+          ...s,
+          comfyUIPositivePrompt: s.comfyUIPositivePrompt || '',
+          comfyUINegativePrompt: s.comfyUINegativePrompt || ''
+        }));
+        partialStory.updatedAt = new Date();
+        storyDataManager.savePartialStory(partialStory);
+        debugService.info('pipeline', `💾 [LIVE] UI update: ${completedCount}/${shots.length} prompts complete`);
+      }
+
+      // Update progress
+      const progressPercent = Math.round((completedCount / shots.length) * 100);
+      this.updateProgress(progress, 'prompts', 'Visual Prompts',
+        75 + Math.round(progressPercent * 0.15),
+        progressPercent,
+        'pool', modelConfigs[0]?.model || 'unknown'
+      );
+    };
+
+    // TASK POOL PATTERN: Queue ALL tasks at once
+    // The nodeQueueManager will handle waiting for available nodes
+    // Tasks will be picked up by nodes as they become free
+    debugService.info('ai', `🎨 Queueing all ${shots.length} prompt tasks to pool (nodes will pick them up as available)`);
+
+    const allTaskPromises = shots.map((shot) => {
+      return new Promise<void>((resolve, reject) => {
+        // Queue the task - nodeQueueManager will wait for available node
+        nodeQueueManager.addTask(
           {
             type: 'comfyui_prompts',
             priority: 5,
-            storyId: shot.storyId,
+            storyId: shot.storyId || queueItem.id,
             data: {
               shot: shot,
               characters: characters,
@@ -680,17 +1055,43 @@ class SequentialAiPipelineService {
             },
             maxAttempts: 2
           },
-          (result) => {
-            shot.visualPrompt = result.positivePrompt;
-            shot.negativePrompt = result.negativePrompt;
-            resolve(result);
+          (wrappedResult) => {
+            // Unwrap the result - it comes wrapped with { taskId, type, result, timestamp }
+            const result = wrappedResult?.result || wrappedResult;
+
+            // Map the result to the correct field names for UI display
+            shot.comfyUIPositivePrompt = result.positivePrompt || '';
+            shot.comfyUINegativePrompt = result.negativePrompt || '';
+            shot.visualPrompt = result.positivePrompt || '';
+
+            completedCount++;
+
+            debugService.info('ai', `🎨 Shot ${shot.shotNumber} prompt complete (${completedCount}/${shots.length})`, {
+              positiveLength: shot.comfyUIPositivePrompt?.length || 0,
+              negativeLength: shot.comfyUINegativePrompt?.length || 0,
+              hasPositive: !!shot.comfyUIPositivePrompt,
+              hasNegative: !!shot.comfyUINegativePrompt
+            });
+
+            // Save after EACH prompt for live UI updates
+            saveAndUpdateUI();
+
+            resolve();
           },
-          (error) => reject(error)
+          (error) => {
+            debugService.error('ai', `❌ Failed shot ${shot.shotNumber}: ${error.message}`);
+            reject(error);
+          }
         );
       });
     });
 
-    await Promise.all(promptPromises);
+    debugService.info('ai', `🎨 All ${shots.length} tasks queued, waiting for completion...`);
+
+    // Wait for ALL tasks to complete
+    // Each task will grab a node when one becomes available
+    await Promise.all(allTaskPromises);
+
     debugService.success('ai', `✅ Visual prompts completed for all ${shots.length} shots`);
   }
 
@@ -871,20 +1272,40 @@ class SequentialAiPipelineService {
       node: nodeInfo.name,
       model: nodeInfo.model,
       storyTitle: story.title,
-      partCount: storyParts.length
+      partCount: storyParts.length,
+      masterStoryContentLength: story.content?.length || 0
     });
 
     const allShots: any[] = [];
     let currentShotNumber = 1;
 
+    // Build master story context for coherence
+    const masterStoryContext = {
+      fullStoryContent: story.content,
+      title: story.title,
+      genre: story.genre,
+      allParts: storyParts.map((p: any) => ({
+        partNumber: p.part_number,
+        title: p.title,
+        content: p.content,
+        keyPlotPoints: p.key_plot_points || [],
+        charactersFeatured: p.characters_featured || []
+      }))
+    };
+
     // Process each story part sequentially
     for (let i = 0; i < storyParts.length; i++) {
       const part = storyParts[i];
-      
+
+      // Get previous part's last shots for continuity
+      const previousPartShots = i > 0 ? allShots.slice(-3) : [];
+
       debugService.info('ai', `🎬 Processing part ${i + 1}/${storyParts.length}: ${part.title}`, {
         partNumber: part.part_number,
         partTitle: part.title,
-        partContent: part.content?.length + ' characters'
+        partContent: part.content?.length + ' characters',
+        hasMasterContext: !!masterStoryContext.fullStoryContent,
+        previousShotsForContext: previousPartShots.length
       });
 
       const partShots = await new Promise<any[]>((resolve, reject) => {
@@ -894,24 +1315,38 @@ class SequentialAiPipelineService {
             priority: 8,
             storyId: story.id,
             data: {
-              story: story, // Full story for context
-              storyPart: part, // Specific part to break down
-              length: queueItem.config.length,
+              // MASTER STORY CONTEXT - Critical for coherence
+              masterStory: masterStoryContext,
+              // Specific part to break down
+              storyPart: part,
+              // Legacy field for backwards compatibility
+              story: story,
+              // Part information
               partNumber: part.part_number,
               totalParts: storyParts.length,
-              startingShotNumber: currentShotNumber
+              startingShotNumber: currentShotNumber,
+              // Previous shots for transition continuity
+              previousPartLastShots: previousPartShots.map((s: any) => ({
+                shotNumber: s.shot_number,
+                description: s.description,
+                camera: s.camera
+              })),
+              // Config
+              length: queueItem.config.length,
+              isFirstPart: i === 0,
+              isLastPart: i === storyParts.length - 1
             },
             maxAttempts: 1
           },
           (wrappedResult) => {
             // Unwrap the result - it comes wrapped with taskId, type, result, timestamp
             const result = wrappedResult?.result || wrappedResult;
-            
+
             debugService.success('ai', `✅ Part ${i + 1} shot breakdown completed: ${result?.length || 0} shots`, {
               partNumber: i + 1,
               shotCount: result?.length || 0
             });
-            
+
             if (result && Array.isArray(result)) {
               resolve(result);
             } else {
@@ -934,21 +1369,30 @@ class SequentialAiPipelineService {
         );
       });
 
-      // Add shots from this part to the total, updating shot numbers
+      // Add shots from this part to the total, updating shot numbers and part references
       if (partShots.length > 0) {
         const adjustedShots = partShots.map((shot, index) => ({
           ...shot,
           shot_number: currentShotNumber + index,
+          shotNumber: currentShotNumber + index,
           part_number: part.part_number,
-          part_title: part.title
+          partNumber: part.part_number,
+          part_title: part.title,
+          partTitle: part.title
         }));
-        
+
         allShots.push(...adjustedShots);
         currentShotNumber += partShots.length;
+
+        // Update the part with shot count
+        part.shotCount = partShots.length;
       }
     }
 
-    debugService.success('ai', `✅ All parts completed: ${allShots.length} total shots from ${storyParts.length} parts`);
+    debugService.success('ai', `✅ All parts completed: ${allShots.length} total shots from ${storyParts.length} parts`, {
+      totalShots: allShots.length,
+      shotsPerPart: storyParts.map((p: any) => ({ part: p.part_number, shots: p.shotCount || 0 }))
+    });
     return allShots;
   }
 }
