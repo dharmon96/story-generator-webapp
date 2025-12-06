@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { devtools, persist } from 'zustand/middleware';
 import { debugService } from '../services/debugService';
+import { GenerationMethodId } from '../types/generationMethods';
 
 export interface StoryConfig {
   prompt: string;
@@ -14,6 +15,10 @@ export interface StoryConfig {
   characterConsistency: boolean;
   musicGeneration: boolean;
   narrationGeneration: boolean;
+  // Generation method selection (defaults to 'holocine' if not specified)
+  generationMethod?: GenerationMethodId;  // 'holocine' | 'wan22' | 'kling' | etc.
+  // Legacy option (deprecated, use generationMethod instead)
+  generateComfyUIPrompts?: boolean;
 }
 
 export interface QueueItem {
@@ -56,12 +61,50 @@ export interface Story {
   status: 'draft' | 'generating' | 'completed';
   generationData?: any; // Store intermediate generation data
 
+  // Generation method used for this story
+  generationMethod?: GenerationMethodId;  // Which pipeline was used
+
   // Master Story Architecture fields
   masterStoryId?: string;  // If this is a part, references the master story
   storyParts?: StoryPart[];  // Array of story parts for multi-video production
   totalParts?: number;  // Total number of parts this story is divided into
   logline?: string;  // Story logline/summary for context
   totalDuration?: number;  // Total estimated duration in seconds
+
+  // HoloCine scene organization (scene-based pipeline output)
+  holoCineScenes?: HoloCineScene[];  // Scenes organized for HoloCine generation
+  holoCineCharacterMap?: Record<string, string>;  // characterId -> "[character1]" mapping
+}
+
+// Import HoloCine types inline to avoid circular dependencies
+export interface HoloCineScene {
+  id: string;
+  sceneNumber: number;
+  title: string;
+  globalCaption: string;
+  shotCaptions: string[];
+  shotCutFrames?: number[];
+  numFrames: 241 | 81;
+  resolution: '832x480' | '480x832' | '832x832';
+  fps: number;
+  characters: Array<{
+    id: string;
+    holoCineRef: string;
+    refNumber: number;
+    name: string;
+    description: string;
+  }>;
+  primaryLocation: string;
+  locationDescription: string;
+  estimatedDuration: number;
+  shotIds: string[];
+  partNumber?: number;
+  partTitle?: string;
+  status: 'draft' | 'ready' | 'generating' | 'completed' | 'failed';
+  videoUrl?: string;
+  thumbnailUrl?: string;
+  generatedAt?: Date;
+  error?: string;
 }
 
 export interface Character {

@@ -49,13 +49,32 @@ import { useStore, ModelConfig as StoreModelConfig } from '../store/useStore';
 import { nodeDiscoveryService, OllamaNode } from '../services/nodeDiscovery';
 import MultiNodeConfig from '../components/MultiNodeConfig';
 
-const PIPELINE_STEPS = [
-  { key: 'story', label: 'Story Generation', description: 'Main story creation and plot development' },
-  { key: 'characters', label: 'Character Development', description: 'Character descriptions and dialogue' },
-  { key: 'shots', label: 'Shot Planning', description: 'Visual scene breakdown and shot composition' },
-  { key: 'prompts', label: 'Image Prompts', description: 'AI image generation prompt creation' },
-  { key: 'narration', label: 'Narration', description: 'Voice-over script and timing' },
-  { key: 'music', label: 'Music & Audio', description: 'Background music and sound effects' },
+// Pipeline step type definition
+interface PipelineStep {
+  key: string;
+  label: string;
+  description: string;
+  pipeline: 'all' | 'scene-based' | 'shot-based';
+  badge?: string;
+  optional?: boolean;
+}
+
+// Pipeline steps - some are shared, some are pipeline-specific
+const PIPELINE_STEPS: PipelineStep[] = [
+  // Shared steps (all pipelines)
+  { key: 'story', label: 'Story Generation', description: 'Main story creation and plot development', pipeline: 'all' },
+  { key: 'characters', label: 'Character Development', description: 'Character descriptions and visual style', pipeline: 'all' },
+
+  // Scene-based pipeline (HoloCine)
+  { key: 'holocine_scenes', label: 'HoloCine Scenes', description: 'Multi-shot scene creation with character refs', pipeline: 'scene-based', badge: 'HoloCine' },
+
+  // Shot-based pipeline (Wan/Kling)
+  { key: 'shots', label: 'Shot Planning', description: 'Visual scene breakdown and shot composition', pipeline: 'shot-based', badge: 'Wan/Kling' },
+  { key: 'prompts', label: 'ComfyUI Prompts', description: 'AI image generation prompt creation', pipeline: 'shot-based', badge: 'Wan/Kling' },
+
+  // Optional steps (all pipelines)
+  { key: 'narration', label: 'Narration', description: 'Voice-over script and timing', pipeline: 'all', optional: true },
+  { key: 'music', label: 'Music & Audio', description: 'Background music and sound effects', pipeline: 'all', optional: true },
 ];
 
 const Settings: React.FC = () => {
@@ -75,8 +94,11 @@ const Settings: React.FC = () => {
   );
   const [scanning, setScanning] = useState(false);
   const [addNodeDialog, setAddNodeDialog] = useState(false);
+  const [addComfyUIDialog, setAddComfyUIDialog] = useState(false);
   const [newNodeHost, setNewNodeHost] = useState('');
   const [newNodePort, setNewNodePort] = useState(11434);
+  const [newComfyUIHost, setNewComfyUIHost] = useState('localhost');
+  const [newComfyUIPort, setNewComfyUIPort] = useState(8188);
   const [saved, setSaved] = useState(false);
   const [apiKeys, setApiKeys] = useState({
     openai: nodeDiscoveryService.getAPIKey('openai'),
@@ -215,6 +237,40 @@ const Settings: React.FC = () => {
       } else {
         alert(`❌ Connection failed!\n\nError: ${error.message}\n\nPlease check:\n- Ollama is running on ${host}:${newNodePort}\n- Firewall settings\n- Network configuration`);
       }
+    }
+  };
+
+  const handleAddComfyUI = async () => {
+    const host = newComfyUIHost.trim();
+    if (!host) return;
+
+    console.log(`🎨 Testing connection to ComfyUI at ${host}:${newComfyUIPort}...`);
+
+    try {
+      const result = await nodeDiscoveryService.addComfyUINode(host, newComfyUIPort);
+
+      if (result && result.status === 'online') {
+        console.log(`✅ Successfully connected to ComfyUI at ${host}:${newComfyUIPort}`);
+
+        setAddComfyUIDialog(false);
+        setNewComfyUIHost('localhost');
+        setNewComfyUIPort(8188);
+        setNodes(nodeDiscoveryService.getNodes());
+
+        alert(`✅ Successfully added ComfyUI at ${host}:${newComfyUIPort}\nFound ${result.models.length} models/nodes`);
+      } else {
+        alert(`❌ Could not connect to ComfyUI!\n\nPlease check:\n- ComfyUI is running on ${host}:${newComfyUIPort}\n- Firewall allows connections\n- IP address is correct`);
+      }
+    } catch (error: any) {
+      console.error(`❌ ComfyUI connection error:`, error);
+      alert(`❌ Connection failed!\n\nError: ${error.message}\n\nPlease check:\n- ComfyUI is running on ${host}:${newComfyUIPort}\n- Firewall settings\n- Network configuration`);
+    }
+  };
+
+  const handleRefreshComfyUI = async (nodeId: string) => {
+    const refreshedNode = await nodeDiscoveryService.refreshComfyUINode(nodeId);
+    if (refreshedNode) {
+      setNodes(prev => prev.map(n => n.id === nodeId ? refreshedNode : n));
     }
   };
 
@@ -723,6 +779,191 @@ const Settings: React.FC = () => {
                 );
               })()}
 
+              {/* ComfyUI Video Generation Section */}
+              <Box sx={{ mb: 4 }}>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2 }}>
+                  <Computer sx={{ color: 'rgba(255,255,255,0.9)' }} />
+                  <Typography variant="h6" sx={{ color: 'white', fontWeight: 'bold' }}>
+                    ComfyUI Video Generation
+                  </Typography>
+                  <Chip
+                    size="small"
+                    label={`${nodes.filter(n => n.type === 'comfyui').length}`}
+                    sx={{
+                      backgroundColor: 'rgba(255,255,255,0.2)',
+                      color: 'white',
+                      border: '1px solid rgba(255,255,255,0.3)',
+                    }}
+                    variant="outlined"
+                  />
+                  <Chip
+                    size="small"
+                    label="HoloCine & Wan 2.2"
+                    sx={{
+                      backgroundColor: 'rgba(156, 39, 176, 0.3)',
+                      color: 'white',
+                      border: '1px solid rgba(156, 39, 176, 0.5)',
+                    }}
+                    variant="outlined"
+                  />
+                  <Box sx={{ ml: 'auto' }}>
+                    <Tooltip title="Add ComfyUI Instance">
+                      <IconButton
+                        onClick={() => setAddComfyUIDialog(true)}
+                        sx={{
+                          backgroundColor: 'rgba(255,255,255,0.2)',
+                          color: 'white',
+                          '&:hover': { backgroundColor: 'rgba(255,255,255,0.3)' }
+                        }}
+                      >
+                        <Add />
+                      </IconButton>
+                    </Tooltip>
+                  </Box>
+                </Box>
+
+                {(() => {
+                  const comfyUINodes = nodes.filter(n => n.type === 'comfyui');
+                  if (comfyUINodes.length === 0) {
+                    return (
+                      <Box sx={{ textAlign: 'center', py: 3 }}>
+                        <Computer sx={{ fontSize: 40, color: 'rgba(255,255,255,0.4)', mb: 1 }} />
+                        <Typography variant="body2" sx={{ color: 'rgba(255,255,255,0.7)', mb: 1 }}>
+                          No ComfyUI instances configured
+                        </Typography>
+                        <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.5)', display: 'block', mb: 2 }}>
+                          Add a ComfyUI instance to enable HoloCine and Wan 2.2 video generation
+                        </Typography>
+                        <Button
+                          variant="outlined"
+                          size="small"
+                          startIcon={<Add />}
+                          onClick={() => setAddComfyUIDialog(true)}
+                          sx={{
+                            borderColor: 'rgba(255,255,255,0.5)',
+                            color: 'white',
+                            '&:hover': { borderColor: 'white', backgroundColor: 'rgba(255,255,255,0.1)' }
+                          }}
+                        >
+                          Add ComfyUI
+                        </Button>
+                      </Box>
+                    );
+                  }
+
+                  return (
+                    <Grid container spacing={2}>
+                      {comfyUINodes.map((node) => (
+                        <Grid size={{ xs: 12, md: 6 }} key={node.id}>
+                          <Fade in timeout={300}>
+                            <Paper
+                              sx={{
+                                p: 2,
+                                background: 'rgba(255,255,255,0.15)',
+                                backdropFilter: 'blur(10px)',
+                                border: '1px solid rgba(255,255,255,0.2)',
+                                borderRadius: 2,
+                                '&:hover': {
+                                  background: 'rgba(255,255,255,0.2)',
+                                  transform: 'translateY(-1px)',
+                                },
+                                transition: 'all 0.2s',
+                              }}
+                            >
+                              <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                                <Box sx={{ flex: 1 }}>
+                                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
+                                    <Box sx={{ color: 'white' }}><Computer /></Box>
+                                    {getStatusIcon(node.status)}
+                                    <Typography variant="subtitle1" fontWeight="bold" sx={{ color: 'white' }}>
+                                      {node.name}
+                                    </Typography>
+                                  </Box>
+                                  <Typography variant="body2" sx={{ color: 'rgba(255,255,255,0.8)' }} gutterBottom>
+                                    {node.host}:{node.port}
+                                  </Typography>
+                                  <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap', mb: 1 }}>
+                                    <Chip
+                                      size="small"
+                                      label={`${node.models.length} models`}
+                                      sx={{
+                                        backgroundColor: 'rgba(255,255,255,0.2)',
+                                        color: 'white',
+                                        border: '1px solid rgba(255,255,255,0.3)',
+                                      }}
+                                      variant="outlined"
+                                    />
+                                    <Chip
+                                      size="small"
+                                      label={node.status}
+                                      sx={{
+                                        backgroundColor: node.status === 'online' ? 'rgba(76, 175, 80, 0.8)' : 'rgba(244, 67, 54, 0.8)',
+                                        color: 'white',
+                                      }}
+                                      variant="filled"
+                                    />
+                                    {node.version && (
+                                      <Chip
+                                        size="small"
+                                        label={`v${node.version}`}
+                                        sx={{
+                                          backgroundColor: 'rgba(255,255,255,0.1)',
+                                          color: 'rgba(255,255,255,0.9)',
+                                          border: '1px solid rgba(255,255,255,0.2)',
+                                        }}
+                                        variant="outlined"
+                                      />
+                                    )}
+                                  </Box>
+                                  {/* Show video generation capabilities */}
+                                  <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                                    {node.models.filter(m => m.startsWith('[Video]')).map((model) => (
+                                      <Chip
+                                        key={model}
+                                        size="small"
+                                        label={model.replace('[Video] ', '')}
+                                        sx={{
+                                          height: 18,
+                                          fontSize: '0.65rem',
+                                          backgroundColor: 'rgba(156, 39, 176, 0.3)',
+                                          color: 'white',
+                                          border: '1px solid rgba(156, 39, 176, 0.5)',
+                                        }}
+                                        variant="outlined"
+                                      />
+                                    ))}
+                                  </Box>
+                                </Box>
+                                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+                                  <Tooltip title="Refresh">
+                                    <IconButton
+                                      size="small"
+                                      onClick={() => handleRefreshComfyUI(node.id)}
+                                      sx={{ color: 'rgba(255,255,255,0.8)', '&:hover': { color: 'white', backgroundColor: 'rgba(255,255,255,0.1)' } }}
+                                    >
+                                      <Refresh fontSize="small" />
+                                    </IconButton>
+                                  </Tooltip>
+                                  <Tooltip title="Remove">
+                                    <IconButton
+                                      size="small"
+                                      onClick={() => handleDeleteNode(node.id)}
+                                      sx={{ color: 'rgba(255,255,255,0.8)', '&:hover': { color: 'white', backgroundColor: 'rgba(255,255,255,0.1)' } }}
+                                    >
+                                      <Delete fontSize="small" />
+                                    </IconButton>
+                                  </Tooltip>
+                                </Box>
+                              </Box>
+                            </Paper>
+                          </Fade>
+                        </Grid>
+                      ))}
+                    </Grid>
+                  );
+                })()}
+              </Box>
+
               {/* Future Services Placeholder Sections */}
               {nodes.length > 0 && (
                 <Box sx={{ mb: 4 }}>
@@ -731,8 +972,8 @@ const Settings: React.FC = () => {
                     <Typography variant="h6" sx={{ color: 'rgba(255,255,255,0.7)', fontWeight: 'bold' }}>
                       Future Services
                     </Typography>
-                    <Chip 
-                      size="small" 
+                    <Chip
+                      size="small"
                       label="Coming Soon"
                       sx={{
                         backgroundColor: 'rgba(255,255,255,0.1)',
@@ -742,13 +983,13 @@ const Settings: React.FC = () => {
                       variant="outlined"
                     />
                   </Box>
-                  
+
                   <Grid container spacing={2}>
                     {/* ElevenLabs Placeholder */}
-                    <Grid size={{ xs: 12, md: 4 }}>
-                      <Paper 
-                        sx={{ 
-                          p: 2, 
+                    <Grid size={{ xs: 12, md: 6 }}>
+                      <Paper
+                        sx={{
+                          p: 2,
                           background: 'rgba(255,255,255,0.05)',
                           backdropFilter: 'blur(10px)',
                           border: '1px solid rgba(255,255,255,0.1)',
@@ -769,10 +1010,10 @@ const Settings: React.FC = () => {
                     </Grid>
 
                     {/* Suno Placeholder */}
-                    <Grid size={{ xs: 12, md: 4 }}>
-                      <Paper 
-                        sx={{ 
-                          p: 2, 
+                    <Grid size={{ xs: 12, md: 6 }}>
+                      <Paper
+                        sx={{
+                          p: 2,
                           background: 'rgba(255,255,255,0.05)',
                           backdropFilter: 'blur(10px)',
                           border: '1px solid rgba(255,255,255,0.1)',
@@ -788,30 +1029,6 @@ const Settings: React.FC = () => {
                         </Box>
                         <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.5)' }}>
                           AI music generation
-                        </Typography>
-                      </Paper>
-                    </Grid>
-
-                    {/* ComfyUI Placeholder */}
-                    <Grid size={{ xs: 12, md: 4 }}>
-                      <Paper 
-                        sx={{ 
-                          p: 2, 
-                          background: 'rgba(255,255,255,0.05)',
-                          backdropFilter: 'blur(10px)',
-                          border: '1px solid rgba(255,255,255,0.1)',
-                          borderRadius: 2,
-                          opacity: 0.6,
-                        }}
-                      >
-                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 1 }}>
-                          <Computer sx={{ color: 'rgba(255,255,255,0.6)' }} fontSize="small" />
-                          <Typography variant="subtitle2" sx={{ color: 'rgba(255,255,255,0.7)' }}>
-                            ComfyUI
-                          </Typography>
-                        </Box>
-                        <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.5)' }}>
-                          Advanced image generation
                         </Typography>
                       </Paper>
                     </Grid>
@@ -927,6 +1144,65 @@ const Settings: React.FC = () => {
                   >
                     Apply to All
                   </Button>
+                </Box>
+              </Box>
+
+              {/* Pipeline Legend */}
+              <Box sx={{ mb: 3, p: 2, backgroundColor: 'grey.50', borderRadius: 2, border: '1px solid', borderColor: 'grey.200' }}>
+                <Typography variant="subtitle2" color="text.secondary" gutterBottom>
+                  Pipeline Step Types:
+                </Typography>
+                <Box sx={{ display: 'flex', gap: 3, flexWrap: 'wrap', alignItems: 'center' }}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <Chip
+                      size="small"
+                      label="HoloCine"
+                      sx={{
+                        height: 20,
+                        fontSize: '0.7rem',
+                        fontWeight: 'bold',
+                        backgroundColor: 'rgba(156, 39, 176, 0.15)',
+                        color: '#9c27b0',
+                        border: '1px solid rgba(156, 39, 176, 0.4)',
+                      }}
+                    />
+                    <Typography variant="caption" color="text.secondary">
+                      Scene-based generation (multi-shot scenes)
+                    </Typography>
+                  </Box>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <Chip
+                      size="small"
+                      label="Wan/Kling"
+                      sx={{
+                        height: 20,
+                        fontSize: '0.7rem',
+                        fontWeight: 'bold',
+                        backgroundColor: 'rgba(33, 150, 243, 0.15)',
+                        color: '#2196f3',
+                        border: '1px solid rgba(33, 150, 243, 0.4)',
+                      }}
+                    />
+                    <Typography variant="caption" color="text.secondary">
+                      Shot-based generation (individual shots)
+                    </Typography>
+                  </Box>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <Chip
+                      size="small"
+                      label="Optional"
+                      sx={{
+                        height: 20,
+                        fontSize: '0.65rem',
+                        backgroundColor: 'rgba(158, 158, 158, 0.15)',
+                        color: '#757575',
+                        border: '1px solid rgba(158, 158, 158, 0.3)',
+                      }}
+                    />
+                    <Typography variant="caption" color="text.secondary">
+                      Can be skipped based on story settings
+                    </Typography>
+                  </Box>
                 </Box>
               </Box>
 
@@ -1113,10 +1389,91 @@ const Settings: React.FC = () => {
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setAddNodeDialog(false)}>Cancel</Button>
-          <Button 
-            onClick={handleAddNode} 
+          <Button
+            onClick={handleAddNode}
             variant="contained"
             disabled={!newNodeHost.trim()}
+          >
+            Add & Test Connection
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Add ComfyUI Dialog */}
+      <Dialog open={addComfyUIDialog} onClose={() => setAddComfyUIDialog(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            <Computer color="primary" />
+            Add ComfyUI Instance
+          </Box>
+        </DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
+            Add a ComfyUI instance for HoloCine and Wan 2.2 video generation. Make sure ComfyUI is running and accessible.
+          </Typography>
+
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3, mt: 1 }}>
+            <TextField
+              label="Host/IP Address"
+              value={newComfyUIHost}
+              onChange={(e) => setNewComfyUIHost(e.target.value)}
+              placeholder="localhost or 192.168.1.100"
+              fullWidth
+              helperText="Enter IP address or hostname of the ComfyUI machine"
+            />
+
+            <TextField
+              label="Port"
+              type="number"
+              value={newComfyUIPort}
+              onChange={(e) => setNewComfyUIPort(parseInt(e.target.value) || 8188)}
+              fullWidth
+              helperText="Default ComfyUI port is 8188"
+            />
+
+            <Box sx={{ p: 2, bgcolor: 'primary.50', borderRadius: 1 }}>
+              <Typography variant="caption" fontWeight="bold" color="primary.main">
+                🎬 Video Generation Requirements:
+              </Typography>
+              <Typography variant="caption" component="div" sx={{ mt: 0.5 }}>
+                • For <strong>HoloCine</strong>: Install kijai/ComfyUI-WanVideoWrapper with HoloCine support
+              </Typography>
+              <Typography variant="caption" component="div">
+                • For <strong>Wan 2.2</strong>: Install WanVideoWrapper nodes
+              </Typography>
+              <Typography variant="caption" component="div">
+                • Ensure CORS is enabled if accessing from a different machine
+              </Typography>
+            </Box>
+
+            <Box sx={{ p: 2, bgcolor: 'info.50', borderRadius: 1 }}>
+              <Typography variant="caption" fontWeight="bold" color="info.main">
+                📝 Common Examples:
+              </Typography>
+              <Typography variant="caption" component="div" sx={{ mt: 0.5 }}>
+                • localhost:8188 (local ComfyUI)
+              </Typography>
+              <Typography variant="caption" component="div">
+                • 192.168.1.100:8188 (network ComfyUI)
+              </Typography>
+              <Typography variant="caption" component="div">
+                • gpu-server.local:8188 (mDNS hostname)
+              </Typography>
+            </Box>
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setAddComfyUIDialog(false)}>Cancel</Button>
+          <Button
+            onClick={handleAddComfyUI}
+            variant="contained"
+            disabled={!newComfyUIHost.trim()}
+            sx={{
+              background: 'linear-gradient(45deg, #9c27b0 30%, #673ab7 90%)',
+              '&:hover': {
+                background: 'linear-gradient(45deg, #7b1fa2 30%, #512da8 90%)',
+              }
+            }}
           >
             Add & Test Connection
           </Button>

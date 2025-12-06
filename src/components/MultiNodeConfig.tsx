@@ -36,6 +36,9 @@ interface MultiNodeConfigProps {
     key: string;
     label: string;
     description: string;
+    pipeline?: 'all' | 'scene-based' | 'shot-based';
+    badge?: string;
+    optional?: boolean;
   };
   configs: ModelConfig[];
   nodes: OllamaNode[];
@@ -312,9 +315,47 @@ export const MultiNodeConfig: React.FC<MultiNodeConfigProps> = ({
           {stepIndex + 1}
         </Box>
         <Box sx={{ flex: 1 }}>
-          <Typography variant="h6" fontWeight="bold" sx={{ mb: 0.5 }}>
-            {step.label}
-          </Typography>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 0.5 }}>
+            <Typography variant="h6" fontWeight="bold">
+              {step.label}
+            </Typography>
+            {/* Pipeline badge - shows which generation method uses this step */}
+            {step.badge && (
+              <Chip
+                size="small"
+                label={step.badge}
+                sx={{
+                  height: 20,
+                  fontSize: '0.7rem',
+                  fontWeight: 'bold',
+                  backgroundColor: step.pipeline === 'scene-based'
+                    ? 'rgba(156, 39, 176, 0.15)' // Purple for HoloCine
+                    : 'rgba(33, 150, 243, 0.15)', // Blue for Wan/Kling
+                  color: step.pipeline === 'scene-based'
+                    ? '#9c27b0'
+                    : '#2196f3',
+                  border: '1px solid',
+                  borderColor: step.pipeline === 'scene-based'
+                    ? 'rgba(156, 39, 176, 0.4)'
+                    : 'rgba(33, 150, 243, 0.4)',
+                }}
+              />
+            )}
+            {/* Optional badge */}
+            {step.optional && (
+              <Chip
+                size="small"
+                label="Optional"
+                sx={{
+                  height: 20,
+                  fontSize: '0.65rem',
+                  backgroundColor: 'rgba(158, 158, 158, 0.15)',
+                  color: '#757575',
+                  border: '1px solid rgba(158, 158, 158, 0.3)',
+                }}
+              />
+            )}
+          </Box>
           <Typography variant="body2" color="text.secondary">
             {step.description}
           </Typography>

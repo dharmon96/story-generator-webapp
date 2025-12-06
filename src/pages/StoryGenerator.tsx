@@ -30,6 +30,8 @@ import {
   Casino,
 } from '@mui/icons-material';
 import { useStore } from '../store/useStore';
+import GenerationMethodSelector from '../components/GenerationMethodSelector';
+import { GenerationMethodId } from '../types/generationMethods';
 
 const genres = ['Drama', 'Comedy', 'Thriller', 'Sci-Fi', 'Romance', 'Horror', 'Mystery', 'Fantasy', 'Auto'];
 const lengths = ['Short', 'Medium', 'Long', 'Auto'];
@@ -60,6 +62,8 @@ const StoryGenerator: React.FC<StoryGeneratorProps> = ({ onNavigateToStory }) =>
     characterConsistency: true,
     musicGeneration: true,
     narrationGeneration: true,
+    generationMethod: 'holocine' as GenerationMethodId, // Default: HoloCine for scene-based generation
+    generateComfyUIPrompts: false, // Legacy: Skip ComfyUI prompts when using HoloCine
   });
 
   const [advancedSettings, setAdvancedSettings] = useState({
@@ -185,6 +189,17 @@ const StoryGenerator: React.FC<StoryGeneratorProps> = ({ onNavigateToStory }) =>
                   Randomize All
                 </Button>
               </Box>
+
+              {/* Generation Method Selector */}
+              <GenerationMethodSelector
+                value={config.generationMethod}
+                onChange={(method) => setConfig({
+                  ...config,
+                  generationMethod: method,
+                  // Auto-adjust ComfyUI prompts based on method
+                  generateComfyUIPrompts: method !== 'holocine'
+                })}
+              />
 
               <Grid container spacing={2}>
                 <Grid size={12}>

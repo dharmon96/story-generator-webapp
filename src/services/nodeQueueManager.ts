@@ -5,7 +5,7 @@ import { aiLogService } from './aiLogService';
 
 export interface QueueTask {
   id: string;
-  type: 'story' | 'segment' | 'shot' | 'character' | 'location' | 'prompt' | 'comfyui_prompts' | 'narration' | 'music';
+  type: 'story' | 'segment' | 'shot' | 'character' | 'location' | 'prompt' | 'comfyui_prompts' | 'narration' | 'music' | 'holocine_scene_direct';
   priority: number;
   storyId: string;
   parentTaskId?: string;
@@ -212,9 +212,9 @@ class NodeQueueManager {
     console.log(`🔧 [${timestamp}] processTaskDirectly() - START for task:`, task.id);
 
     try {
-      // Wait for an available node with retry logic
+      // Wait for an available node with retry logic - OPTIMIZED for speed
       const maxWaitTime = 120000; // 2 minutes max wait
-      const retryInterval = 500; // Check every 500ms
+      const retryInterval = 100; // Check every 100ms (5x faster polling)
       let waitTime = 0;
       let nodeAssignment = null;
 
@@ -228,8 +228,8 @@ class NodeQueueManager {
           await new Promise(resolve => setTimeout(resolve, retryInterval));
           waitTime += retryInterval;
 
-          // Log every 5 seconds of waiting
-          if (waitTime % 5000 === 0) {
+          // Log every 3 seconds of waiting (reduced spam)
+          if (waitTime % 3000 === 0) {
             console.log(`⏳ Waiting for node for task ${task.id}... (${waitTime / 1000}s elapsed)`);
           }
         }
@@ -275,6 +275,7 @@ class NodeQueueManager {
       case 'story':
         return 'story';
       case 'shot':
+      case 'holocine_scene_direct':
         return 'shots';
       case 'character':
       case 'location':
@@ -477,13 +478,26 @@ class NodeQueueManager {
       'prompt': 'prompts',
       'comfyui_prompts': 'prompts', // Use same model config as prompts
       'narration': 'narration',
-      'music': 'music'
+      'music': 'music',
+      'holocine_scene_direct': 'holocine_scenes' // Use HoloCine scenes config (falls back to shots if not configured)
     };
 
     const stepName = stepMap[type];
-    return this.modelConfigs.filter(config => 
+    let configs = this.modelConfigs.filter(config =>
       config.enabled && config.step === stepName
     );
+
+    // Fallback: if holocine_scenes has no config, use shots config
+    if (configs.length === 0 && stepName === 'holocine_scenes') {
+      configs = this.modelConfigs.filter(config =>
+        config.enabled && config.step === 'shots'
+      );
+      if (configs.length > 0) {
+        debugService.info('ai', `📋 No holocine_scenes config found, falling back to shots config`);
+      }
+    }
+
+    return configs;
   }
 
   private getOrCreateNodeStats(nodeId: string): NodeUsageStats {
@@ -608,6 +622,8 @@ class NodeQueueManager {
         return this.executeNarrationTask(task, node, model);
       case 'music':
         return this.executeMusicTask(task, node, model);
+      case 'holocine_scene_direct':
+        return this.executeHoloCineSceneDirectTask(task, node, model);
       default:
         throw new Error(`Unknown task type: ${task.type}`);
     }
@@ -1144,6 +1160,9 @@ ${contentToProcess}`;
       
       // Validate and format the shots
       if (data && data.shots && Array.isArray(data.shots) && data.shots.length > 0) {
+        // Extract scene_setting from the response (used for HoloCine global caption)
+        const sceneSetting = data.scene_setting || data.sceneSetting || '';
+
         const shots = data.shots.map((shot: any, index: number) => ({
           id: `shot_${Date.now()}_${index}`,
           storyId: task.data.story.id,
@@ -1158,7 +1177,10 @@ ${contentToProcess}`;
           visualPrompt: '',
           // Scene elements - characters and locations in this shot
           characters: shot.characters_in_shot || shot.characters || [],
-          locations: shot.locations_in_shot || shot.locations || (shot.location_in_shot ? [shot.location_in_shot] : (shot.location ? [shot.location] : []))
+          locations: shot.locations_in_shot || shot.locations || (shot.location_in_shot ? [shot.location_in_shot] : (shot.location ? [shot.location] : [])),
+          // HoloCine-specific fields
+          holocineCaption: shot.holocine_caption || shot.holocineCaption || '',
+          sceneSetting: index === 0 ? sceneSetting : '' // Only first shot stores scene setting
         }));
         
         console.log('🎬 executeShotTask: Successfully formatted', shots.length, 'shots');
@@ -1510,7 +1532,7 @@ Shot #${task.data.shot.shotNumber}`;
 
   private async executeMusicTask(task: QueueTask, node: any, model: string): Promise<any> {
     const { SYSTEM_PROMPTS } = await import('./systemPrompts');
-    
+
     const prompt = `Shot: ${task.data.shot.description}
 Music: ${task.data.shot.musicCue}
 Duration: ${task.data.shot.duration}s
@@ -1518,6 +1540,126 @@ Shot #${task.data.shot.shotNumber}`;
 
     const response = await this.callAI(node, model, SYSTEM_PROMPTS.music_director, prompt, task.id);
     return response.replace(/<think>.*?<\/think>/gs, '').trim();
+  }
+
+  /**
+   * Execute HoloCine Scene Direct Task
+   * Creates a complete scene with multiple shots directly from a story part.
+   * This is the "native" HoloCine mode that skips individual shot breakdown.
+   */
+  private async executeHoloCineSceneDirectTask(task: QueueTask, node: any, model: string): Promise<any> {
+    const { SYSTEM_PROMPTS } = await import('./systemPrompts');
+
+    const data = task.data;
+
+    // Build character context for the prompt
+    const characterList = (data.characters || [])
+      .map((char: any) => `- ${char.ref}: ${char.name} - ${char.physicalDescription || char.physical_description || 'character'}`)
+      .join('\n');
+
+    const prompt = `STORY TITLE: ${data.storyTitle}
+GENRE: ${data.storyGenre}
+
+MASTER STORY:
+${data.masterStoryContent?.slice(0, 1000) || 'No master story content'}
+
+STORY PART ${data.partNumber} of ${data.totalScenes}: "${data.partTitle}"
+${data.partContent || data.storyPart?.content || 'No content'}
+
+CHARACTERS (use these exact references):
+${characterList || 'No characters defined'}
+
+SCENE NUMBER: ${data.sceneNumber}
+IS FIRST SCENE: ${data.isFirstScene}
+IS LAST SCENE: ${data.isLastScene}
+
+Create a complete HoloCine scene from this story part. Generate:
+1. A global caption describing the scene setting and all characters
+2. Multiple shot captions (3-6 shots) using the [characterX] references
+3. Keep shots flowing naturally to tell this part of the story`;
+
+    debugService.info('ai', `🎬 Calling AI for HoloCine scene creation (Part ${data.partNumber})`);
+    const response = await this.callAI(node, model, SYSTEM_PROMPTS.holocine_scene_creator, prompt, task.id);
+    debugService.info('ai', '🎬 HoloCine scene response received', { responseLength: response.length });
+
+    try {
+      // Parse the JSON response
+      const parsedData = this.parseJSONResponse(response, 'scenes');
+
+      debugService.info('ai', `🎬 Parsed HoloCine response for Part ${data.partNumber}:`, {
+        hasScenes: !!parsedData.scenes,
+        scenesArrayLength: parsedData.scenes?.length || 0,
+        hasSceneNumber: !!(parsedData.scene_number || parsedData.sceneNumber),
+        hasGlobalCaption: !!(parsedData.global_caption || parsedData.globalCaption),
+        partNumber: data.partNumber
+      });
+
+      // Handle different response formats
+      // IMPORTANT: Each task should return ONE scene (one per story part)
+      // If AI returns multiple scenes in array, we take the first one for this part
+      let scene;
+      if (parsedData.scenes && Array.isArray(parsedData.scenes) && parsedData.scenes.length > 0) {
+        // Response has scenes array - take the first one (one scene per story part)
+        scene = parsedData.scenes[0];
+        if (parsedData.scenes.length > 1) {
+          debugService.warn('ai', `⚠️ AI returned ${parsedData.scenes.length} scenes for Part ${data.partNumber}, using first one only (one scene per part)`);
+        }
+      } else if (parsedData.scene_number || parsedData.sceneNumber || parsedData.global_caption || parsedData.globalCaption) {
+        // Response is a single scene object
+        scene = parsedData;
+      } else {
+        throw new Error('Could not find scene data in response');
+      }
+
+      // Normalize the scene data
+      const normalizedScene = {
+        scene_number: scene.scene_number || scene.sceneNumber || data.sceneNumber,
+        title: scene.title || data.partTitle || `Scene ${data.sceneNumber}`,
+        part_number: scene.part_number || scene.partNumber || data.partNumber,
+        part_title: scene.part_title || scene.partTitle || data.partTitle,
+        primary_location: scene.primary_location || scene.primaryLocation || 'Unknown Location',
+        location_description: scene.location_description || scene.locationDescription || '',
+        global_caption: scene.global_caption || scene.globalCaption || '',
+        shot_captions: scene.shot_captions || scene.shotCaptions || [],
+        characters: (scene.characters || data.characters || []).map((char: any, idx: number) => ({
+          name: char.name,
+          ref: char.ref || char.holoCineRef || `[character${idx + 1}]`,
+          ref_number: char.ref_number || char.refNumber || idx + 1,
+          physical_description: char.physical_description || char.physicalDescription || char.description || ''
+        })),
+        estimated_duration: scene.estimated_duration || scene.estimatedDuration || 12,
+        shot_count: (scene.shot_captions || scene.shotCaptions || []).length
+      };
+
+      debugService.success('ai', `🎬 Successfully parsed HoloCine scene: ${normalizedScene.title}`, {
+        shotCount: normalizedScene.shot_count,
+        globalCaptionLength: normalizedScene.global_caption.length
+      });
+
+      return normalizedScene;
+    } catch (error) {
+      debugService.error('ai', `🎬 Failed to parse HoloCine scene response: ${error}`);
+
+      // Return a fallback scene
+      return {
+        scene_number: data.sceneNumber,
+        title: data.partTitle || `Scene ${data.sceneNumber}`,
+        part_number: data.partNumber,
+        part_title: data.partTitle,
+        primary_location: 'Scene Location',
+        location_description: '',
+        global_caption: `The scene takes place in a ${data.storyGenre || 'dramatic'} setting. ` +
+          (data.characters || []).map((char: any) => `${char.ref} is ${char.name}, ${char.physicalDescription || 'a character in the scene'}.`).join(' '),
+        shot_captions: [
+          'Wide establishing shot of the scene',
+          `Medium shot of ${(data.characters && data.characters[0]) ? data.characters[0].ref : '[character1]'} entering`,
+          `Close-up reaction shot`
+        ],
+        characters: data.characters || [],
+        estimated_duration: 12,
+        shot_count: 3
+      };
+    }
   }
 
   private async callAI(node: any, model: string, systemPrompt: string, userPrompt: string, taskId?: string): Promise<string> {

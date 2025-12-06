@@ -2,6 +2,7 @@ import { QueueItem, Story, ModelConfig, useStore } from '../store/useStore';
 import { nodeQueueManager } from './nodeQueueManager';
 import { debugService } from './debugService';
 import { validationService } from './validationService';
+import { GenerationMethodId, getGenerationMethod, getPipelineSteps, shouldRunStep } from '../types/generationMethods';
 // Note: We don't use the imported storyDataManager directly, but define our own wrapper below
 // that syncs to the Zustand store for live UI updates
 
@@ -72,6 +73,13 @@ const storyDataManager = {
         visualPrompt: loc.visualPrompt || loc.visual_prompt || '',
         usedInShots: loc.usedInShots || []
       })),
+      // HoloCine scene-based pipeline fields
+      holoCineScenes: story.holoCineScenes || undefined,
+      holoCineCharacterMap: story.holoCineCharacterMap || undefined,
+      generationMethod: story.generationMethod || undefined,
+      // Story parts for multi-video architecture
+      storyParts: story.storyParts || undefined,
+      totalParts: story.totalParts || undefined,
       status: 'generating' as const,
       createdAt: story.createdAt || new Date(),
       updatedAt: new Date()
@@ -96,6 +104,8 @@ const storyDataManager = {
       shotsWithPositivePrompt,
       shotsWithNegativePrompt,
       charactersCount: storeStory.characters.length,
+      holoCineScenesCount: storeStory.holoCineScenes?.length || 0,
+      generationMethod: storeStory.generationMethod || 'not set',
       storeHasStory: !!matchingStory,
       totalStoriesInStore: storiesAfterUpdate.length
     });
@@ -105,6 +115,7 @@ const storyDataManager = {
       hasContent: !!storeStory.content,
       shotsCount: storeStory.shots.length,
       charactersCount: storeStory.characters.length,
+      holoCineScenesCount: storeStory.holoCineScenes?.length || 0,
       storeHasStory: !!matchingStory
     });
   },
@@ -226,55 +237,115 @@ class SequentialAiPipelineService {
     }
 
     try {
-      debugService.info('pipeline', `🚀 Starting sequential pipeline for: ${queueItem.config.prompt.slice(0, 50)}...`);
-      
-      // Define processing steps with explicit dependencies
-      const steps: StepDefinition[] = [
-        { 
-          id: 'story', 
-          name: 'Story Generation', 
-          required: true,
-          dependencies: [] // No dependencies - can run first
-        },
-        { 
-          id: 'segments', 
-          name: 'Story Segmentation', 
-          required: true,
-          dependencies: ['story'] // Must wait for story
-        },
-        { 
-          id: 'shots', 
-          name: 'Shot Breakdown', 
-          required: true,
-          dependencies: ['story', 'segments'] // Must wait for story and segments
-        },
-        { 
-          id: 'characters', 
-          name: 'Character Analysis', 
-          required: true,
-          dependencies: ['story'] // Can run after story, parallel with shots
-        },
-        { 
-          id: 'prompts', 
-          name: 'Visual Prompts', 
-          required: true,
-          dependencies: ['shots', 'characters'] // Must wait for both shots and characters
-        },
-        { 
-          id: 'narration', 
-          name: 'Narration Generation', 
-          required: false,
-          dependencies: ['shots'], // Must wait for shots
-          configCheck: (config) => config.narrationGeneration
-        },
-        { 
-          id: 'music', 
-          name: 'Music Cue Generation', 
-          required: false,
-          dependencies: ['shots'], // Must wait for shots
-          configCheck: (config) => config.musicGeneration
-        }
-      ];
+      // Determine generation method from config
+      const generationMethod: GenerationMethodId = queueItem.config.generationMethod || 'holocine';
+      const methodInfo = getGenerationMethod(generationMethod);
+
+      debugService.info('pipeline', `🚀 Starting ${generationMethod.toUpperCase()} pipeline for: ${queueItem.config.prompt.slice(0, 50)}...`, {
+        method: generationMethod,
+        pipelineType: methodInfo?.pipelineType || 'unknown'
+      });
+
+      // Define processing steps based on generation method
+      // SCENE-BASED (HoloCine): Story → Segments → Characters → HoloCine Scenes (skips individual shots)
+      // SHOT-BASED (Wan/Kling): Story → Segments → Shots → Characters → Prompts
+
+      let steps: StepDefinition[];
+
+      if (methodInfo?.pipelineType === 'scene-based') {
+        // HoloCine Native Pipeline - create scenes directly from story
+        debugService.info('pipeline', '🎬 Using SCENE-BASED pipeline (HoloCine native)');
+        steps = [
+          {
+            id: 'story',
+            name: 'Story Generation',
+            required: true,
+            dependencies: []
+          },
+          {
+            id: 'segments',
+            name: 'Story Segmentation',
+            required: true,
+            dependencies: ['story']
+          },
+          {
+            id: 'characters',
+            name: 'Character Analysis',
+            required: true,
+            dependencies: ['story']
+          },
+          {
+            // HoloCine scenes created DIRECTLY from story parts (no shot breakdown)
+            id: 'holocine_scenes_direct',
+            name: 'HoloCine Scene Creation',
+            required: true,
+            dependencies: ['story', 'segments', 'characters']
+          },
+          {
+            id: 'narration',
+            name: 'Narration Generation',
+            required: false,
+            dependencies: ['holocine_scenes_direct'],
+            configCheck: (config) => config.narrationGeneration
+          },
+          {
+            id: 'music',
+            name: 'Music Cue Generation',
+            required: false,
+            dependencies: ['holocine_scenes_direct'],
+            configCheck: (config) => config.musicGeneration
+          }
+        ];
+      } else {
+        // Shot-Based Pipeline (Wan 2.2, Kling, CogVideoX)
+        debugService.info('pipeline', '🎥 Using SHOT-BASED pipeline (Wan/Kling)');
+        steps = [
+          {
+            id: 'story',
+            name: 'Story Generation',
+            required: true,
+            dependencies: []
+          },
+          {
+            id: 'segments',
+            name: 'Story Segmentation',
+            required: true,
+            dependencies: ['story']
+          },
+          {
+            id: 'shots',
+            name: 'Shot Breakdown',
+            required: true,
+            dependencies: ['story', 'segments']
+          },
+          {
+            id: 'characters',
+            name: 'Character Analysis',
+            required: true,
+            dependencies: ['story']
+          },
+          {
+            id: 'prompts',
+            name: 'Visual Prompts (ComfyUI)',
+            required: true,
+            dependencies: ['shots', 'characters']
+          },
+          {
+            id: 'narration',
+            name: 'Narration Generation',
+            required: false,
+            dependencies: ['shots'],
+            configCheck: (config) => config.narrationGeneration
+          },
+          {
+            id: 'music',
+            name: 'Music Cue Generation',
+            required: false,
+            dependencies: ['shots'],
+            configCheck: (config) => config.musicGeneration
+          }
+        ];
+      }
 
       // Filter steps based on configuration
       const activeSteps = steps.filter(step => {
@@ -490,28 +561,143 @@ class SequentialAiPipelineService {
             break;
 
           case 'narration':
-            if (!shots.length) throw new Error('Shots required for narration');
-            await this.executeNarrationStep(shots, queueItem, modelConfigs, progress);
+            // For scene-based pipeline (HoloCine), skip traditional narration
+            // HoloCine scenes have global captions and shot captions, not individual shot narrations
+            if (partialStory?.holoCineScenes && partialStory.holoCineScenes.length > 0) {
+              debugService.info('pipeline', `🗣️ Skipping narration step for HoloCine pipeline - scenes use global/shot captions`);
+              // For HoloCine, we could optionally generate a voiceover script from the scene captions
+              // For now, we just mark this step as complete
+            } else if (shots.length > 0) {
+              await this.executeNarrationStep(shots, queueItem, modelConfigs, progress);
 
-            // Save partial story with narration for live UI updates
-            if (partialStory) {
-              partialStory.shots = shots;
-              partialStory.updatedAt = new Date();
-              storyDataManager.savePartialStory(partialStory);
-              debugService.info('pipeline', `💾 Updated story with narration`);
+              // Save partial story with narration for live UI updates
+              if (partialStory) {
+                partialStory.shots = shots;
+                partialStory.updatedAt = new Date();
+                storyDataManager.savePartialStory(partialStory);
+                debugService.info('pipeline', `💾 Updated story with narration`);
+              }
+            } else {
+              debugService.warn('pipeline', `⚠️ No shots or HoloCine scenes available for narration, skipping`);
             }
             break;
 
           case 'music':
-            if (!shots.length) throw new Error('Shots required for music generation');
-            await this.executeMusicStep(shots, queueItem, modelConfigs, progress);
+            // For scene-based pipeline (HoloCine), skip traditional music cues
+            // HoloCine generates video directly, music would be added in post-production
+            if (partialStory?.holoCineScenes && partialStory.holoCineScenes.length > 0) {
+              debugService.info('pipeline', `🎵 Skipping music step for HoloCine pipeline - music added in post-production`);
+            } else if (shots.length > 0) {
+              await this.executeMusicStep(shots, queueItem, modelConfigs, progress);
 
-            // Save partial story with music cues for live UI updates
+              // Save partial story with music cues for live UI updates
+              if (partialStory) {
+                partialStory.shots = shots;
+                partialStory.updatedAt = new Date();
+                storyDataManager.savePartialStory(partialStory);
+                debugService.info('pipeline', `💾 Updated story with music cues`);
+              }
+            } else {
+              debugService.warn('pipeline', `⚠️ No shots or HoloCine scenes available for music, skipping`);
+            }
+            break;
+
+          case 'holocine_scenes':
+            if (!shots.length) throw new Error('Shots required for HoloCine scene organization');
+            // Import holoCineService dynamically to avoid circular dependencies
+            const { holoCineService } = await import('./holoCineService');
+
+            // Create HoloCine scenes from story parts and shots
+            const holoCineScenes = holoCineService.createScenesFromStory({
+              id: queueItem.id,
+              title: story?.title || 'Untitled',
+              content: story?.content || '',
+              genre: queueItem.config.genre,
+              shots,
+              characters,
+              locations,
+              storyParts,
+              status: 'generating',
+              createdAt: new Date(),
+            });
+
+            debugService.info('pipeline', `🎬 Created ${holoCineScenes.length} HoloCine scenes`);
+
+            // Build character map for reference
+            const characterMap = holoCineService.buildCharacterMap(characters);
+            const holoCineCharacterMap: Record<string, string> = {};
+            characterMap.forEach((ref, id) => {
+              holoCineCharacterMap[id] = ref.holoCineRef;
+            });
+
+            // Save HoloCine scenes to partial story
             if (partialStory) {
-              partialStory.shots = shots;
+              partialStory.holoCineScenes = holoCineScenes;
+              partialStory.holoCineCharacterMap = holoCineCharacterMap;
               partialStory.updatedAt = new Date();
               storyDataManager.savePartialStory(partialStory);
-              debugService.info('pipeline', `💾 Updated story with music cues`);
+              debugService.info('pipeline', `💾 Updated story with ${holoCineScenes.length} HoloCine scenes`);
+            }
+            break;
+
+          case 'holocine_scenes_direct':
+            // HoloCine Native Pipeline: Create scenes DIRECTLY from story parts (no shot breakdown)
+            if (!storyParts || storyParts.length === 0) throw new Error('Story parts required for HoloCine scene creation');
+            if (!characters || characters.length === 0) throw new Error('Characters required for HoloCine scene creation');
+
+            debugService.info('pipeline', `🎬 Creating HoloCine scenes DIRECTLY from ${storyParts.length} story parts (native mode)`, {
+              storyPartsCount: storyParts.length,
+              storyPartTitles: storyParts.map((p: any) => p.title || `Part ${p.partNumber || p.part_number}`),
+              charactersCount: characters.length
+            });
+
+            // Execute the native HoloCine scene creation
+            const directScenes = await this.executeHoloCineDirectStep(
+              storyParts,
+              characters,
+              story,
+              queueItem,
+              nodeInfo,
+              progress
+            );
+
+            debugService.success('pipeline', `✅ Created ${directScenes.length} HoloCine scenes directly from story`, {
+              scenesCreated: directScenes.length,
+              expectedScenes: storyParts.length,
+              scenesMissing: storyParts.length - directScenes.length,
+              sceneSummary: directScenes.map((s: any) => ({
+                number: s.sceneNumber,
+                title: s.title,
+                partNumber: s.partNumber,
+                shotsCount: s.shotCaptions?.length || 0
+              }))
+            });
+
+            // Verify scene count matches story parts
+            if (directScenes.length !== storyParts.length) {
+              debugService.warn('pipeline', `⚠️ SCENE COUNT MISMATCH: Expected ${storyParts.length} scenes (one per story part), got ${directScenes.length}`, {
+                storyPartsCount: storyParts.length,
+                scenesCount: directScenes.length,
+                storyPartNumbers: storyParts.map((p: any) => p.partNumber || p.part_number),
+                scenePartNumbers: directScenes.map((s: any) => s.partNumber)
+              });
+            }
+
+            // Save to partial story
+            if (partialStory) {
+              partialStory.holoCineScenes = directScenes;
+              // Build character map from the scenes
+              const directCharacterMap: Record<string, string> = {};
+              if (directScenes.length > 0 && directScenes[0].characters) {
+                directScenes[0].characters.forEach((char: any) => {
+                  directCharacterMap[char.name] = char.ref || char.holoCineRef;
+                });
+              }
+              partialStory.holoCineCharacterMap = directCharacterMap;
+              partialStory.generationMethod = generationMethod;
+              partialStory.updatedAt = new Date();
+              storyDataManager.savePartialStory(partialStory);
+              debugService.info('pipeline', `💾 Updated story with ${directScenes.length} HoloCine scenes (native mode)`);
             }
             break;
         }
@@ -546,6 +732,9 @@ class SequentialAiPipelineService {
             break;
           case 'music':
             completionMessage = `Added music cues to shots`;
+            break;
+          case 'holocine_scenes':
+            completionMessage = `Organized shots into HoloCine scenes`;
             break;
         }
         this.addLog(progress, step.id, 'success', completionMessage, completionDetails);
@@ -697,11 +886,22 @@ class SequentialAiPipelineService {
       'characters': 'characters',
       'prompts': 'prompts',
       'narration': 'narration',
-      'music': 'music'
+      'music': 'music',
+      'holocine_scenes_direct': 'holocine_scenes', // HoloCine direct scene creation
+      'holocine_scenes': 'holocine_scenes' // HoloCine scene organization
     };
-    
+
     const modelConfigStep = stepMapping[stepType] || stepType;
-    const configs = modelConfigs.filter(c => c.step === modelConfigStep && c.enabled);
+    let configs = modelConfigs.filter(c => c.step === modelConfigStep && c.enabled);
+
+    // Fallback: if holocine_scenes has no config, use shots config
+    if (configs.length === 0 && (stepType === 'holocine_scenes_direct' || stepType === 'holocine_scenes')) {
+      configs = modelConfigs.filter(c => c.step === 'shots' && c.enabled);
+      if (configs.length > 0) {
+        debugService.info('pipeline', `📋 No holocine_scenes config found, falling back to shots config`);
+      }
+    }
+
     if (configs.length === 0) return null;
 
     debugService.debug('queue', `🔍 Checking node availability for ${stepType}`, {
@@ -1268,16 +1468,13 @@ class SequentialAiPipelineService {
   ): Promise<any[]> {
     if (!nodeInfo) throw new Error('No node available for shot breakdown');
 
-    debugService.info('ai', `🎬 Starting shot breakdown for ${storyParts.length} story parts`, {
+    debugService.info('ai', `🎬 Starting PARALLEL shot breakdown for ${storyParts.length} story parts`, {
       node: nodeInfo.name,
       model: nodeInfo.model,
       storyTitle: story.title,
       partCount: storyParts.length,
       masterStoryContentLength: story.content?.length || 0
     });
-
-    const allShots: any[] = [];
-    let currentShotNumber = 1;
 
     // Build master story context for coherence
     const masterStoryContext = {
@@ -1293,23 +1490,21 @@ class SequentialAiPipelineService {
       }))
     };
 
-    // Process each story part sequentially
-    for (let i = 0; i < storyParts.length; i++) {
-      const part = storyParts[i];
+    // Track completion for progress updates
+    let completedParts = 0;
+    const totalParts = storyParts.length;
 
-      // Get previous part's last shots for continuity
-      const previousPartShots = i > 0 ? allShots.slice(-3) : [];
+    // PARALLEL PROCESSING: Queue all parts at once
+    // Each part gets an estimated starting shot number based on average shots per part
+    const estimatedShotsPerPart = 5; // Estimate for initial numbering
 
-      debugService.info('ai', `🎬 Processing part ${i + 1}/${storyParts.length}: ${part.title}`, {
-        partNumber: part.part_number,
-        partTitle: part.title,
-        partContent: part.content?.length + ' characters',
-        hasMasterContext: !!masterStoryContext.fullStoryContent,
-        previousShotsForContext: previousPartShots.length
-      });
+    debugService.info('ai', `🚀 Queueing ALL ${storyParts.length} parts in PARALLEL for maximum speed`);
 
-      const partShots = await new Promise<any[]>((resolve, reject) => {
-        const taskId = nodeQueueManager.addTask(
+    const partPromises = storyParts.map((part, i) => {
+      const estimatedStartingShot = 1 + (i * estimatedShotsPerPart);
+
+      return new Promise<{ partIndex: number; shots: any[] }>((resolve, reject) => {
+        nodeQueueManager.addTask(
           {
             type: 'shot',
             priority: 8,
@@ -1324,54 +1519,65 @@ class SequentialAiPipelineService {
               // Part information
               partNumber: part.part_number,
               totalParts: storyParts.length,
-              startingShotNumber: currentShotNumber,
-              // Previous shots for transition continuity
-              previousPartLastShots: previousPartShots.map((s: any) => ({
-                shotNumber: s.shot_number,
-                description: s.description,
-                camera: s.camera
-              })),
+              startingShotNumber: estimatedStartingShot,
+              // No previous shots in parallel mode - use master context for transitions
+              previousPartLastShots: [],
               // Config
               length: queueItem.config.length,
               isFirstPart: i === 0,
               isLastPart: i === storyParts.length - 1
             },
-            maxAttempts: 1
+            maxAttempts: 2
           },
           (wrappedResult) => {
-            // Unwrap the result - it comes wrapped with taskId, type, result, timestamp
             const result = wrappedResult?.result || wrappedResult;
+            completedParts++;
 
-            debugService.success('ai', `✅ Part ${i + 1} shot breakdown completed: ${result?.length || 0} shots`, {
+            debugService.success('ai', `✅ Part ${i + 1}/${totalParts} completed: ${result?.length || 0} shots (${completedParts}/${totalParts} done)`, {
               partNumber: i + 1,
-              shotCount: result?.length || 0
+              shotCount: result?.length || 0,
+              completedParts,
+              remainingParts: totalParts - completedParts
             });
 
+            // Update progress
+            const progressPercent = Math.round((completedParts / totalParts) * 100);
+            this.updateProgress(progress, 'shots', 'Shot Breakdown',
+              25 + Math.round(progressPercent * 0.25), // 25-50%
+              progressPercent,
+              'parallel', nodeInfo.model
+            );
+
             if (result && Array.isArray(result)) {
-              resolve(result);
+              resolve({ partIndex: i, shots: result });
             } else {
               debugService.warn('ai', `⚠️ Part ${i + 1} returned invalid result, using empty array`);
-              resolve([]);
+              resolve({ partIndex: i, shots: [] });
             }
           },
           (error) => {
             debugService.error('ai', `❌ Part ${i + 1} shot breakdown failed: ${error.message}`, error);
             reject(error);
-          },
-          (progressData) => {
-            const partProgress = (i / storyParts.length) * 25 + (progressData.stepProgress || 0) * (25 / storyParts.length);
-            this.updateProgress(progress, 'shots', 'Shot Breakdown',
-              25 + Math.round(partProgress), // 25-50%
-              progressData.stepProgress || 0,
-              nodeInfo.name, nodeInfo.model
-            );
           }
         );
       });
+    });
 
-      // Add shots from this part to the total, updating shot numbers and part references
-      if (partShots.length > 0) {
-        const adjustedShots = partShots.map((shot, index) => ({
+    // Wait for all parts to complete in parallel
+    debugService.info('ai', `⏳ Waiting for ${storyParts.length} parallel tasks to complete...`);
+    const partResults = await Promise.all(partPromises);
+
+    // Sort by part index and renumber shots sequentially
+    partResults.sort((a, b) => a.partIndex - b.partIndex);
+
+    const allShots: any[] = [];
+    let currentShotNumber = 1;
+
+    for (const { partIndex, shots } of partResults) {
+      const part = storyParts[partIndex];
+
+      if (shots.length > 0) {
+        const adjustedShots = shots.map((shot, index) => ({
           ...shot,
           shot_number: currentShotNumber + index,
           shotNumber: currentShotNumber + index,
@@ -1382,18 +1588,178 @@ class SequentialAiPipelineService {
         }));
 
         allShots.push(...adjustedShots);
-        currentShotNumber += partShots.length;
-
-        // Update the part with shot count
-        part.shotCount = partShots.length;
+        currentShotNumber += shots.length;
+        part.shotCount = shots.length;
       }
     }
 
-    debugService.success('ai', `✅ All parts completed: ${allShots.length} total shots from ${storyParts.length} parts`, {
+    debugService.success('ai', `✅ PARALLEL processing complete: ${allShots.length} total shots from ${storyParts.length} parts`, {
       totalShots: allShots.length,
       shotsPerPart: storyParts.map((p: any) => ({ part: p.part_number, shots: p.shotCount || 0 }))
     });
     return allShots;
+  }
+
+  /**
+   * Execute HoloCine Direct Scene Creation
+   * This creates scenes DIRECTLY from story parts without going through individual shot breakdown.
+   * The AI creates complete scenes with multiple shot captions in one step.
+   */
+  private async executeHoloCineDirectStep(
+    storyParts: any[],
+    characters: any[],
+    story: any,
+    queueItem: QueueItem,
+    nodeInfo: { id: string; name: string; model: string } | null,
+    progress: SequentialProgress
+  ): Promise<any[]> {
+    if (!nodeInfo) throw new Error('No node available for HoloCine scene creation');
+
+    debugService.info('ai', `🎬 Starting HoloCine DIRECT scene creation for ${storyParts.length} story parts`, {
+      node: nodeInfo.name,
+      model: nodeInfo.model,
+      storyTitle: story.title,
+      partCount: storyParts.length,
+      characterCount: characters.length
+    });
+
+    // Build character context for the prompt
+    const characterContext = characters.map((char: any, index: number) => ({
+      name: char.name,
+      ref: `[character${index + 1}]`,
+      refNumber: index + 1,
+      physicalDescription: char.physical_description || char.physicalDescription || '',
+      role: char.role || 'supporting',
+      clothing: char.clothing || char.clothing_style || ''
+    }));
+
+    // Track completion
+    let completedParts = 0;
+    const totalParts = storyParts.length;
+
+    debugService.info('ai', `🚀 Queueing ${storyParts.length} story parts for HoloCine scene creation`);
+
+    // Process each story part to create a complete scene
+    const partPromises = storyParts.map((part, i) => {
+      return new Promise<{ partIndex: number; scene: any }>((resolve, reject) => {
+        nodeQueueManager.addTask(
+          {
+            type: 'holocine_scene_direct',  // New task type for direct scene creation
+            priority: 8,
+            storyId: story.id,
+            data: {
+              // Story context
+              storyTitle: story.title,
+              storyGenre: story.genre,
+              masterStoryContent: story.content,
+              // Specific part to convert to scene
+              storyPart: part,
+              partNumber: part.part_number || part.partNumber,
+              partTitle: part.title,
+              partContent: part.content,
+              // Character references
+              characters: characterContext,
+              // Scene settings
+              sceneNumber: i + 1,
+              totalScenes: storyParts.length,
+              isFirstScene: i === 0,
+              isLastScene: i === storyParts.length - 1
+            },
+            maxAttempts: 2
+          },
+          (wrappedResult) => {
+            const result = wrappedResult?.result || wrappedResult;
+            completedParts++;
+
+            debugService.success('ai', `✅ Part ${i + 1}/${totalParts} → Scene created (${completedParts}/${totalParts} done)`, {
+              partNumber: i + 1,
+              sceneTitle: result?.title || 'Untitled Scene',
+              shotCount: result?.shot_captions?.length || result?.shotCaptions?.length || 0,
+              completedParts
+            });
+
+            // Update progress
+            const progressPercent = Math.round((completedParts / totalParts) * 100);
+            this.updateProgress(progress, 'holocine_scenes_direct', 'HoloCine Scene Creation',
+              50 + Math.round(progressPercent * 0.35), // 50-85%
+              progressPercent,
+              'parallel', nodeInfo.model
+            );
+
+            if (result) {
+              resolve({ partIndex: i, scene: result });
+            } else {
+              debugService.warn('ai', `⚠️ Part ${i + 1} returned no scene, creating fallback`);
+              resolve({
+                partIndex: i,
+                scene: {
+                  scene_number: i + 1,
+                  title: part.title || `Scene ${i + 1}`,
+                  part_number: part.part_number || part.partNumber,
+                  global_caption: `The scene takes place in a ${story.genre || 'dramatic'} setting.`,
+                  shot_captions: ['Wide establishing shot of the scene'],
+                  characters: [],
+                  estimated_duration: 10
+                }
+              });
+            }
+          },
+          (error) => {
+            debugService.error('ai', `❌ Part ${i + 1} scene creation failed: ${error.message}`, error);
+            reject(error);
+          }
+        );
+      });
+    });
+
+    // Wait for all scenes to be created
+    debugService.info('ai', `⏳ Waiting for ${storyParts.length} HoloCine scenes to be created...`);
+    const sceneResults = await Promise.all(partPromises);
+
+    // Sort by part index and format into HoloCineScene format
+    sceneResults.sort((a, b) => a.partIndex - b.partIndex);
+
+    const holoCineScenes = sceneResults.map(({ partIndex, scene }) => {
+      const part = storyParts[partIndex];
+
+      return {
+        id: `holocine_scene_${Date.now()}_${partIndex}`,
+        sceneNumber: scene.scene_number || partIndex + 1,
+        title: scene.title || part.title || `Scene ${partIndex + 1}`,
+        globalCaption: scene.global_caption || scene.globalCaption || '',
+        shotCaptions: scene.shot_captions || scene.shotCaptions || [],
+        shotCutFrames: scene.shot_cut_frames || scene.shotCutFrames,
+        numFrames: 241 as const,  // Default to 15 second scenes
+        resolution: '832x480' as const,
+        fps: 16,
+        characters: (scene.characters || characterContext).map((char: any) => ({
+          id: char.id || `char_${char.name?.replace(/\s+/g, '_')}`,
+          holoCineRef: char.ref || char.holoCineRef,
+          refNumber: char.ref_number || char.refNumber,
+          name: char.name,
+          description: char.physical_description || char.physicalDescription || char.description || ''
+        })),
+        primaryLocation: scene.primary_location || scene.primaryLocation || part.title || 'Scene Location',
+        locationDescription: scene.location_description || scene.locationDescription || '',
+        estimatedDuration: scene.estimated_duration || scene.estimatedDuration || 12,
+        shotIds: [], // No individual shots in native mode
+        partNumber: part.part_number || part.partNumber,
+        partTitle: part.title,
+        status: 'ready' as const
+      };
+    });
+
+    debugService.success('ai', `✅ HoloCine DIRECT processing complete: ${holoCineScenes.length} scenes created`, {
+      totalScenes: holoCineScenes.length,
+      sceneSummary: holoCineScenes.map(s => ({
+        number: s.sceneNumber,
+        title: s.title,
+        shots: s.shotCaptions.length,
+        duration: s.estimatedDuration
+      }))
+    });
+
+    return holoCineScenes;
   }
 }
 

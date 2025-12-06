@@ -388,9 +388,9 @@ class NodeDiscoveryService {
       type: 'ollama',
       category: 'local',
     };
-    
+
     this.nodes.set(id, node);
-    
+
     // Check the node in the background
     this.checkNode(host, port).then(checkedNode => {
       if (checkedNode) {
@@ -399,6 +399,191 @@ class NodeDiscoveryService {
         this.nodes.set(id, { ...node, status: 'offline' });
       }
     });
+  }
+
+  /**
+   * Add a ComfyUI instance
+   * ComfyUI has a different API structure than Ollama
+   */
+  async addComfyUINode(host: string, port: number = 8188): Promise<OllamaNode | null> {
+    const id = `comfyui_${host}:${port}`;
+
+    console.log(`🎨 Adding ComfyUI node at ${host}:${port}...`);
+
+    const node: OllamaNode = {
+      id,
+      name: this.generateComfyUIName(host, port),
+      host,
+      port,
+      status: 'checking',
+      models: [],
+      lastChecked: new Date(),
+      type: 'comfyui',
+      category: 'local',
+    };
+
+    this.nodes.set(id, node);
+
+    // Check the node
+    const checkedNode = await this.checkComfyUINode(host, port);
+    if (checkedNode) {
+      this.nodes.set(id, checkedNode);
+      return checkedNode;
+    } else {
+      const offlineNode = { ...node, status: 'offline' as const };
+      this.nodes.set(id, offlineNode);
+      return offlineNode;
+    }
+  }
+
+  /**
+   * Check if a ComfyUI instance is reachable and get its info
+   */
+  private async checkComfyUINode(host: string, port: number): Promise<OllamaNode | null> {
+    const id = `comfyui_${host}:${port}`;
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+      // ComfyUI system stats endpoint
+      const response = await fetch(`http://${host}:${port}/system_stats`, {
+        method: 'GET',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        mode: 'cors',
+      });
+
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        const systemStats = await response.json();
+        console.log(`✅ Found ComfyUI at ${host}:${port}`, systemStats);
+
+        // Try to get available models/checkpoints
+        const models = await this.getComfyUIModels(host, port);
+
+        return {
+          id,
+          name: this.generateComfyUIName(host, port),
+          host,
+          port,
+          status: 'online',
+          models,
+          version: systemStats.system?.comfyui_version || 'unknown',
+          lastChecked: new Date(),
+          type: 'comfyui',
+          category: 'local',
+        };
+      }
+    } catch (error: any) {
+      if (error.name === 'AbortError') {
+        console.log(`⏰ ComfyUI timeout at ${host}:${port}`);
+      } else {
+        console.log(`🚫 ComfyUI check failed for ${host}:${port}:`, error.message);
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Get available models/checkpoints from ComfyUI
+   */
+  private async getComfyUIModels(host: string, port: number): Promise<string[]> {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+      // Get object_info which contains all node types and their options
+      const response = await fetch(`http://${host}:${port}/object_info`, {
+        method: 'GET',
+        signal: controller.signal,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        mode: 'cors',
+      });
+
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        const objectInfo = await response.json();
+        const models: string[] = [];
+
+        // Extract checkpoint models
+        if (objectInfo.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0]) {
+          models.push(...objectInfo.CheckpointLoaderSimple.input.required.ckpt_name[0]);
+        }
+
+        // Also check for video models (Wan, HoloCine, etc.)
+        // Look for HoloCine-specific nodes
+        const holoCineNodes = ['HoloCineLoader', 'HoloCineSceneLoader', 'WanVideoLoader'];
+        for (const nodeName of holoCineNodes) {
+          if (objectInfo[nodeName]) {
+            console.log(`🎬 Found video generation node: ${nodeName}`);
+            // Add as a "model" to indicate capability
+            models.push(`[Video] ${nodeName}`);
+          }
+        }
+
+        // Check for Wan 2.2 specific nodes
+        const wanNodes = ['WanVideoWrapper', 'Wan2_2Loader', 'WanVideoSampler'];
+        for (const nodeName of wanNodes) {
+          if (objectInfo[nodeName]) {
+            console.log(`🎥 Found Wan video node: ${nodeName}`);
+            models.push(`[Video] ${nodeName}`);
+          }
+        }
+
+        console.log(`🎨 ComfyUI models found: ${models.length}`, models.slice(0, 10));
+        return models;
+      }
+    } catch (error) {
+      console.warn(`⚠️ Could not fetch ComfyUI models from ${host}:${port}:`, error);
+    }
+
+    // Return default video generation models as fallback
+    return ['HoloCine', 'Wan 2.2', 'SDXL', 'Flux'];
+  }
+
+  private generateComfyUIName(host: string, port: number): string {
+    if (host === 'localhost' || host === '127.0.0.1') {
+      return port === 8188 ? 'Local ComfyUI' : `Local ComfyUI (:${port})`;
+    }
+    return port === 8188 ? `ComfyUI (${host})` : `ComfyUI (${host}:${port})`;
+  }
+
+  /**
+   * Refresh a ComfyUI node's status
+   */
+  async refreshComfyUINode(nodeId: string): Promise<OllamaNode | null> {
+    const existingNode = this.nodes.get(nodeId);
+    if (!existingNode || existingNode.type !== 'comfyui') return null;
+
+    const refreshedNode = await this.checkComfyUINode(existingNode.host, existingNode.port);
+    if (refreshedNode) {
+      this.nodes.set(nodeId, refreshedNode);
+      return refreshedNode;
+    } else {
+      const offlineNode = {
+        ...existingNode,
+        status: 'offline' as const,
+        lastChecked: new Date(),
+      };
+      this.nodes.set(nodeId, offlineNode);
+      return offlineNode;
+    }
+  }
+
+  /**
+   * Get all ComfyUI nodes
+   */
+  getComfyUINodes(): OllamaNode[] {
+    return Array.from(this.nodes.values()).filter(node => node.type === 'comfyui');
   }
 
   addAPINode(type: 'openai' | 'claude', apiKey: string): void {

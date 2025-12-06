@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   Box,
   Tabs,
@@ -8,6 +8,8 @@ import {
   Chip,
   LinearProgress,
   Paper,
+  Tooltip,
+  alpha,
 } from '@mui/material';
 import {
   ArrowBack as ArrowBackIcon,
@@ -16,6 +18,8 @@ import {
   Chat as ChatIcon,
   Settings as SettingsIcon,
   Style as StyleIcon,
+  Videocam as ScenesIcon,
+  Movie as MovieIcon,
 } from '@mui/icons-material';
 
 // Import the tab components
@@ -24,10 +28,12 @@ import ShotlistTab from './story-tabs/ShotlistTab';
 import AIChatTab from './story-tabs/AIChatTab';
 import GenerationSettingsTab from './story-tabs/GenerationSettingsTab';
 import StyleSheetTab from './story-tabs/StyleSheetTab';
+import ScenesTab from './story-tabs/ScenesTab';
 
 import { useStore } from '../store/useStore';
 import { EnhancedStory, AILogEntry } from '../types/storyTypes';
 import { aiLogService } from '../services/aiLogService';
+import { getGenerationMethod, GenerationMethodId } from '../types/generationMethods';
 
 interface StoryDetailProps {
   storyId: string;
@@ -74,6 +80,9 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
   // Also track character and location prompts for reactivity
   const characterPromptSignature = story?.characters?.map(c => c.visualPrompt ? '1' : '0').join('') || '';
   const locationPromptSignature = story?.locations?.map(l => l.visualPrompt ? '1' : '0').join('') || '';
+  // Track HoloCine scenes for scene-based pipeline reactivity
+  const holoCineScenesCount = story?.holoCineScenes?.length || 0;
+  const holoCineScenesSignature = story?.holoCineScenes?.map(s => `${s.sceneNumber}:${s.shotCaptions?.length || 0}`).join(',') || '';
 
   // Debug logging for story lookup - check for prompt updates
   console.log('🔍 [StoryDetail] Looking up story:', {
@@ -86,6 +95,9 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
     shotsWithPositivePrompts: shotsWithPrompts,
     promptSignature,
     firstShotHasPrompt: !!story?.shots?.[0]?.comfyUIPositivePrompt,
+    holoCineScenesCount,
+    holoCineScenesSignature,
+    generationMethod: story?.generationMethod || 'not set',
     storyUpdatedAt: story?.updatedAt,
     totalStoriesInStore: stories.length
   });
@@ -282,9 +294,9 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
       console.log('📖 Updating AI logs from queue item:', queueItem.logs.length);
       setAiLogs(queueItem.logs);
     }
-  // Depend on promptSignature to ensure re-render when prompts are updated
-  // This string changes whenever a shot gains a prompt, forcing the useEffect to run
-  }, [story, story?.updatedAt, promptSignature, characterPromptSignature, locationPromptSignature, queueItem, storyId]);
+  // Depend on promptSignature and holoCineScenesSignature to ensure re-render when data updates
+  // These strings change whenever shots/scenes update, forcing the useEffect to run
+  }, [story, story?.updatedAt, promptSignature, characterPromptSignature, locationPromptSignature, holoCineScenesSignature, queueItem, storyId]);
 
   // Enhanced progress calculation that responds to queue item updates
   const overallProgress = React.useMemo(() => {
@@ -308,6 +320,59 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
   const isCompleted = queueItem?.status === 'completed' || (storyData?.status === 'completed' && queueItem?.status !== 'processing');
   const hasError = queueItem?.status === 'failed' || storyData?.status === 'failed';
   const isConnected = isGenerating && !!queueItem; // Show as connected when actively processing with queue item
+
+  // Determine generation method from story or queue item config
+  const generationMethodId: GenerationMethodId = useMemo(() => {
+    // First check story's generationMethod
+    if (story?.generationMethod) return story.generationMethod;
+    // Then check queue item config
+    if (queueItem?.config?.generationMethod) return queueItem.config.generationMethod;
+    // Fallback: if story has holoCineScenes but no shots, it's likely HoloCine
+    if (story?.holoCineScenes && story.holoCineScenes.length > 0 && (!story?.shots || story.shots.length === 0)) {
+      return 'holocine';
+    }
+    // Default to holocine (current default)
+    return 'holocine';
+  }, [story?.generationMethod, queueItem?.config?.generationMethod, story?.holoCineScenes, story?.shots]);
+
+  const generationMethod = getGenerationMethod(generationMethodId);
+  const isSceneBased = generationMethod?.pipelineType === 'scene-based';
+  const isShotBased = generationMethod?.pipelineType === 'shot-based';
+
+  // Determine which tabs to show based on generation method
+  const tabs = useMemo(() => {
+    const baseTabs = [
+      { id: 'story', icon: <StoryIcon />, label: 'Story', alwaysShow: true },
+    ];
+
+    if (isShotBased) {
+      // Shot-based: Show Shotlist prominently, Scenes hidden/secondary
+      baseTabs.push({ id: 'shotlist', icon: <ShotlistIcon />, label: 'Shotlist', alwaysShow: true });
+      // Only show Scenes tab if there are scenes (for backwards compatibility)
+      if (story?.holoCineScenes && story.holoCineScenes.length > 0) {
+        baseTabs.push({ id: 'scenes', icon: <ScenesIcon />, label: 'Scenes', alwaysShow: false });
+      }
+    } else {
+      // Scene-based (HoloCine): Show Scenes prominently, Shotlist hidden
+      baseTabs.push({ id: 'scenes', icon: <ScenesIcon />, label: 'Scenes', alwaysShow: true });
+      // Only show Shotlist if there are shots (for backwards compatibility)
+      if (story?.shots && story.shots.length > 0) {
+        baseTabs.push({ id: 'shotlist', icon: <ShotlistIcon />, label: 'Shotlist', alwaysShow: false });
+      }
+    }
+
+    // Always show these tabs
+    baseTabs.push(
+      { id: 'stylesheet', icon: <StyleIcon />, label: 'Style Sheet', alwaysShow: true },
+      { id: 'aichat', icon: <ChatIcon />, label: 'AI Chat', alwaysShow: true },
+      { id: 'settings', icon: <SettingsIcon />, label: 'Settings', alwaysShow: true }
+    );
+
+    return baseTabs;
+  }, [isShotBased, story?.holoCineScenes, story?.shots]);
+
+  // Map tab index to tab id for content rendering
+  const getTabIdForIndex = (index: number) => tabs[index]?.id || 'story';
 
   // If no story found and no queue item, show error state (after all hooks)
   if (!story && !queueItem) {
@@ -342,7 +407,24 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
               ID: {storyId} • Created: {queueItem?.createdAt ? new Date(queueItem.createdAt).toLocaleString() : 'Unknown'}
             </Typography>
           </Box>
-          <Box sx={{ display: 'flex', gap: 1 }}>
+          <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+            {/* Generation Method Badge */}
+            {generationMethod && (
+              <Tooltip title={`${generationMethod.pipelineType === 'scene-based' ? 'Scene-based' : 'Shot-based'} pipeline`}>
+                <Chip
+                  icon={<MovieIcon sx={{ fontSize: 16 }} />}
+                  label={generationMethod.name}
+                  size="small"
+                  sx={{
+                    bgcolor: alpha(generationMethod.color, 0.15),
+                    color: generationMethod.color,
+                    borderColor: generationMethod.color,
+                    '& .MuiChip-icon': { color: generationMethod.color }
+                  }}
+                  variant="outlined"
+                />
+              </Tooltip>
+            )}
             <Chip
               label={isCompleted ? 'Completed' : isGenerating ? 'Generating' : hasError ? 'Failed' : 'Queued'}
               color={isCompleted ? 'success' : isGenerating ? 'primary' : hasError ? 'error' : 'default'}
@@ -361,16 +443,19 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
               {currentStep && isGenerating && (
                 <>
                   {' • '}
-                  <Box component="span" sx={{ color: 'primary.main', fontWeight: 500 }}>
+                  <Box component="span" sx={{ color: generationMethod?.color || 'primary.main', fontWeight: 500 }}>
                     {currentStep === 'story' && '📝 Writing Story'}
+                    {currentStep === 'segments' && '📑 Segmenting Story'}
                     {currentStep === 'shots' && '🎬 Creating Shots'}
                     {currentStep === 'characters' && '👥 Analyzing Characters'}
+                    {currentStep === 'holocine_scenes_direct' && '🎬 Creating HoloCine Scenes'}
+                    {currentStep === 'holocine_scenes' && '🎬 Organizing HoloCine Scenes'}
                     {currentStep === 'prompts' && '🎨 Generating Prompts'}
                     {currentStep === 'comfyui_prompts' && '🖼️ ComfyUI Prompts'}
                     {currentStep === 'narration' && '🎙️ Adding Narration'}
                     {currentStep === 'music' && '🎵 Adding Music'}
                     {currentStep === 'completed' && '✅ Finalizing'}
-                    {!['story', 'shots', 'characters', 'prompts', 'comfyui_prompts', 'narration', 'music', 'completed'].includes(currentStep) && currentStep}
+                    {!['story', 'segments', 'shots', 'characters', 'holocine_scenes_direct', 'holocine_scenes', 'prompts', 'comfyui_prompts', 'narration', 'music', 'completed'].includes(currentStep) && currentStep}
                   </Box>
                 </>
               )}
@@ -393,21 +478,25 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
         </Box>
       </Paper>
 
-      {/* Tab Navigation */}
+      {/* Tab Navigation - Dynamic based on generation method */}
       <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 2 }}>
         <Tabs value={currentTab} onChange={handleTabChange} aria-label="story detail tabs">
-          <Tab icon={<StoryIcon />} label="Story" />
-          <Tab icon={<ShotlistIcon />} label="Shotlist" />
-          <Tab icon={<StyleIcon />} label="Style Sheet" />
-          <Tab icon={<ChatIcon />} label="AI Chat" />
-          <Tab icon={<SettingsIcon />} label="Settings" />
+          {tabs.map((tab, index) => (
+            <Tab
+              key={tab.id}
+              icon={tab.icon}
+              label={tab.label}
+              sx={!tab.alwaysShow ? { opacity: 0.7 } : undefined}
+            />
+          ))}
         </Tabs>
       </Box>
 
-      {/* Tab Content */}
+      {/* Tab Content - Renders based on dynamic tab IDs */}
       <Box sx={{ flex: 1, overflow: 'hidden' }}>
-        <TabPanel value={currentTab} index={0}>
-          <StoryTab 
+        {/* Story Tab - Always first */}
+        {getTabIdForIndex(currentTab) === 'story' && (
+          <StoryTab
             storyData={storyData}
             isGenerating={isGenerating}
             onUpdateStory={(updates) => {
@@ -417,17 +506,18 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
               if (updates.content) storeUpdates.content = updates.content;
               if (updates.genre) storeUpdates.genre = updates.genre;
               updateStory(storyId, storeUpdates);
-              
+
               // Update local state immediately
               if (storyData) {
                 setStoryData({ ...storyData, ...updates });
               }
             }}
           />
-        </TabPanel>
+        )}
 
-        <TabPanel value={currentTab} index={1}>
-          <ShotlistTab 
+        {/* Shotlist Tab - For shot-based pipelines */}
+        {getTabIdForIndex(currentTab) === 'shotlist' && (
+          <ShotlistTab
             storyData={storyData}
             onUpdateShot={(shotId, updates) => {
               // Update shot in local state and store
@@ -437,7 +527,7 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
                 );
                 const updatedStory = { ...storyData, shots: updatedShots };
                 setStoryData(updatedStory);
-                
+
                 // Convert to store format
                 const basicShots = updatedShots.map(shot => ({
                   id: shot.id,
@@ -458,9 +548,19 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
               }
             }}
           />
-        </TabPanel>
+        )}
 
-        <TabPanel value={currentTab} index={2}>
+        {/* Scenes Tab - For scene-based (HoloCine) pipelines */}
+        {getTabIdForIndex(currentTab) === 'scenes' && (
+          <ScenesTab
+            scenes={story?.holoCineScenes || []}
+            characterMap={story?.holoCineCharacterMap || {}}
+            storyId={storyId}
+          />
+        )}
+
+        {/* Style Sheet Tab */}
+        {getTabIdForIndex(currentTab) === 'stylesheet' && (
           <StyleSheetTab
             characters={storyData?.characters || []}
             locations={storyData?.locations || []}
@@ -472,7 +572,7 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
                   char.id === charId ? { ...char, ...updates } : char
                 );
                 setStoryData({ ...storyData, characters: updatedCharacters });
-                
+
                 // Update store
                 const basicCharacters = updatedCharacters.map(char => ({
                   name: char.name || 'Unknown',
@@ -494,10 +594,11 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
               }
             }}
           />
-        </TabPanel>
+        )}
 
-        <TabPanel value={currentTab} index={3}>
-          <AIChatTab 
+        {/* AI Chat Tab */}
+        {getTabIdForIndex(currentTab) === 'aichat' && (
+          <AIChatTab
             aiLogs={aiLogs}
             storyId={storyId}
             onClearLogs={() => {
@@ -505,14 +606,15 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
               setAiLogs([]);
             }}
           />
-        </TabPanel>
+        )}
 
-        <TabPanel value={currentTab} index={4}>
-          <GenerationSettingsTab 
+        {/* Settings Tab */}
+        {getTabIdForIndex(currentTab) === 'settings' && (
+          <GenerationSettingsTab
             queueItem={queueItem || null}
             storyData={storyData}
           />
-        </TabPanel>
+        )}
       </Box>
     </Box>
   );

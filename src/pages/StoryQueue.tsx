@@ -189,12 +189,15 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
   };
 
   const getStepDisplayName = (step: string): string => {
+    // Step names in HoloCine-optimized pipeline order:
+    // 1. Story → 2. Segments → 3. Shots → 4. Characters → 5. HoloCine Scenes → (optional: prompts, narration, music)
     const stepNames: Record<string, string> = {
       'story': '📝 Writing Story',
       'segments': '📑 Segmenting Story',
       'shots': '🎬 Creating Shots',
       'characters': '👥 Analyzing Characters',
-      'prompts': '🎨 Generating Prompts',
+      'holocine_scenes': '🎥 Building HoloCine Scenes',
+      'prompts': '🎨 ComfyUI Prompts (Optional)',
       'comfyui_prompts': '🖼️ ComfyUI Prompts',
       'narration': '🎙️ Adding Narration',
       'music': '🎵 Adding Music',

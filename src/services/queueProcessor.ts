@@ -258,10 +258,22 @@ class QueueProcessor {
         throw new Error('Story processing returned null');
       }
 
-      debugService.success('queue', `✅ Successfully processed: ${story.title}`);
+      debugService.success('queue', `✅ Successfully processed: ${story.title}`, {
+        hasHoloCineScenes: !!story.holoCineScenes,
+        holoCineScenesCount: story.holoCineScenes?.length || 0,
+        generationMethod: story.generationMethod
+      });
 
       // Convert to store-compatible format and save
       const basicStory = this.convertToBasicStory(story, item);
+
+      debugService.info('queue', `💾 Saving story with HoloCine data:`, {
+        id: basicStory.id,
+        hasHoloCineScenes: !!basicStory.holoCineScenes,
+        holoCineScenesCount: basicStory.holoCineScenes?.length || 0,
+        generationMethod: basicStory.generationMethod
+      });
+
       addStory(basicStory);
 
       // Mark queue item as completed
@@ -315,6 +327,16 @@ class QueueProcessor {
         age_range: char.age_range || char.age || '',
         importance_level: char.importance_level || char.importanceLevel || 3
       })) || [],
+      // Locations
+      locations: story.locations || [],
+      // HoloCine scene-based pipeline fields
+      holoCineScenes: story.holoCineScenes || undefined,
+      holoCineCharacterMap: story.holoCineCharacterMap || undefined,
+      // Generation method used
+      generationMethod: story.generationMethod || queueItem.config.generationMethod || undefined,
+      // Story parts for multi-video architecture
+      storyParts: story.storyParts || undefined,
+      totalParts: story.totalParts || undefined,
       status: 'completed',
       createdAt: story.createdAt,
       updatedAt: story.updatedAt
