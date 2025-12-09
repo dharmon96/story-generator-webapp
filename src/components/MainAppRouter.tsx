@@ -7,6 +7,7 @@ import Dashboard from '../pages/Dashboard';
 import Research from '../pages/Research';
 import Metrics from '../pages/Metrics';
 import Settings from '../pages/Settings';
+import RenderQueue from '../pages/RenderQueue';
 import StoryDetail from '../components/StoryDetail';
 
 const MainAppRouter: React.FC = () => {
@@ -31,6 +32,7 @@ const MainAppRouter: React.FC = () => {
         <Route path="/queue" element={<StoryQueue onOpenStory={handleOpenStory} />} />
         <Route path="/research" element={<Research />} />
         <Route path="/metrics" element={<Metrics />} />
+        <Route path="/render-queue" element={<RenderQueue />} />
         <Route path="/settings" element={<Settings />} />
         <Route 
           path="/story/:storyId" 

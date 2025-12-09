@@ -134,6 +134,15 @@ export const HOLOCINE_PIPELINE: GenerationStep[] = [
     required: false,
     dependencies: ['holocine_scenes'],
     taskType: 'music'
+  },
+  {
+    id: 'comfyui_render',
+    name: 'Video Rendering',
+    description: 'Render scenes to video using ComfyUI',
+    required: false,
+    dependencies: ['holocine_scenes'],
+    outputType: 'scenes',
+    taskType: 'comfyui_render'
   }
 ];
 
@@ -198,6 +207,15 @@ export const SHOT_BASED_PIPELINE: GenerationStep[] = [
     required: false,
     dependencies: ['shots'],
     taskType: 'music'
+  },
+  {
+    id: 'comfyui_render',
+    name: 'Video Rendering',
+    description: 'Render shots to video using ComfyUI',
+    required: false,
+    dependencies: ['prompts'],
+    outputType: 'shots',
+    taskType: 'comfyui_render'
   }
 ];
 

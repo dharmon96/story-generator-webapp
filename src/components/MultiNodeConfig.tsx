@@ -27,6 +27,7 @@ import {
   KeyboardArrowDown,
   Check,
   Close,
+  Speed,
 } from '@mui/icons-material';
 import { ModelConfig } from '../store/useStore';
 import { OllamaNode, nodeDiscoveryService } from '../services/nodeDiscovery';
@@ -67,13 +68,14 @@ export const MultiNodeConfig: React.FC<MultiNodeConfigProps> = ({
   });
   const [testStatus, setTestStatus] = useState<Record<string, 'testing' | 'success' | 'error' | null>>({});
 
-  const getNodeTypeIcon = (type: 'ollama' | 'openai' | 'claude' | 'elevenlabs' | 'suno' | 'comfyui') => {
+  const getNodeTypeIcon = (type: 'ollama' | 'openai' | 'claude' | 'elevenlabs' | 'suno' | 'comfyui' | 'unified') => {
     switch (type) {
       case 'ollama': return <Computer fontSize="small" />;
       case 'openai': return <SmartToy fontSize="small" />;
       case 'claude': return <Cloud fontSize="small" />;
       case 'elevenlabs': return <SmartToy fontSize="small" />;
       case 'suno': return <SmartToy fontSize="small" />;
+      case 'unified': return <Speed fontSize="small" />;
       case 'comfyui': return <Computer fontSize="small" />;
       default: return <Computer fontSize="small" />;
     }

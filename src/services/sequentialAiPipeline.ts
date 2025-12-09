@@ -1,8 +1,8 @@
-import { QueueItem, Story, ModelConfig, useStore } from '../store/useStore';
+import { QueueItem, Story, ModelConfig, useStore, StepCheckpoint } from '../store/useStore';
 import { nodeQueueManager } from './nodeQueueManager';
 import { debugService } from './debugService';
 import { validationService } from './validationService';
-import { GenerationMethodId, getGenerationMethod, getPipelineSteps, shouldRunStep } from '../types/generationMethods';
+import { GenerationMethodId, getGenerationMethod } from '../types/generationMethods';
 // Note: We don't use the imported storyDataManager directly, but define our own wrapper below
 // that syncs to the Zustand store for live UI updates
 
@@ -162,6 +162,132 @@ class SequentialAiPipelineService {
   private nodeAssignments = new Map<string, { storyId: string; stepId: string; model: string; startTime: Date }>();
   private globalNodeBusyStatus = new Map<string, boolean>(); // Global tracking of node busy status
   private abortControllers = new Map<string, AbortController>(); // Track abort controllers per story
+  private stepStartTimes = new Map<string, number>(); // Track step start times for duration calculation
+
+  /**
+   * Save or update a checkpoint for a story's pipeline execution
+   */
+  private saveStepCheckpoint(
+    storyId: string,
+    queueItemId: string,
+    stepId: string,
+    status: 'started' | 'completed' | 'failed',
+    output?: any,
+    error?: string
+  ): void {
+    const store = useStore.getState();
+    const stepKey = `${storyId}_${stepId}`;
+
+    if (status === 'started') {
+      // Record step start time
+      this.stepStartTimes.set(stepKey, Date.now());
+
+      // Initialize or update checkpoint with current step
+      const existing = store.checkpoints[storyId];
+      if (existing) {
+        store.updateCheckpointStep(storyId, stepId, {});
+      } else {
+        store.saveCheckpoint({
+          storyId,
+          queueItemId,
+          completedSteps: [],
+          currentStep: stepId,
+          stepData: {},
+          lastUpdated: new Date(),
+          resumeCount: 0
+        });
+      }
+      debugService.info('checkpoint', `📍 Checkpoint: Starting step '${stepId}' for story ${storyId}`);
+    } else if (status === 'completed') {
+      // Calculate duration
+      const startTime = this.stepStartTimes.get(stepKey);
+      const duration = startTime ? Date.now() - startTime : 0;
+      this.stepStartTimes.delete(stepKey);
+
+      // Update checkpoint with completed step
+      store.updateCheckpointStep(storyId, stepId, {
+        completedAt: new Date(),
+        duration,
+        output: output ? { type: typeof output, keys: Object.keys(output || {}).slice(0, 5) } : undefined
+      });
+      debugService.success('checkpoint', `✅ Checkpoint: Completed step '${stepId}' for story ${storyId} (${(duration / 1000).toFixed(1)}s)`);
+    } else if (status === 'failed') {
+      // Calculate duration
+      const startTime = this.stepStartTimes.get(stepKey);
+      const duration = startTime ? Date.now() - startTime : 0;
+      this.stepStartTimes.delete(stepKey);
+
+      // Update checkpoint with failed step
+      store.updateCheckpointStep(storyId, stepId, {
+        completedAt: new Date(),
+        duration,
+        error: error || 'Unknown error'
+      });
+      debugService.error('checkpoint', `❌ Checkpoint: Failed step '${stepId}' for story ${storyId}: ${error}`);
+    }
+  }
+
+  /**
+   * Get the checkpoint for a story to determine resume point
+   */
+  getCheckpoint(storyId: string): StepCheckpoint | null {
+    return useStore.getState().checkpoints[storyId] || null;
+  }
+
+  /**
+   * Clear checkpoint after successful completion
+   */
+  clearCheckpoint(storyId: string): void {
+    useStore.getState().clearCheckpoint(storyId);
+    debugService.info('checkpoint', `🗑️ Cleared checkpoint for story ${storyId}`);
+  }
+
+  /**
+   * Resume processing from checkpoint
+   * Returns the step to resume from, or null if no checkpoint exists
+   */
+  async resumeFromCheckpoint(
+    queueItem: QueueItem,
+    modelConfigs: ModelConfig[],
+    onProgress?: (progress: SequentialProgress) => void
+  ): Promise<Story | null> {
+    const checkpoint = this.getCheckpoint(queueItem.id);
+    if (!checkpoint) {
+      debugService.warn('checkpoint', `No checkpoint found for story ${queueItem.id}, starting fresh`);
+      return null;
+    }
+
+    debugService.info('checkpoint', `🔄 Resuming from checkpoint for story ${queueItem.id}`, {
+      completedSteps: checkpoint.completedSteps,
+      currentStep: checkpoint.currentStep,
+      resumeCount: checkpoint.resumeCount
+    });
+
+    // Increment resume count
+    useStore.getState().incrementResumeCount(queueItem.id);
+
+    // Process with resume flag
+    // The processQueueItem will need to check for checkpoint and skip completed steps
+    // For now, we'll just restart - full resume implementation would require significant refactoring
+    // TODO: Implement true step-skipping based on checkpoint.completedSteps
+    return this.processQueueItem(queueItem, modelConfigs, onProgress);
+  }
+
+  /**
+   * Restart processing from the beginning (clears checkpoint first)
+   */
+  async restartProcessing(
+    queueItem: QueueItem,
+    modelConfigs: ModelConfig[],
+    onProgress?: (progress: SequentialProgress) => void
+  ): Promise<Story> {
+    // Clear any existing checkpoint
+    this.clearCheckpoint(queueItem.id);
+
+    debugService.info('checkpoint', `🔄 Restarting processing from beginning for story ${queueItem.id}`);
+
+    return this.processQueueItem(queueItem, modelConfigs, onProgress);
+  }
 
   // Stop processing a specific story
   stopProcessing(storyId: string): void {
@@ -402,6 +528,10 @@ class SequentialAiPipelineService {
           this.assignNode(nodeInfo.id, queueItem.id, step.id, nodeInfo.model);
         }
 
+        // Save checkpoint when step starts
+        this.saveStepCheckpoint(queueItem.id, queueItem.id, step.id, 'started');
+
+        try {
         switch (step.id) {
           case 'story':
             story = await this.executeStoryStep(queueItem, nodeInfo, progress);
@@ -700,6 +830,50 @@ class SequentialAiPipelineService {
               debugService.info('pipeline', `💾 Updated story with ${directScenes.length} HoloCine scenes (native mode)`);
             }
             break;
+
+          case 'comfyui_render':
+            // ComfyUI Video Rendering Step
+            // This step adds scenes/shots to the render queue for ComfyUI processing
+            debugService.info('pipeline', `🎬 Starting ComfyUI render step...`);
+
+            // Import render queue manager
+            const { renderQueueManager } = await import('./renderQueueManager');
+
+            // Check for HoloCine scenes (scene-based pipeline)
+            if (partialStory?.holoCineScenes && partialStory.holoCineScenes.length > 0) {
+              debugService.info('pipeline', `🎬 Queueing ${partialStory.holoCineScenes.length} HoloCine scenes for ComfyUI rendering`);
+
+              // Create render jobs from scenes
+              renderQueueManager.createJobsFromScenes(queueItem.id, partialStory.holoCineScenes, queueItem.config);
+
+              debugService.success('pipeline', `✅ Added ${partialStory.holoCineScenes.length} scenes to render queue`);
+            }
+            // Check for shots with prompts (shot-based pipeline)
+            else if (shots && shots.length > 0) {
+              const shotsWithPrompts = shots.filter(s => s.comfyUIPositivePrompt || s.visualPrompt);
+              if (shotsWithPrompts.length > 0) {
+                debugService.info('pipeline', `🎬 Queueing ${shotsWithPrompts.length} shots for ComfyUI rendering`);
+
+                // Create render jobs from shots
+                renderQueueManager.createJobsFromShots(queueItem.id, shotsWithPrompts, queueItem.config);
+
+                debugService.success('pipeline', `✅ Added ${shotsWithPrompts.length} shots to render queue`);
+              } else {
+                debugService.warn('pipeline', `⚠️ No shots with ComfyUI prompts found, skipping render step`);
+              }
+            } else {
+              debugService.warn('pipeline', `⚠️ No scenes or shots available for rendering, skipping`);
+            }
+            break;
+        }
+
+        // Save checkpoint on step completion
+        this.saveStepCheckpoint(queueItem.id, queueItem.id, step.id, 'completed', { stepId: step.id });
+
+        } catch (stepError: any) {
+          // Save checkpoint on step failure
+          this.saveStepCheckpoint(queueItem.id, queueItem.id, step.id, 'failed', undefined, stepError.message || String(stepError));
+          throw stepError; // Re-throw to be caught by outer error handler
         }
 
         // Mark step as completed for dependency tracking
@@ -735,6 +909,9 @@ class SequentialAiPipelineService {
             break;
           case 'holocine_scenes':
             completionMessage = `Organized shots into HoloCine scenes`;
+            break;
+          case 'comfyui_render':
+            completionMessage = `Added scenes/shots to render queue`;
             break;
         }
         this.addLog(progress, step.id, 'success', completionMessage, completionDetails);
@@ -794,6 +971,9 @@ class SequentialAiPipelineService {
         characterCount: characters.length,
         validationPassed: completeStoryValidation.isValid
       });
+
+      // Clear checkpoint on successful completion
+      this.clearCheckpoint(queueItem.id);
 
       return finalStory;
 

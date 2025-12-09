@@ -7,7 +7,8 @@
 
 import { HoloCineScene, HoloCineGenerationSettings, buildRawPromptString } from '../types/holocineTypes';
 import { debugService } from './debugService';
-import { nodeDiscoveryService } from './nodeDiscovery';
+import { nodeDiscoveryService, OllamaNode } from './nodeDiscovery';
+import { useStore } from '../store/useStore';
 
 export interface ComfyUIQueueItem {
   id: string;
@@ -183,7 +184,7 @@ class ComfyUIRenderService {
   /**
    * Get all available ComfyUI nodes
    */
-  getAvailableNodes() {
+  getAvailableNodes(): OllamaNode[] {
     return nodeDiscoveryService.getComfyUINodes().filter(n => n.status === 'online');
   }
 
@@ -195,12 +196,48 @@ class ComfyUIRenderService {
   }
 
   /**
-   * Get the first available ComfyUI endpoint
+   * Get the assigned node for a specific render step from settings
    */
-  getEndpoint(): string | null {
+  getAssignedNode(stepId: string): OllamaNode | null {
+    try {
+      const settings = useStore.getState().settings;
+      const assignment = settings.comfyUISettings?.nodeAssignments?.find(a => a.stepId === stepId);
+      if (!assignment || !assignment.nodeId) return null;
+
+      const nodes = this.getAvailableNodes();
+      return nodes.find(n => n.id === assignment.nodeId) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Get the first available ComfyUI endpoint, preferring assigned nodes
+   */
+  getEndpoint(stepId?: string): string | null {
+    // First try to get assigned node for the step
+    if (stepId) {
+      const assignedNode = this.getAssignedNode(stepId);
+      if (assignedNode) {
+        return `http://${assignedNode.host}:${assignedNode.port}`;
+      }
+    }
+
+    // Fall back to first available node
     const nodes = this.getAvailableNodes();
     if (nodes.length === 0) return null;
     return `http://${nodes[0].host}:${nodes[0].port}`;
+  }
+
+  /**
+   * Get ComfyUI settings from store
+   */
+  getComfyUISettings() {
+    try {
+      return useStore.getState().settings.comfyUISettings || null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -209,12 +246,17 @@ class ComfyUIRenderService {
   async queueScene(
     scene: HoloCineScene,
     settings: HoloCineGenerationSettings,
-    negativePrompt: string = 'blurry, low quality, distorted, deformed'
+    negativePrompt?: string
   ): Promise<ComfyUIQueueItem> {
-    const endpoint = this.getEndpoint();
+    // Use assigned HoloCine node or fall back to first available
+    const endpoint = this.getEndpoint('holocine_render');
     if (!endpoint) {
       throw new Error('No ComfyUI instance available. Please configure ComfyUI in Settings.');
     }
+
+    // Use negative prompt from settings if not provided
+    const comfySettings = this.getComfyUISettings();
+    const finalNegativePrompt = negativePrompt || comfySettings?.defaultNegativePrompt || 'blurry, low quality, distorted, deformed';
 
     const queueItem: ComfyUIQueueItem = {
       id: `render_${scene.id}_${Date.now()}`,
@@ -229,7 +271,7 @@ class ComfyUIRenderService {
 
     try {
       // Build workflow payload
-      const workflowPayload = buildSimpleHoloCineWorkflow(scene, settings, negativePrompt);
+      const workflowPayload = buildSimpleHoloCineWorkflow(scene, settings, finalNegativePrompt);
 
       debugService.info('comfyui', `🎬 Queueing HoloCine scene ${scene.sceneNumber}: ${scene.title}`, {
         endpoint,

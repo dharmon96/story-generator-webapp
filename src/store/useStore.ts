@@ -194,6 +194,97 @@ export interface ModelConfig {
   priority: number; // For ordering within the same step
 }
 
+// ComfyUI node assignment for pipeline rendering steps
+export interface ComfyUINodeAssignment {
+  stepId: string;  // e.g., 'holocine_render', 'wan_render'
+  nodeId: string;  // ComfyUI node ID from nodeDiscovery
+  workflowId: string;  // Which workflow to use
+  modelOverrides?: Record<string, string>;  // Override specific models
+  enabled: boolean;
+}
+
+// ComfyUI-specific settings
+export interface ComfyUISettings {
+  nodeAssignments: ComfyUINodeAssignment[];
+  defaultWorkflow: 'holocine' | 'wan22' | 'cogvideox' | 'custom';
+  modelMappings: Record<string, string>;  // Friendly name -> actual file name
+  autoValidateModels: boolean;
+  defaultNegativePrompt: string;
+  maxConcurrentRenders: number;
+  autoRetryFailed: boolean;
+  retryAttempts: number;
+}
+
+// Step data for individual checkpoint steps
+export interface StepCheckpointData {
+  completedAt?: Date;
+  duration?: number;  // Time taken in ms
+  output?: any;  // Step-specific output data
+  assignedNode?: string;
+  model?: string;
+  error?: string;  // If step failed
+}
+
+// Step checkpoint for retry/resume capability
+export interface StepCheckpoint {
+  storyId: string;
+  queueItemId: string;
+  completedSteps: string[];  // Step IDs that have completed successfully
+  currentStep: string | null;  // Step currently in progress (or null if none)
+  stepData: {
+    [stepId: string]: StepCheckpointData;
+  };
+  lastUpdated: Date;
+  resumeCount: number;  // Number of times this checkpoint has been resumed
+}
+
+// Render job for video generation queue
+export interface RenderJob {
+  id: string;
+  storyId: string;
+  type: 'holocine_scene' | 'shot' | 'character_reference';
+  targetId: string;  // Scene ID or Shot ID
+  targetNumber: number;  // For ordering
+  title: string;
+
+  // Prompt data
+  positivePrompt: string;
+  negativePrompt: string;
+
+  // Generation settings (pulled from story config)
+  settings: {
+    workflow: 'holocine' | 'wan22' | 'cogvideox';
+    numFrames: number;
+    fps: number;
+    resolution: string;
+    steps?: number;
+    cfg?: number;
+    seed?: number;
+  };
+
+  // Status
+  status: 'queued' | 'assigned' | 'rendering' | 'completed' | 'failed';
+  progress: number;
+  assignedNode?: string;
+
+  // Output
+  outputUrl?: string;
+  thumbnailUrl?: string;
+
+  // Timing
+  createdAt: Date;
+  startedAt?: Date;
+  completedAt?: Date;
+
+  // Error handling
+  error?: string;
+  attempts: number;
+  maxAttempts: number;
+
+  // Priority (lower = higher priority)
+  priority: number;
+}
+
 export interface Settings {
   theme: 'light' | 'dark' | 'system';
   autoSave: boolean;
@@ -206,6 +297,8 @@ export interface Settings {
   parallelProcessing?: number;
   autoRetry?: boolean;
   retryAttempts?: number;
+  // ComfyUI workflow settings
+  comfyUISettings?: ComfyUISettings;
 }
 
 export interface StoreState {
@@ -218,30 +311,54 @@ export interface StoreState {
     progress: number;
     currentStep: string;
   };
-  
+
+  // Step checkpoints for retry/resume
+  checkpoints: Record<string, StepCheckpoint>;  // Key: storyId
+
+  // Render queue for video generation
+  renderQueue: RenderJob[];
+  renderQueueEnabled: boolean;  // Auto-render toggle
+
   addToQueue: (item: Omit<QueueItem, 'id' | 'createdAt'>) => void;
   removeFromQueue: (id: string) => void;
   updateQueueItem: (id: string, updates: Partial<QueueItem>) => void;
   clearCompletedQueue: () => void;
   moveQueueItem: (id: string, direction: 'up' | 'down') => void;
   reQueueItem: (id: string) => void;
-  
+
   addStory: (story: Story) => void;
   updateStory: (id: string, updates: Partial<Story>) => void;
   deleteStory: (id: string) => void;
   upsertStory: (story: Partial<Story> & { id: string }) => void;
   updateStoryFromGeneration: (storyId: string, stepData: any) => void;
-  
+
   setResearchData: (data: ResearchData) => void;
   updateSettings: (settings: Partial<Settings>) => void;
-  
+
   setGenerationStatus: (status: Partial<StoreState['currentGeneration']>) => void;
+
+  // Checkpoint methods
+  saveCheckpoint: (checkpoint: StepCheckpoint) => void;
+  getCheckpoint: (storyId: string) => StepCheckpoint | null;
+  updateCheckpointStep: (storyId: string, stepId: string, stepData: StepCheckpointData) => void;
+  clearCheckpoint: (storyId: string) => void;
+  incrementResumeCount: (storyId: string) => void;
+
+  // Render queue methods
+  addRenderJob: (job: Omit<RenderJob, 'id' | 'createdAt' | 'attempts'>) => void;
+  addRenderJobs: (jobs: Omit<RenderJob, 'id' | 'createdAt' | 'attempts'>[]) => void;
+  updateRenderJob: (id: string, updates: Partial<RenderJob>) => void;
+  removeRenderJob: (id: string) => void;
+  clearCompletedRenderJobs: () => void;
+  clearAllRenderJobs: (storyId?: string) => void;
+  setRenderQueueEnabled: (enabled: boolean) => void;
+  getNextRenderJob: () => RenderJob | null;
 }
 
 export const useStore = create<StoreState>()(
   devtools(
     persist(
-      (set) => ({
+      (set, get) => ({
         queue: [],
         stories: [],
         researchData: null,
@@ -263,7 +380,14 @@ export const useStore = create<StoreState>()(
           progress: 0,
           currentStep: '',
         },
-        
+
+        // Step checkpoints for retry/resume
+        checkpoints: {},
+
+        // Render queue for video generation
+        renderQueue: [],
+        renderQueueEnabled: false,  // Off by default, user can toggle
+
         addToQueue: (item) => set((state) => {
           try {
             const newItem = {
@@ -473,6 +597,158 @@ export const useStore = create<StoreState>()(
         setGenerationStatus: (status) => set((state) => ({
           currentGeneration: { ...state.currentGeneration, ...status },
         })),
+
+        // ============== CHECKPOINT METHODS ==============
+
+        saveCheckpoint: (checkpoint) => set((state) => {
+          debugService.info('store', `💾 Saving checkpoint for story ${checkpoint.storyId}`, {
+            completedSteps: checkpoint.completedSteps.length,
+            currentStep: checkpoint.currentStep
+          });
+          return {
+            checkpoints: {
+              ...state.checkpoints,
+              [checkpoint.storyId]: checkpoint
+            }
+          };
+        }),
+
+        getCheckpoint: (storyId) => {
+          return get().checkpoints[storyId] || null;
+        },
+
+        updateCheckpointStep: (storyId, stepId, stepData) => set((state) => {
+          const existing = state.checkpoints[storyId];
+          if (!existing) {
+            debugService.warn('store', `No checkpoint found for story ${storyId}`);
+            return state;
+          }
+
+          const updatedStepData = {
+            ...existing.stepData,
+            [stepId]: stepData
+          };
+
+          // If step completed successfully (no error), add to completedSteps
+          const completedSteps = stepData.error
+            ? existing.completedSteps
+            : existing.completedSteps.includes(stepId)
+              ? existing.completedSteps
+              : [...existing.completedSteps, stepId];
+
+          debugService.info('store', `📝 Updated checkpoint step ${stepId} for story ${storyId}`, {
+            hasError: !!stepData.error,
+            completedSteps: completedSteps.length
+          });
+
+          return {
+            checkpoints: {
+              ...state.checkpoints,
+              [storyId]: {
+                ...existing,
+                completedSteps,
+                currentStep: stepData.error ? stepId : null,  // Keep failed step as current
+                stepData: updatedStepData,
+                lastUpdated: new Date()
+              }
+            }
+          };
+        }),
+
+        clearCheckpoint: (storyId) => set((state) => {
+          const { [storyId]: _removed, ...rest } = state.checkpoints;
+          debugService.info('store', `🗑️ Cleared checkpoint for story ${storyId}`);
+          return { checkpoints: rest };
+        }),
+
+        incrementResumeCount: (storyId) => set((state) => {
+          const existing = state.checkpoints[storyId];
+          if (!existing) return state;
+
+          debugService.info('store', `🔄 Resume count for ${storyId}: ${existing.resumeCount + 1}`);
+          return {
+            checkpoints: {
+              ...state.checkpoints,
+              [storyId]: {
+                ...existing,
+                resumeCount: existing.resumeCount + 1,
+                lastUpdated: new Date()
+              }
+            }
+          };
+        }),
+
+        // ============== RENDER QUEUE METHODS ==============
+
+        addRenderJob: (job) => set((state) => {
+          const newJob: RenderJob = {
+            ...job,
+            id: `render_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            createdAt: new Date(),
+            attempts: 0
+          };
+          debugService.info('store', `🎬 Added render job: ${newJob.title}`, { type: job.type, storyId: job.storyId });
+          return {
+            renderQueue: [...state.renderQueue, newJob]
+          };
+        }),
+
+        addRenderJobs: (jobs) => set((state) => {
+          const newJobs: RenderJob[] = jobs.map((job, idx) => ({
+            ...job,
+            id: `render_${Date.now()}_${idx}_${Math.random().toString(36).substr(2, 9)}`,
+            createdAt: new Date(),
+            attempts: 0
+          }));
+          debugService.info('store', `🎬 Added ${newJobs.length} render jobs`);
+          return {
+            renderQueue: [...state.renderQueue, ...newJobs]
+          };
+        }),
+
+        updateRenderJob: (id, updates) => set((state) => {
+          const job = state.renderQueue.find(j => j.id === id);
+          if (!job) {
+            debugService.warn('store', `Render job ${id} not found`);
+            return state;
+          }
+          debugService.info('store', `📝 Updated render job ${id}`, { status: updates.status, progress: updates.progress });
+          return {
+            renderQueue: state.renderQueue.map(j =>
+              j.id === id ? { ...j, ...updates } : j
+            )
+          };
+        }),
+
+        removeRenderJob: (id) => set((state) => ({
+          renderQueue: state.renderQueue.filter(j => j.id !== id)
+        })),
+
+        clearCompletedRenderJobs: () => set((state) => ({
+          renderQueue: state.renderQueue.filter(j => j.status !== 'completed')
+        })),
+
+        clearAllRenderJobs: (storyId) => set((state) => ({
+          renderQueue: storyId
+            ? state.renderQueue.filter(j => j.storyId !== storyId)
+            : []
+        })),
+
+        setRenderQueueEnabled: (enabled) => set(() => {
+          debugService.info('store', `🎬 Render queue ${enabled ? 'enabled' : 'disabled'}`);
+          return { renderQueueEnabled: enabled };
+        }),
+
+        getNextRenderJob: () => {
+          // Get queued jobs sorted by priority (lower = higher priority), then by creation time
+          const queuedJobs = get().renderQueue
+            .filter(j => j.status === 'queued')
+            .sort((a, b) => {
+              if (a.priority !== b.priority) return a.priority - b.priority;
+              return a.createdAt.getTime() - b.createdAt.getTime();
+            });
+          return queuedJobs[0] || null;
+        },
       }),
       {
         name: 'story-generator-storage',
@@ -480,6 +756,9 @@ export const useStore = create<StoreState>()(
           queue: state.queue,
           stories: state.stories,
           settings: state.settings,
+          checkpoints: state.checkpoints,  // Persist checkpoints for resume
+          renderQueue: state.renderQueue,  // Persist render queue
+          renderQueueEnabled: state.renderQueueEnabled,
         }),
       }
     )

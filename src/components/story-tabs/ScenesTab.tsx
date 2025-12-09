@@ -44,9 +44,10 @@ import {
   CheckCircle,
   Error as ErrorIcon,
 } from '@mui/icons-material';
-import { HoloCineScene } from '../../store/useStore';
+import { HoloCineScene, useStore } from '../../store/useStore';
 import { buildRawPromptString, checkTokenLimits, DEFAULT_HOLOCINE_GENERATION_SETTINGS } from '../../types/holocineTypes';
 import { comfyUIRenderService, ComfyUIQueueItem } from '../../services/comfyUIRenderService';
+import { renderQueueManager } from '../../services/renderQueueManager';
 
 interface ScenesTabProps {
   scenes: HoloCineScene[];
@@ -65,6 +66,7 @@ const ScenesTab: React.FC<ScenesTabProps> = ({
   onRegenerateScenes,
   onExportScenes,
 }) => {
+  const { renderQueue: storeRenderQueue } = useStore();
   const [expandedScene, setExpandedScene] = useState<string | null>(null);
   const [editingScene, setEditingScene] = useState<string | null>(null);
   const [editedGlobalCaption, setEditedGlobalCaption] = useState('');
@@ -171,6 +173,51 @@ const ScenesTab: React.FC<ScenesTabProps> = ({
   // Get render status for a scene
   const getSceneRenderStatus = (sceneId: string): ComfyUIQueueItem | undefined => {
     return renderQueue.find(item => item.sceneId === sceneId);
+  };
+
+  // Send scenes to the unified Render Queue (new system)
+  const handleSendToRenderQueue = (scene?: HoloCineScene) => {
+    const scenesToQueue = scene ? [scene] : scenes.filter(s => s.status !== 'generating' && s.status !== 'completed');
+
+    if (scenesToQueue.length === 0) {
+      setSnackbar({
+        open: true,
+        message: 'No scenes ready for rendering',
+        severity: 'info'
+      });
+      return;
+    }
+
+    // Create render jobs using the render queue manager
+    // The manager expects a StoryConfig but we just need to pass scene-related defaults
+    const storyConfig = {
+      prompt: '',
+      genre: 'drama',
+      length: '15s',
+      visualStyle: 'cinematic',
+      aspectRatio: '16:9',
+      fps: '16',
+      autoPrompt: false,
+      priority: 5,
+      characterConsistency: true,
+      musicGeneration: false,
+      narrationGeneration: false,
+      generationMethod: 'holocine' as const
+    };
+
+    // Use the manager to add jobs (it calls addRenderJobs internally)
+    renderQueueManager.createJobsFromScenes(storyId, scenesToQueue, storyConfig);
+
+    setSnackbar({
+      open: true,
+      message: `${scenesToQueue.length} scene(s) added to Render Queue`,
+      severity: 'success'
+    });
+  };
+
+  // Check if a scene is already in the render queue
+  const getSceneRenderQueueStatus = (sceneId: string) => {
+    return storeRenderQueue.find(job => job.targetId === sceneId);
   };
 
   // Calculate statistics
@@ -305,6 +352,17 @@ const ScenesTab: React.FC<ScenesTabProps> = ({
                     Send to ComfyUI
                   </Button>
                 </span>
+              </Tooltip>
+              <Tooltip title="Add all scenes to the Render Queue for batch processing">
+                <Button
+                  size="small"
+                  variant="outlined"
+                  color="primary"
+                  startIcon={<Movie />}
+                  onClick={() => handleSendToRenderQueue()}
+                >
+                  Add to Render Queue
+                </Button>
               </Tooltip>
             </Box>
           </Box>
@@ -469,6 +527,36 @@ const ScenesTab: React.FC<ScenesTabProps> = ({
                         </IconButton>
                       </span>
                     </Tooltip>
+                    {/* Add to Render Queue button */}
+                    {(() => {
+                      const queueStatus = getSceneRenderQueueStatus(scene.id);
+                      return (
+                        <Tooltip title={
+                          queueStatus
+                            ? `Status: ${queueStatus.status}${queueStatus.progress > 0 ? ` (${queueStatus.progress}%)` : ''}`
+                            : 'Add to Render Queue'
+                        }>
+                          <IconButton
+                            size="small"
+                            color="primary"
+                            onClick={() => handleSendToRenderQueue(scene)}
+                            disabled={queueStatus?.status === 'rendering'}
+                          >
+                            {queueStatus?.status === 'completed' ? (
+                              <CheckCircle fontSize="small" color="success" />
+                            ) : queueStatus?.status === 'rendering' ? (
+                              <CircularProgress size={18} />
+                            ) : queueStatus?.status === 'failed' ? (
+                              <ErrorIcon fontSize="small" color="error" />
+                            ) : queueStatus ? (
+                              <Movie fontSize="small" color="info" />
+                            ) : (
+                              <Movie fontSize="small" />
+                            )}
+                          </IconButton>
+                        </Tooltip>
+                      );
+                    })()}
                     <Chip
                       size="small"
                       label={scene.status}

@@ -7,8 +7,33 @@ export interface OllamaNode {
   models: string[];
   version?: string;
   lastChecked: Date;
-  type: 'ollama' | 'openai' | 'claude' | 'elevenlabs' | 'suno' | 'comfyui';
+  type: 'ollama' | 'openai' | 'claude' | 'elevenlabs' | 'suno' | 'comfyui' | 'unified';
   category: 'local' | 'online';
+
+  // Dual capability support - for unified nodes that run both Ollama and ComfyUI
+  capabilities?: {
+    ollama: boolean;
+    comfyui: boolean;
+  };
+
+  // Port per capability (for unified nodes)
+  ollamaPort?: number;   // Default: 11434
+  comfyUIPort?: number;  // Default: 8188
+
+  // Independent status per capability
+  ollamaStatus?: 'online' | 'offline' | 'busy';
+  comfyuiStatus?: 'online' | 'offline' | 'busy';
+
+  // ComfyUI-specific fields
+  comfyUIData?: {
+    checkpoints: string[];
+    vaes: string[];
+    loras: string[];
+    clipModels: string[];
+    unets: string[];
+    customNodes: string[];
+    embeddings: string[];
+  };
 }
 
 export interface ModelConfig {
@@ -55,25 +80,37 @@ class NodeDiscoveryService {
 
 
   async scanLocalNetwork(): Promise<OllamaNode[]> {
-    console.log('🔍 Starting network scan for Ollama nodes...');
+    console.log('🔍 Starting network scan for Ollama and ComfyUI nodes...');
     const promises: Promise<OllamaNode | null>[] = [];
-    
-    // Scan common local addresses
+
+    // Common ComfyUI ports (in addition to default 8188)
+    const comfyUIPorts = [8188, 8000, 8080, 7860];
+
+    // Scan common local addresses for Ollama AND ComfyUI (localhost only gets full port scan)
     for (const host of this.commonHosts) {
       for (const port of this.commonPorts) {
         promises.push(this.checkNode(host, port));
       }
+      // Scan for standalone ComfyUI on common ports - ONLY for localhost
+      for (const port of comfyUIPorts) {
+        promises.push(this.checkStandaloneComfyUI(host, port));
+      }
     }
-    
+
     // Try common device hostnames (may work with mDNS/DNS resolution)
-    const commonHostnames = ['ollama', 'ai', 'gpu', 'server'];
+    const commonHostnames = ['ollama', 'ai', 'gpu', 'server', 'comfyui', 'render'];
     for (const hostname of commonHostnames) {
       promises.push(this.checkNode(hostname, 11434));
       promises.push(this.checkNode(`${hostname}.local`, 11434));
+      // Also check for ComfyUI on hostnames (but only default port to limit requests)
+      promises.push(this.checkStandaloneComfyUI(hostname, 8188));
+      promises.push(this.checkStandaloneComfyUI(`${hostname}.local`, 8188));
     }
 
     // Try common IP ranges (works if no CORS restrictions)
     // Scan the FULL range 1-254 for each common network prefix
+    // NOTE: Only scan Ollama port (11434) for network ranges to avoid overwhelming the network
+    // ComfyUI on specific IPs can be added manually or via "Add Unified Node"
     const networkRanges = [
       '192.168.0.',
       '192.168.1.',
@@ -85,7 +122,8 @@ class NodeDiscoveryService {
     ];
 
     for (const range of networkRanges) {
-      // Scan FULL IP range 1-254 to find all Ollama nodes
+      // Scan FULL IP range 1-254 for Ollama (port 11434 only)
+      // checkNode will also check for ComfyUI on port 8188 when Ollama is found
       for (let i = 1; i <= 254; i++) {
         promises.push(this.checkNode(`${range}${i}`, 11434));
       }
@@ -243,17 +281,47 @@ class NodeDiscoveryService {
 
         console.log(`✅ Found Ollama at ${host}:${port} with ${models.length} models:`, models);
 
-        return {
+        // Also check for ComfyUI on the same host (default port 8188)
+        // This allows local nodes to automatically detect both services
+        const comfyUIPort = 8188;
+        const comfyUIResult = await this.checkComfyUIOnHost(host, comfyUIPort);
+        const hasComfyUI = comfyUIResult !== null;
+
+        if (hasComfyUI) {
+          console.log(`✅ Also found ComfyUI at ${host}:${comfyUIPort} - creating unified node`);
+        }
+
+        const node: OllamaNode = {
           id,
-          name: this.generateNodeName(host, port),
+          name: this.generateNodeName(host, port, hasComfyUI),
           host,
           port,
           status: 'online',
           models,
           lastChecked: new Date(),
-          type: 'ollama',
+          type: hasComfyUI ? 'unified' : 'ollama',
           category: 'local',
+          // Add dual capability fields
+          capabilities: {
+            ollama: true,
+            comfyui: hasComfyUI
+          },
+          ollamaPort: port,
+          comfyUIPort: hasComfyUI ? comfyUIPort : undefined,
+          ollamaStatus: 'online',
+          comfyuiStatus: hasComfyUI ? 'online' : 'offline',
+          comfyUIData: comfyUIResult?.comfyUIData
         };
+
+        // Add ComfyUI models to the list if available
+        if (comfyUIResult?.models) {
+          node.models = [
+            ...node.models,
+            ...comfyUIResult.models.filter(m => m.startsWith('[Video') || m.startsWith('[Checkpoint'))
+          ];
+        }
+
+        return node;
       } else {
         // Log all non-success responses for debugging
         console.log(`❌ ${host}:${port} responded with ${response.status}: ${response.statusText}`);
@@ -284,12 +352,66 @@ class NodeDiscoveryService {
     return null;
   }
 
+  /**
+   * Check for standalone ComfyUI on a specific host/port
+   * Creates a ComfyUI-only node if found (no Ollama required)
+   */
+  private async checkStandaloneComfyUI(host: string, port: number): Promise<OllamaNode | null> {
+    const id = `comfyui_${host}:${port}`;
+
+    // Skip if we already have this node (from checkNode or previous scan)
+    if (this.nodes.has(id)) {
+      return null;
+    }
+
+    try {
+      const comfyUIResult = await this.checkComfyUIOnHost(host, port);
+
+      if (comfyUIResult) {
+        console.log(`✅ Found standalone ComfyUI at ${host}:${port}`);
+
+        const node: OllamaNode = {
+          id,
+          name: this.generateUnifiedNodeName(host, false, true),
+          host,
+          port,
+          status: 'online',
+          models: comfyUIResult.models || [],
+          version: comfyUIResult.version,
+          lastChecked: new Date(),
+          type: 'comfyui',
+          category: 'local',
+          capabilities: {
+            ollama: false,
+            comfyui: true
+          },
+          comfyUIPort: port,
+          comfyuiStatus: 'online',
+          comfyUIData: comfyUIResult.comfyUIData
+        };
+
+        this.nodes.set(id, node);
+        return node;
+      }
+    } catch (error: any) {
+      // Silent fail for scans - only log if it's a non-standard port we explicitly tried
+      if (port !== 8188) {
+        // Don't spam logs during network scan
+      }
+    }
+
+    return null;
+  }
+
   async refreshNode(nodeId: string): Promise<OllamaNode | null> {
     const existingNode = this.nodes.get(nodeId);
     if (!existingNode) return null;
 
-    const refreshedNode = await this.checkNode(existingNode.host, existingNode.port);
+    // For unified nodes or nodes that might have ComfyUI, use checkNode which auto-detects both
+    const refreshedNode = await this.checkNode(existingNode.host, existingNode.ollamaPort || existingNode.port);
     if (refreshedNode) {
+      // Preserve the original ID to avoid duplicates
+      refreshedNode.id = nodeId;
       this.nodes.set(nodeId, refreshedNode);
       return refreshedNode;
     } else {
@@ -297,6 +419,8 @@ class NodeDiscoveryService {
       const offlineNode = {
         ...existingNode,
         status: 'offline' as const,
+        ollamaStatus: 'offline' as const,
+        comfyuiStatus: existingNode.capabilities?.comfyui ? 'offline' as const : undefined,
         lastChecked: new Date(),
       };
       this.nodes.set(nodeId, offlineNode);
@@ -368,8 +492,16 @@ class NodeDiscoveryService {
     return [];
   }
 
-  private generateNodeName(host: string, port: number): string {
-    if (host === 'localhost' || host === '127.0.0.1') {
+  private generateNodeName(host: string, port: number, hasComfyUI: boolean = false): string {
+    const isLocal = host === 'localhost' || host === '127.0.0.1';
+
+    if (hasComfyUI) {
+      // Unified node with both Ollama and ComfyUI
+      return isLocal ? 'Local AI + Render' : `AI + Render (${host})`;
+    }
+
+    // Ollama only
+    if (isLocal) {
       return 'Local Ollama';
     }
     return port === 11434 ? `Ollama (${host})` : `Ollama (${host}:${port})`;
@@ -438,116 +570,237 @@ class NodeDiscoveryService {
 
   /**
    * Check if a ComfyUI instance is reachable and get its info
+   * Tries multiple endpoints since ComfyUI API can vary by version/installation type
    */
   private async checkComfyUINode(host: string, port: number): Promise<OllamaNode | null> {
     const id = `comfyui_${host}:${port}`;
 
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
+    // Try multiple endpoints - ComfyUI API endpoints vary by version
+    // The installer version may have different endpoints than portable
+    const endpoints = [
+      '/system_stats',      // Newer ComfyUI
+      '/api/system_stats',  // Some versions use /api prefix
+      '/object_info',       // Common in all versions
+      '/api/object_info',   // With /api prefix
+      '/queue',             // Basic queue endpoint
+      '/api/queue',         // With /api prefix
+      '/',                  // Root - just check if server responds
+    ];
 
-      // ComfyUI system stats endpoint
-      const response = await fetch(`http://${host}:${port}/system_stats`, {
-        method: 'GET',
-        signal: controller.signal,
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        mode: 'cors',
-      });
+    for (const endpoint of endpoints) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-      clearTimeout(timeoutId);
+        console.log(`🔍 Checking ComfyUI at ${host}:${port}${endpoint}...`);
 
-      if (response.ok) {
-        const systemStats = await response.json();
-        console.log(`✅ Found ComfyUI at ${host}:${port}`, systemStats);
+        const response = await fetch(`http://${host}:${port}${endpoint}`, {
+          method: 'GET',
+          signal: controller.signal,
+          headers: {
+            'Accept': 'application/json, text/html, */*',
+          },
+          mode: 'cors',
+        });
 
-        // Try to get available models/checkpoints
-        const models = await this.getComfyUIModels(host, port);
+        clearTimeout(timeoutId);
 
-        return {
-          id,
-          name: this.generateComfyUIName(host, port),
-          host,
-          port,
-          status: 'online',
-          models,
-          version: systemStats.system?.comfyui_version || 'unknown',
-          lastChecked: new Date(),
-          type: 'comfyui',
-          category: 'local',
-        };
-      }
-    } catch (error: any) {
-      if (error.name === 'AbortError') {
-        console.log(`⏰ ComfyUI timeout at ${host}:${port}`);
-      } else {
-        console.log(`🚫 ComfyUI check failed for ${host}:${port}:`, error.message);
+        if (response.ok) {
+          console.log(`✅ ComfyUI detected at ${host}:${port} via ${endpoint}`);
+
+          // Try to get version from system_stats
+          let version: string | undefined;
+          try {
+            // Try both with and without /api prefix
+            for (const statsEndpoint of ['/system_stats', '/api/system_stats']) {
+              const statsResponse = await fetch(`http://${host}:${port}${statsEndpoint}`, {
+                method: 'GET',
+                signal: AbortSignal.timeout(3000),
+                mode: 'cors',
+              });
+              if (statsResponse.ok) {
+                const stats = await statsResponse.json();
+                version = stats.system?.comfyui_version;
+                if (version) break;
+              }
+            }
+          } catch {
+            // Version fetch is optional
+          }
+
+          // Try to get available models/checkpoints
+          const { models, comfyUIData } = await this.getComfyUIModels(host, port);
+
+          return {
+            id,
+            name: this.generateComfyUIName(host, port),
+            host,
+            port,
+            status: 'online',
+            models,
+            version: version || 'unknown',
+            lastChecked: new Date(),
+            type: 'comfyui',
+            category: 'local',
+            comfyUIData,
+            comfyUIPort: port,
+            comfyuiStatus: 'online',
+            capabilities: {
+              ollama: false,
+              comfyui: true
+            }
+          };
+        }
+      } catch (error: any) {
+        if (error.name === 'AbortError') {
+          console.log(`⏱️ ComfyUI check timed out for ${host}:${port}${endpoint}`);
+        } else if (error.message?.includes('Failed to fetch') || error.message?.includes('NetworkError')) {
+          console.log(`🔒 ComfyUI connection blocked at ${host}:${port}${endpoint} (CORS or network issue)`);
+        } else {
+          console.log(`❌ ComfyUI check failed for ${host}:${port}${endpoint}:`, error.message);
+        }
+        // Continue to next endpoint
       }
     }
 
+    console.log(`⚠️ Could not detect ComfyUI at ${host}:${port}. Tried endpoints: ${endpoints.join(', ')}`);
+    console.log(`   If ComfyUI is running, it may need CORS enabled: --enable-cors-header`);
     return null;
   }
 
   /**
    * Get available models/checkpoints from ComfyUI
+   * Returns both a flat model list and detailed ComfyUI data
    */
-  private async getComfyUIModels(host: string, port: number): Promise<string[]> {
+  private async getComfyUIModels(host: string, port: number): Promise<{
+    models: string[];
+    comfyUIData: OllamaNode['comfyUIData'];
+  }> {
+    const comfyUIData: OllamaNode['comfyUIData'] = {
+      checkpoints: [],
+      vaes: [],
+      loras: [],
+      clipModels: [],
+      unets: [],
+      customNodes: [],
+      embeddings: []
+    };
+
+    // Try both with and without /api prefix
+    const objectInfoEndpoints = ['/object_info', '/api/object_info'];
+    let response: Response | null = null;
+
+    for (const endpoint of objectInfoEndpoints) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+        // Get object_info which contains all node types and their options
+        const res = await fetch(`http://${host}:${port}${endpoint}`, {
+          method: 'GET',
+          signal: controller.signal,
+          headers: {
+            'Accept': 'application/json',
+          },
+          mode: 'cors',
+        });
+
+        clearTimeout(timeoutId);
+
+        if (res.ok) {
+          response = res;
+          console.log(`📦 Got object_info from ${host}:${port}${endpoint}`);
+          break;
+        }
+      } catch (e) {
+        // Continue to next endpoint
+      }
+    }
+
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 5000);
-
-      // Get object_info which contains all node types and their options
-      const response = await fetch(`http://${host}:${port}/object_info`, {
-        method: 'GET',
-        signal: controller.signal,
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        mode: 'cors',
-      });
-
-      clearTimeout(timeoutId);
-
-      if (response.ok) {
+      if (response && response.ok) {
         const objectInfo = await response.json();
         const models: string[] = [];
 
         // Extract checkpoint models
         if (objectInfo.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0]) {
-          models.push(...objectInfo.CheckpointLoaderSimple.input.required.ckpt_name[0]);
+          const checkpoints = objectInfo.CheckpointLoaderSimple.input.required.ckpt_name[0];
+          comfyUIData.checkpoints = checkpoints;
+          models.push(...checkpoints);
         }
 
-        // Also check for video models (Wan, HoloCine, etc.)
-        // Look for HoloCine-specific nodes
-        const holoCineNodes = ['HoloCineLoader', 'HoloCineSceneLoader', 'WanVideoLoader'];
-        for (const nodeName of holoCineNodes) {
+        // Extract VAE models
+        if (objectInfo.VAELoader?.input?.required?.vae_name?.[0]) {
+          comfyUIData.vaes = objectInfo.VAELoader.input.required.vae_name[0];
+        }
+
+        // Extract LoRA models
+        if (objectInfo.LoraLoader?.input?.required?.lora_name?.[0]) {
+          comfyUIData.loras = objectInfo.LoraLoader.input.required.lora_name[0];
+        }
+
+        // Extract CLIP models (various loaders)
+        const clipLoaders = ['CLIPLoader', 'DualCLIPLoader', 'TripleCLIPLoader'];
+        for (const loader of clipLoaders) {
+          if (objectInfo[loader]?.input?.required?.clip_name?.[0]) {
+            comfyUIData.clipModels.push(...objectInfo[loader].input.required.clip_name[0]);
+          }
+        }
+
+        // Extract UNET models
+        if (objectInfo.UNETLoader?.input?.required?.unet_name?.[0]) {
+          comfyUIData.unets = objectInfo.UNETLoader.input.required.unet_name[0];
+        }
+
+        // Also check for Diffusion models folder (for Wan/HoloCine)
+        const diffusionLoaders = ['DownloadAndLoadWanVideo2Model', 'WanVideoModelLoader', 'LoadWanVideoModel'];
+        for (const loader of diffusionLoaders) {
+          if (objectInfo[loader]?.input?.required?.model?.[0]) {
+            const diffModels = objectInfo[loader].input.required.model[0];
+            comfyUIData.unets.push(...diffModels);
+            // Also add to models with [Video] prefix
+            diffModels.forEach((m: string) => models.push(`[Video Model] ${m}`));
+          }
+        }
+
+        // Collect all custom nodes
+        comfyUIData.customNodes = Object.keys(objectInfo);
+
+        // Look for video generation capability nodes
+        const videoNodes = [
+          'WanVideoWrapper', 'WanVideoSampler', 'WanVideoVAEDecode', 'WanVideoModelLoader',
+          'DownloadAndLoadWanVideo2Model', 'WanVideo2VAEDecode',
+          'HoloCineLoader', 'HoloCineSceneLoader',
+          'CogVideoXLoader', 'CogVideoXSampler'
+        ];
+
+        for (const nodeName of videoNodes) {
           if (objectInfo[nodeName]) {
             console.log(`🎬 Found video generation node: ${nodeName}`);
-            // Add as a "model" to indicate capability
-            models.push(`[Video] ${nodeName}`);
+            models.push(`[Video Node] ${nodeName}`);
           }
         }
 
-        // Check for Wan 2.2 specific nodes
-        const wanNodes = ['WanVideoWrapper', 'Wan2_2Loader', 'WanVideoSampler'];
-        for (const nodeName of wanNodes) {
-          if (objectInfo[nodeName]) {
-            console.log(`🎥 Found Wan video node: ${nodeName}`);
-            models.push(`[Video] ${nodeName}`);
-          }
-        }
+        console.log(`🎨 ComfyUI data found:`, {
+          checkpoints: comfyUIData.checkpoints.length,
+          vaes: comfyUIData.vaes.length,
+          loras: comfyUIData.loras.length,
+          clipModels: comfyUIData.clipModels.length,
+          unets: comfyUIData.unets.length,
+          customNodes: comfyUIData.customNodes.length
+        });
 
-        console.log(`🎨 ComfyUI models found: ${models.length}`, models.slice(0, 10));
-        return models;
+        return { models, comfyUIData };
       }
     } catch (error) {
       console.warn(`⚠️ Could not fetch ComfyUI models from ${host}:${port}:`, error);
     }
 
-    // Return default video generation models as fallback
-    return ['HoloCine', 'Wan 2.2', 'SDXL', 'Flux'];
+    // Return defaults as fallback
+    return {
+      models: ['HoloCine', 'Wan 2.2', 'SDXL', 'Flux'],
+      comfyUIData
+    };
   }
 
   private generateComfyUIName(host: string, port: number): string {
@@ -919,6 +1172,380 @@ class NodeDiscoveryService {
     return Array.from(this.nodes.values()).filter(
       node => now - node.lastChecked.getTime() > maxAgeMs
     );
+  }
+
+  // ============== DUAL CAPABILITY (UNIFIED NODE) METHODS ==============
+
+  /**
+   * Scan a host for both Ollama and ComfyUI capabilities
+   * Creates a unified node if both are present
+   */
+  async scanHostForCapabilities(host: string): Promise<OllamaNode | null> {
+    console.log(`🔍 Scanning ${host} for dual capabilities (Ollama + ComfyUI)...`);
+
+    const ollamaPort = 11434;
+    const comfyuiPort = 8188;
+
+    // Check both services in parallel
+    const [ollamaResult, comfyuiResult] = await Promise.all([
+      this.checkOllamaOnHost(host, ollamaPort),
+      this.checkComfyUIOnHost(host, comfyuiPort)
+    ]);
+
+    const hasOllama = ollamaResult !== null;
+    const hasComfyUI = comfyuiResult !== null;
+
+    if (!hasOllama && !hasComfyUI) {
+      console.log(`❌ No services found on ${host}`);
+      return null;
+    }
+
+    // Create a unified node if BOTH are present, otherwise single-capability node
+    const isUnified = hasOllama && hasComfyUI;
+    const nodeId = isUnified ? `unified_${host}` : (hasOllama ? `${host}:${ollamaPort}` : `comfyui_${host}:${comfyuiPort}`);
+    const nodeName = this.generateUnifiedNodeName(host, hasOllama, hasComfyUI);
+
+    const node: OllamaNode = {
+      id: nodeId,
+      name: nodeName,
+      host,
+      port: hasOllama ? ollamaPort : comfyuiPort, // Primary port for backwards compatibility
+      status: 'online',
+      models: ollamaResult?.models || [],
+      version: ollamaResult?.version || comfyuiResult?.version,
+      lastChecked: new Date(),
+      type: isUnified ? 'unified' : (hasOllama ? 'ollama' : 'comfyui'),
+      category: 'local',
+
+      // Dual capability fields
+      capabilities: {
+        ollama: hasOllama,
+        comfyui: hasComfyUI
+      },
+      ollamaPort: hasOllama ? ollamaPort : undefined,
+      comfyUIPort: hasComfyUI ? comfyuiPort : undefined,
+      ollamaStatus: hasOllama ? 'online' : 'offline',
+      comfyuiStatus: hasComfyUI ? 'online' : 'offline',
+
+      // ComfyUI data if present
+      comfyUIData: comfyuiResult?.comfyUIData
+    };
+
+    // Add ComfyUI models to the models list with prefix
+    if (comfyuiResult?.models) {
+      node.models = [
+        ...node.models,
+        ...comfyuiResult.models.filter(m => m.startsWith('[Video'))
+      ];
+    }
+
+    console.log(`✅ Created ${isUnified ? 'UNIFIED' : node.type.toUpperCase()} node for ${host}:`, {
+      ollama: hasOllama,
+      comfyui: hasComfyUI,
+      ollamaModels: ollamaResult?.models?.length || 0,
+      comfyuiCheckpoints: comfyuiResult?.comfyUIData?.checkpoints?.length || 0
+    });
+
+    this.nodes.set(nodeId, node);
+    return node;
+  }
+
+  /**
+   * Check for Ollama on a specific host/port
+   */
+  private async checkOllamaOnHost(host: string, port: number): Promise<{ models: string[]; version?: string } | null> {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3000);
+
+      const response = await fetch(`http://${host}:${port}/api/tags`, {
+        method: 'GET',
+        signal: controller.signal,
+        headers: { 'Content-Type': 'application/json' },
+        mode: 'cors'
+      });
+
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        const data = await response.json();
+        const models = data.models?.map((m: any) => m.name) || [];
+        return { models };
+      }
+    } catch {
+      // Silent fail - host doesn't have Ollama
+    }
+    return null;
+  }
+
+  /**
+   * Check for ComfyUI on a specific host/port
+   * Tries multiple endpoints since ComfyUI API can vary by version
+   */
+  private async checkComfyUIOnHost(host: string, port: number): Promise<{
+    models: string[];
+    version?: string;
+    comfyUIData: OllamaNode['comfyUIData'];
+  } | null> {
+    // Try multiple endpoints - ComfyUI API endpoints vary by version/installation type
+    const endpoints = [
+      '/system_stats',      // Newer ComfyUI
+      '/api/system_stats',  // Some versions use /api prefix
+      '/object_info',       // Common in all versions
+      '/api/object_info',   // With /api prefix
+      '/queue',             // Basic queue endpoint
+      '/api/queue',         // With /api prefix
+    ];
+
+    for (const endpoint of endpoints) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+        console.log(`🔍 Checking ComfyUI at ${host}:${port}${endpoint}...`);
+
+        const response = await fetch(`http://${host}:${port}${endpoint}`, {
+          method: 'GET',
+          signal: controller.signal,
+          headers: { 'Accept': 'application/json' },
+          mode: 'cors',
+        });
+
+        clearTimeout(timeoutId);
+
+        if (response.ok) {
+          console.log(`✅ ComfyUI detected at ${host}:${port} via ${endpoint}`);
+
+          // Try to get version from system_stats if available
+          let version: string | undefined;
+          try {
+            for (const statsEndpoint of ['/system_stats', '/api/system_stats']) {
+              const statsResponse = await fetch(`http://${host}:${port}${statsEndpoint}`, {
+                method: 'GET',
+                signal: AbortSignal.timeout(3000),
+                mode: 'cors',
+              });
+              if (statsResponse.ok) {
+                const stats = await statsResponse.json();
+                version = stats.system?.comfyui_version;
+                if (version) break;
+              }
+            }
+          } catch {
+            // Version fetch is optional
+          }
+
+          // Get models and comfyUI data
+          const { models, comfyUIData } = await this.getComfyUIModels(host, port);
+          return {
+            models,
+            version,
+            comfyUIData
+          };
+        }
+      } catch (error: any) {
+        // Continue to next endpoint with more context
+        if (error.name === 'AbortError') {
+          console.log(`⏱️ ComfyUI check timed out for ${host}:${port}${endpoint}`);
+        } else if (error.message?.includes('Failed to fetch') || error.message?.includes('NetworkError')) {
+          // CORS or network error - likely ComfyUI is running but CORS is blocking
+          console.log(`🔒 ComfyUI connection blocked at ${host}:${port}${endpoint} (possible CORS issue or not running)`);
+        } else {
+          console.log(`❌ ComfyUI check failed for ${host}:${port}${endpoint}:`, error.message || error);
+        }
+      }
+    }
+
+    // Only log if we're checking default ComfyUI port
+    if (port === 8188) {
+      console.log(`⚠️ No ComfyUI detected at ${host}:${port}. If ComfyUI is running, check:`);
+      console.log(`   1. ComfyUI is accessible at http://${host}:${port}`);
+      console.log(`   2. CORS is not blocking requests (--enable-cors-header)`);
+    }
+    return null;
+  }
+
+  /**
+   * Generate a name for unified or single-capability nodes
+   */
+  private generateUnifiedNodeName(host: string, hasOllama: boolean, hasComfyUI: boolean): string {
+    const isLocal = host === 'localhost' || host === '127.0.0.1';
+
+    if (hasOllama && hasComfyUI) {
+      return isLocal ? 'Local AI + Render' : `AI + Render (${host})`;
+    } else if (hasOllama) {
+      return isLocal ? 'Local Ollama' : `Ollama (${host})`;
+    } else {
+      return isLocal ? 'Local ComfyUI' : `ComfyUI (${host})`;
+    }
+  }
+
+  /**
+   * Add a unified node by scanning a host for both services
+   */
+  async addUnifiedNode(host: string): Promise<OllamaNode | null> {
+    return this.scanHostForCapabilities(host);
+  }
+
+  /**
+   * Get nodes with Ollama capability
+   */
+  getOllamaCapableNodes(): OllamaNode[] {
+    return Array.from(this.nodes.values()).filter(node =>
+      (node.type === 'ollama') ||
+      (node.type === 'unified' && node.capabilities?.ollama)
+    );
+  }
+
+  /**
+   * Get nodes with ComfyUI capability (for rendering)
+   */
+  getComfyUICapableNodes(): OllamaNode[] {
+    return Array.from(this.nodes.values()).filter(node =>
+      (node.type === 'comfyui') ||
+      (node.type === 'unified' && node.capabilities?.comfyui)
+    );
+  }
+
+  /**
+   * Check if a node is available for a specific capability
+   */
+  isNodeAvailableFor(nodeId: string, capability: 'ollama' | 'comfyui'): boolean {
+    const node = this.nodes.get(nodeId);
+    if (!node) return false;
+
+    if (capability === 'ollama') {
+      // Check Ollama availability
+      if (node.type === 'ollama') {
+        return node.status === 'online';
+      }
+      if (node.type === 'unified') {
+        return node.capabilities?.ollama === true && node.ollamaStatus === 'online';
+      }
+    } else {
+      // Check ComfyUI availability
+      if (node.type === 'comfyui') {
+        return node.status === 'online';
+      }
+      if (node.type === 'unified') {
+        return node.capabilities?.comfyui === true && node.comfyuiStatus === 'online';
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Mark a node's capability as busy
+   */
+  markNodeBusy(nodeId: string, capability: 'ollama' | 'comfyui'): void {
+    const node = this.nodes.get(nodeId);
+    if (!node) return;
+
+    if (node.type === 'unified') {
+      if (capability === 'ollama') {
+        node.ollamaStatus = 'busy';
+      } else {
+        node.comfyuiStatus = 'busy';
+      }
+    } else {
+      // For single-capability nodes, mark the main status as busy
+      node.status = 'online'; // Keep online but busy tracked separately
+      if (capability === 'ollama' && node.type === 'ollama') {
+        node.ollamaStatus = 'busy';
+      } else if (capability === 'comfyui' && node.type === 'comfyui') {
+        node.comfyuiStatus = 'busy';
+      }
+    }
+
+    this.nodes.set(nodeId, node);
+  }
+
+  /**
+   * Mark a node's capability as available (not busy)
+   */
+  markNodeAvailable(nodeId: string, capability: 'ollama' | 'comfyui'): void {
+    const node = this.nodes.get(nodeId);
+    if (!node) return;
+
+    if (capability === 'ollama') {
+      node.ollamaStatus = 'online';
+    } else {
+      node.comfyuiStatus = 'online';
+    }
+
+    this.nodes.set(nodeId, node);
+  }
+
+  /**
+   * Get the correct endpoint URL for a node's capability
+   */
+  getNodeEndpoint(nodeId: string, capability: 'ollama' | 'comfyui'): string | null {
+    const node = this.nodes.get(nodeId);
+    if (!node) return null;
+
+    if (capability === 'ollama') {
+      const port = node.ollamaPort || node.port;
+      return `http://${node.host}:${port}`;
+    } else {
+      const port = node.comfyUIPort || (node.type === 'comfyui' ? node.port : 8188);
+      return `http://${node.host}:${port}`;
+    }
+  }
+
+  /**
+   * Refresh a unified node - checks both capabilities
+   */
+  async refreshUnifiedNode(nodeId: string): Promise<OllamaNode | null> {
+    const existingNode = this.nodes.get(nodeId);
+    if (!existingNode) return null;
+
+    // For unified nodes, re-scan the host for both capabilities
+    if (existingNode.type === 'unified') {
+      const refreshed = await this.scanHostForCapabilities(existingNode.host);
+      return refreshed;
+    }
+
+    // For other nodes, use existing refresh methods
+    if (existingNode.type === 'ollama') {
+      return this.refreshNode(nodeId);
+    }
+    if (existingNode.type === 'comfyui') {
+      return this.refreshComfyUINode(nodeId);
+    }
+
+    return existingNode;
+  }
+
+  /**
+   * Get unified nodes only
+   */
+  getUnifiedNodes(): OllamaNode[] {
+    return Array.from(this.nodes.values()).filter(node => node.type === 'unified');
+  }
+
+  /**
+   * Find the best available node for a given capability
+   * Prefers nodes that are not busy, then least recently used
+   */
+  findBestAvailableNode(capability: 'ollama' | 'comfyui'): OllamaNode | null {
+    const capableNodes = capability === 'ollama'
+      ? this.getOllamaCapableNodes()
+      : this.getComfyUICapableNodes();
+
+    // Filter to only available (not busy) nodes
+    const availableNodes = capableNodes.filter(node =>
+      this.isNodeAvailableFor(node.id, capability)
+    );
+
+    if (availableNodes.length === 0) return null;
+
+    // Sort by last checked (least recently used first)
+    availableNodes.sort((a, b) =>
+      a.lastChecked.getTime() - b.lastChecked.getTime()
+    );
+
+    return availableNodes[0];
   }
 
 }

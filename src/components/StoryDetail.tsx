@@ -10,6 +10,9 @@ import {
   Paper,
   Tooltip,
   alpha,
+  Button,
+  Collapse,
+  Divider,
 } from '@mui/material';
 import {
   ArrowBack as ArrowBackIcon,
@@ -20,6 +23,12 @@ import {
   Style as StyleIcon,
   Videocam as ScenesIcon,
   Movie as MovieIcon,
+  Replay as ReplayIcon,
+  CheckCircle as CheckIcon,
+  Error as ErrorIcon,
+  HourglassEmpty as PendingIcon,
+  ExpandMore as ExpandMoreIcon,
+  ExpandLess as ExpandLessIcon,
 } from '@mui/icons-material';
 
 // Import the tab components
@@ -30,10 +39,11 @@ import GenerationSettingsTab from './story-tabs/GenerationSettingsTab';
 import StyleSheetTab from './story-tabs/StyleSheetTab';
 import ScenesTab from './story-tabs/ScenesTab';
 
-import { useStore } from '../store/useStore';
+import { useStore, StepCheckpoint } from '../store/useStore';
 import { EnhancedStory, AILogEntry } from '../types/storyTypes';
 import { aiLogService } from '../services/aiLogService';
 import { getGenerationMethod, GenerationMethodId } from '../types/generationMethods';
+import { sequentialAiPipelineService } from '../services/sequentialAiPipeline';
 
 interface StoryDetailProps {
   storyId: string;
@@ -41,31 +51,17 @@ interface StoryDetailProps {
   onBack: () => void;
 }
 
-interface TabPanelProps {
-  children?: React.ReactNode;
-  index: number;
-  value: number;
-}
-
-function TabPanel({ children, value, index }: TabPanelProps) {
-  return (
-    <div
-      role="tabpanel"
-      hidden={value !== index}
-      id={`story-tabpanel-${index}`}
-      aria-labelledby={`story-tab-${index}`}
-    >
-      {value === index && <Box sx={{ p: 0 }}>{children}</Box>}
-    </div>
-  );
-}
-
 const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack }) => {
-  const { queue, stories, updateStory } = useStore();
+  const { queue, stories, updateStory, checkpoints, renderQueue, settings, updateQueueItem } = useStore();
   const [currentTab, setCurrentTab] = useState(0);
   const [storyData, setStoryData] = useState<EnhancedStory | null>(null);
   const [aiLogs, setAiLogs] = useState<AILogEntry[]>([]);
+  const [showStepDetails, setShowStepDetails] = useState(false);
+  const [isResuming, setIsResuming] = useState(false);
   // Removed updateCounter - using promptSignature instead for reactivity
+
+  // Get checkpoint for this story
+  const checkpoint: StepCheckpoint | null = checkpoints[storyId] || null;
 
   // Find queue item and story data
   const queueItem = queueItemId ? queue.find(item => item.id === queueItemId) : null;
@@ -104,6 +100,86 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
 
   const handleTabChange = (event: React.SyntheticEvent, newValue: number) => {
     setCurrentTab(newValue);
+  };
+
+  // Handle resume from checkpoint
+  const handleResume = async () => {
+    if (!queueItem || isResuming) return;
+
+    const modelConfigs = settings.modelConfigs || [];
+    if (modelConfigs.length === 0) {
+      console.error('No model configs available for resume');
+      return;
+    }
+
+    setIsResuming(true);
+    try {
+      // Update queue item status to processing
+      updateQueueItem(queueItem.id, { status: 'processing', progress: 0 });
+
+      // Resume from checkpoint
+      await sequentialAiPipelineService.resumeFromCheckpoint(
+        queueItem,
+        modelConfigs,
+        (progress) => {
+          updateQueueItem(queueItem.id, {
+            progress: progress.overallProgress,
+            currentStep: progress.currentStep
+          });
+        }
+      );
+
+      // Update queue item status to completed
+      updateQueueItem(queueItem.id, { status: 'completed', progress: 100 });
+    } catch (error: any) {
+      console.error('Resume failed:', error);
+      updateQueueItem(queueItem.id, {
+        status: 'failed',
+        error: error.message || 'Resume failed'
+      });
+    } finally {
+      setIsResuming(false);
+    }
+  };
+
+  // Handle restart from beginning
+  const handleRestart = async () => {
+    if (!queueItem || isResuming) return;
+
+    const modelConfigs = settings.modelConfigs || [];
+    if (modelConfigs.length === 0) {
+      console.error('No model configs available for restart');
+      return;
+    }
+
+    setIsResuming(true);
+    try {
+      // Update queue item status to processing
+      updateQueueItem(queueItem.id, { status: 'processing', progress: 0 });
+
+      // Restart from beginning
+      await sequentialAiPipelineService.restartProcessing(
+        queueItem,
+        modelConfigs,
+        (progress) => {
+          updateQueueItem(queueItem.id, {
+            progress: progress.overallProgress,
+            currentStep: progress.currentStep
+          });
+        }
+      );
+
+      // Update queue item status to completed
+      updateQueueItem(queueItem.id, { status: 'completed', progress: 100 });
+    } catch (error: any) {
+      console.error('Restart failed:', error);
+      updateQueueItem(queueItem.id, {
+        status: 'failed',
+        error: error.message || 'Restart failed'
+      });
+    } finally {
+      setIsResuming(false);
+    }
   };
 
   // Listen for AI log updates
@@ -475,6 +551,153 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
               Current step: {currentStep}
             </Typography>
           )}
+
+          {/* Step Progress with Checkpoint Info */}
+          {checkpoint && checkpoint.completedSteps.length > 0 && (
+            <Box sx={{ mt: 2 }}>
+              <Divider sx={{ mb: 1 }} />
+              <Box
+                sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer' }}
+                onClick={() => setShowStepDetails(!showStepDetails)}
+              >
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                  <Typography variant="body2" fontWeight="medium">
+                    Step Progress
+                  </Typography>
+                  <Chip
+                    size="small"
+                    label={`${checkpoint.completedSteps.length} completed`}
+                    color="success"
+                    sx={{ height: 20, fontSize: '0.7rem' }}
+                  />
+                  {checkpoint.currentStep && (
+                    <Chip
+                      size="small"
+                      icon={<ErrorIcon sx={{ fontSize: 14 }} />}
+                      label={`Failed at ${checkpoint.currentStep}`}
+                      color="error"
+                      sx={{ height: 20, fontSize: '0.7rem' }}
+                    />
+                  )}
+                  {checkpoint.resumeCount > 0 && (
+                    <Chip
+                      size="small"
+                      icon={<ReplayIcon sx={{ fontSize: 14 }} />}
+                      label={`Resumed ${checkpoint.resumeCount}x`}
+                      variant="outlined"
+                      sx={{ height: 20, fontSize: '0.7rem' }}
+                    />
+                  )}
+                </Box>
+                <IconButton size="small">
+                  {showStepDetails ? <ExpandLessIcon /> : <ExpandMoreIcon />}
+                </IconButton>
+              </Box>
+
+              <Collapse in={showStepDetails}>
+                <Box sx={{ mt: 1, p: 1, bgcolor: 'grey.50', borderRadius: 1 }}>
+                  <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 0.5, mb: 1 }}>
+                    {['story', 'segments', 'shots', 'characters', 'holocine_scenes', 'prompts', 'narration', 'music'].map(step => {
+                      const isCompleted = checkpoint.completedSteps.includes(step);
+                      const isFailed = checkpoint.currentStep === step && checkpoint.stepData[step]?.error;
+                      const isPending = !isCompleted && !isFailed;
+
+                      return (
+                        <Chip
+                          key={step}
+                          size="small"
+                          icon={
+                            isCompleted ? <CheckIcon sx={{ fontSize: 14 }} /> :
+                            isFailed ? <ErrorIcon sx={{ fontSize: 14 }} /> :
+                            <PendingIcon sx={{ fontSize: 14 }} />
+                          }
+                          label={step.replace('_', ' ')}
+                          color={isCompleted ? 'success' : isFailed ? 'error' : 'default'}
+                          variant={isPending ? 'outlined' : 'filled'}
+                          sx={{ height: 24, fontSize: '0.7rem', textTransform: 'capitalize' }}
+                        />
+                      );
+                    })}
+                  </Box>
+
+                  {/* Action buttons for retry/resume */}
+                  {(hasError || checkpoint.currentStep) && queueItem && (
+                    <Box sx={{ display: 'flex', gap: 1, mt: 1 }}>
+                      <Button
+                        size="small"
+                        variant="contained"
+                        color="warning"
+                        startIcon={<ReplayIcon />}
+                        onClick={handleResume}
+                        disabled={isResuming || isGenerating}
+                      >
+                        {isResuming ? 'Resuming...' : `Resume from ${checkpoint.currentStep || 'last step'}`}
+                      </Button>
+                      <Button
+                        size="small"
+                        variant="outlined"
+                        color="error"
+                        startIcon={<ReplayIcon />}
+                        onClick={handleRestart}
+                        disabled={isResuming || isGenerating}
+                      >
+                        {isResuming ? 'Restarting...' : 'Restart'}
+                      </Button>
+                    </Box>
+                  )}
+
+                  {/* Checkpoint metadata */}
+                  <Typography variant="caption" color="text.secondary" sx={{ mt: 1, display: 'block' }}>
+                    Last updated: {checkpoint.lastUpdated ? new Date(checkpoint.lastUpdated).toLocaleString() : 'Unknown'}
+                  </Typography>
+                </Box>
+              </Collapse>
+            </Box>
+          )}
+
+          {/* Render Queue Status */}
+          {(() => {
+            const storyRenderJobs = renderQueue.filter(j => j.storyId === storyId);
+            if (storyRenderJobs.length === 0) return null;
+
+            const queuedCount = storyRenderJobs.filter(j => j.status === 'queued' || j.status === 'assigned').length;
+            const renderingCount = storyRenderJobs.filter(j => j.status === 'rendering').length;
+            const completedCount = storyRenderJobs.filter(j => j.status === 'completed').length;
+            const failedCount = storyRenderJobs.filter(j => j.status === 'failed').length;
+
+            return (
+              <Box sx={{ mt: 2 }}>
+                <Divider sx={{ mb: 1 }} />
+                <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                  <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <MovieIcon fontSize="small" color="primary" />
+                    <Typography variant="body2" fontWeight="medium">
+                      Video Render Queue
+                    </Typography>
+                    {queuedCount > 0 && (
+                      <Chip size="small" label={`${queuedCount} queued`} color="default" sx={{ height: 20, fontSize: '0.7rem' }} />
+                    )}
+                    {renderingCount > 0 && (
+                      <Chip size="small" label={`${renderingCount} rendering`} color="primary" sx={{ height: 20, fontSize: '0.7rem' }} />
+                    )}
+                    {completedCount > 0 && (
+                      <Chip size="small" label={`${completedCount} done`} color="success" sx={{ height: 20, fontSize: '0.7rem' }} />
+                    )}
+                    {failedCount > 0 && (
+                      <Chip size="small" label={`${failedCount} failed`} color="error" sx={{ height: 20, fontSize: '0.7rem' }} />
+                    )}
+                  </Box>
+                  <Button
+                    size="small"
+                    variant="outlined"
+                    onClick={() => window.location.href = '/render-queue'}
+                  >
+                    View Queue
+                  </Button>
+                </Box>
+              </Box>
+            );
+          })()}
         </Box>
       </Paper>
 
