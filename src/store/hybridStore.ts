@@ -39,7 +39,7 @@ export const useHybridStore = create<HybridStoreState>()(
         theme: 'dark',
         autoSave: true,
         notificationsEnabled: true,
-        apiEndpoint: 'http://localhost:8000',
+        apiEndpoint: 'http://localhost:8001',
         ollamaHost: 'http://localhost:11434',
         processingEnabled: true,
         maxConcurrentGenerations: 3,

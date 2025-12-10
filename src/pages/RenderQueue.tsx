@@ -46,18 +46,46 @@ import {
   ExpandLess,
   Visibility,
   Replay,
+  Add,
+  Videocam,
+  Schedule,
 } from '@mui/icons-material';
 import { useStore, RenderJob } from '../store/useStore';
 import { renderQueueManager } from '../services/renderQueueManager';
-import { nodeDiscoveryService } from '../services/nodeDiscovery';
+import ManualRenderJobDialog from '../components/ManualRenderJobDialog';
+
+// Model colors for visual distinction
+const MODEL_COLORS: Record<string, { bg: string; text: string }> = {
+  holocine: { bg: '#7c4dff', text: 'white' },
+  wan22: { bg: '#00bcd4', text: 'white' },
+  hunyuan15: { bg: '#ff5722', text: 'white' },
+  cogvideox: { bg: '#4caf50', text: 'white' },
+};
+
+// Type colors
+const TYPE_COLORS: Record<string, { bg: string; text: string }> = {
+  scene: { bg: '#e91e63', text: 'white' },
+  shot: { bg: '#2196f3', text: 'white' },
+};
 
 const RenderQueue: React.FC = () => {
-  const { renderQueue, renderQueueEnabled, setRenderQueueEnabled, updateRenderJob, removeRenderJob, clearCompletedRenderJobs, clearAllRenderJobs } = useStore();
+  const {
+    renderQueue,
+    renderQueueEnabled,
+    setRenderQueueEnabled,
+    updateRenderJob,
+    removeRenderJob,
+    clearCompletedRenderJobs,
+    clearAllRenderJobs,
+    stories,
+    shotlists,
+  } = useStore();
   const [nodeStatuses, setNodeStatuses] = useState<{ nodeId: string; nodeName: string; busy: boolean; currentJob: string | null }[]>([]);
   const [queueStats, setQueueStats] = useState({ queued: 0, rendering: 0, completed: 0, failed: 0, total: 0 });
   const [expandedJobs, setExpandedJobs] = useState<Set<string>>(new Set());
   const [confirmClearDialog, setConfirmClearDialog] = useState(false);
   const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [addJobDialogOpen, setAddJobDialogOpen] = useState(false);
 
   // Update stats periodically
   useEffect(() => {
@@ -105,14 +133,14 @@ const RenderQueue: React.FC = () => {
   const getStatusIcon = (status: RenderJob['status']) => {
     switch (status) {
       case 'queued':
-        return <HourglassEmpty fontSize="small" sx={{ color: 'grey.500' }} />;
+        return <HourglassEmpty fontSize="small" />;
       case 'assigned':
       case 'rendering':
-        return <Movie fontSize="small" sx={{ color: 'primary.main' }} className="animate-spin" />;
+        return <Movie fontSize="small" />;
       case 'completed':
-        return <CheckCircle fontSize="small" sx={{ color: 'success.main' }} />;
+        return <CheckCircle fontSize="small" />;
       case 'failed':
-        return <ErrorIcon fontSize="small" sx={{ color: 'error.main' }} />;
+        return <ErrorIcon fontSize="small" />;
       default:
         return null;
     }
@@ -139,6 +167,75 @@ const RenderQueue: React.FC = () => {
     );
   };
 
+  // Get model chip with color
+  const getModelChip = (workflow: string) => {
+    const colors = MODEL_COLORS[workflow] || { bg: '#757575', text: 'white' };
+    const displayName = workflow === 'holocine' ? 'HoloCine'
+      : workflow === 'wan22' ? 'Wan 2.2'
+      : workflow === 'hunyuan15' ? 'Hunyuan 1.5'
+      : workflow === 'cogvideox' ? 'CogVideoX'
+      : workflow;
+
+    return (
+      <Chip
+        size="small"
+        label={displayName}
+        sx={{
+          bgcolor: colors.bg,
+          color: colors.text,
+          fontWeight: 'medium',
+          fontSize: '0.7rem',
+        }}
+      />
+    );
+  };
+
+  // Get type chip with color
+  const getTypeChip = (type: RenderJob['type']) => {
+    const isScene = type === 'holocine_scene';
+    const colors = isScene ? TYPE_COLORS.scene : TYPE_COLORS.shot;
+    const label = isScene ? 'Scene' : 'Shot';
+
+    return (
+      <Chip
+        size="small"
+        label={label}
+        sx={{
+          bgcolor: colors.bg,
+          color: colors.text,
+          fontWeight: 'medium',
+          fontSize: '0.7rem',
+        }}
+      />
+    );
+  };
+
+  // Get source name (Story or Shotlist)
+  const getSourceName = (job: RenderJob): { name: string; id: string; source: string } => {
+    if (job.shotlistId) {
+      const shotlist = shotlists.find(sl => sl.id === job.shotlistId);
+      return {
+        name: shotlist?.title || 'Unknown Shotlist',
+        id: job.shotlistId.slice(0, 8),
+        source: 'Shotlist'
+      };
+    } else if (job.storyId) {
+      const story = stories.find(s => s.id === job.storyId);
+      return {
+        name: story?.title || 'Unknown Story',
+        id: job.storyId.slice(0, 8),
+        source: 'Story'
+      };
+    }
+    return { name: 'Unknown', id: '', source: '' };
+  };
+
+  // Calculate duration from frames and fps
+  const getDuration = (numFrames: number, fps: number) => {
+    const seconds = numFrames / fps;
+    return `${seconds.toFixed(1)}s`;
+  };
+
   // Toggle job expansion
   const toggleJobExpansion = (jobId: string) => {
     setExpandedJobs(prev => {
@@ -152,18 +249,7 @@ const RenderQueue: React.FC = () => {
     });
   };
 
-  // Group jobs by story
-  const jobsByStory = renderQueue.reduce((acc, job) => {
-    const storyId = job.storyId;
-    if (!acc[storyId]) {
-      acc[storyId] = [];
-    }
-    acc[storyId].push(job);
-    return acc;
-  }, {} as Record<string, RenderJob[]>);
-
   const availableNodes = nodeStatuses.filter(n => !n.busy).length;
-  const busyNodes = nodeStatuses.filter(n => n.busy).length;
 
   return (
     <Box sx={{ p: 3 }}>
@@ -191,6 +277,18 @@ const RenderQueue: React.FC = () => {
           </Box>
 
           <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <Button
+              variant="contained"
+              startIcon={<Add />}
+              onClick={() => setAddJobDialogOpen(true)}
+              sx={{
+                bgcolor: 'rgba(255,255,255,0.2)',
+                '&:hover': { bgcolor: 'rgba(255,255,255,0.3)' },
+              }}
+            >
+              Add Custom
+            </Button>
+
             <FormControlLabel
               control={
                 <Switch
@@ -237,9 +335,9 @@ const RenderQueue: React.FC = () => {
       {/* Stats Cards */}
       <Grid container spacing={2} sx={{ mb: 3 }}>
         <Grid size={{ xs: 6, md: 2 }}>
-          <Card sx={{ bgcolor: 'background.paper' }}>
+          <Card>
             <CardContent sx={{ textAlign: 'center', py: 2 }}>
-              <Typography variant="h4" fontWeight="bold" color="grey.600">
+              <Typography variant="h4" fontWeight="bold" color="text.secondary">
                 {queueStats.queued}
               </Typography>
               <Typography variant="body2" color="text.secondary">
@@ -355,196 +453,231 @@ const RenderQueue: React.FC = () => {
             <TableHead>
               <TableRow sx={{ bgcolor: 'grey.100' }}>
                 <TableCell width={40}></TableCell>
-                <TableCell>Job</TableCell>
-                <TableCell>Type</TableCell>
-                <TableCell>Status</TableCell>
-                <TableCell>Progress</TableCell>
-                <TableCell>Node</TableCell>
-                <TableCell align="right">Actions</TableCell>
+                <TableCell sx={{ fontWeight: 'bold', color: 'text.primary' }}>Job</TableCell>
+                <TableCell sx={{ fontWeight: 'bold', color: 'text.primary' }}>Type / Model</TableCell>
+                <TableCell sx={{ fontWeight: 'bold', color: 'text.primary' }}>Settings</TableCell>
+                <TableCell sx={{ fontWeight: 'bold', color: 'text.primary' }}>Status</TableCell>
+                <TableCell sx={{ fontWeight: 'bold', color: 'text.primary' }}>Node</TableCell>
+                <TableCell align="right" sx={{ fontWeight: 'bold', color: 'text.primary' }}>Actions</TableCell>
               </TableRow>
             </TableHead>
             <TableBody>
-              {renderQueue.map((job) => (
-                <React.Fragment key={job.id}>
-                  <TableRow
-                    sx={{
-                      '&:hover': { bgcolor: 'grey.50' },
-                      ...(job.status === 'failed' && { bgcolor: 'error.50' })
-                    }}
-                  >
-                    <TableCell>
-                      <IconButton
-                        size="small"
-                        onClick={() => toggleJobExpansion(job.id)}
-                      >
-                        {expandedJobs.has(job.id) ? <ExpandLess /> : <ExpandMore />}
-                      </IconButton>
-                    </TableCell>
-                    <TableCell>
-                      <Typography variant="body2" fontWeight="medium">
-                        {job.title}
-                      </Typography>
-                      <Typography variant="caption" color="text.secondary">
-                        Story: {job.storyId.slice(0, 8)}...
-                      </Typography>
-                    </TableCell>
-                    <TableCell>
-                      <Chip
-                        size="small"
-                        label={job.type === 'holocine_scene' ? 'Scene' : 'Shot'}
-                        variant="outlined"
-                        color={job.type === 'holocine_scene' ? 'secondary' : 'default'}
-                      />
-                    </TableCell>
-                    <TableCell>{getStatusChip(job.status)}</TableCell>
-                    <TableCell sx={{ minWidth: 150 }}>
-                      {(job.status === 'rendering' || job.status === 'assigned') && (
-                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-                          <LinearProgress
-                            variant="determinate"
-                            value={job.progress}
-                            sx={{ flex: 1 }}
-                          />
-                          <Typography variant="caption" sx={{ minWidth: 40 }}>
-                            {job.progress.toFixed(0)}%
-                          </Typography>
-                        </Box>
-                      )}
-                      {job.status === 'completed' && (
-                        <Typography variant="caption" color="success.main">
-                          Done
-                        </Typography>
-                      )}
-                      {job.status === 'failed' && (
-                        <Typography variant="caption" color="error.main">
-                          Attempt {job.attempts}/{job.maxAttempts}
-                        </Typography>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      {job.assignedNode ? (
-                        <Chip
+              {renderQueue.map((job) => {
+                const sourceInfo = getSourceName(job);
+                return (
+                  <React.Fragment key={job.id}>
+                    <TableRow
+                      sx={{
+                        '&:hover': { bgcolor: 'action.hover' },
+                        ...(job.status === 'failed' && { bgcolor: 'error.50' }),
+                        ...(job.status === 'rendering' && { bgcolor: 'primary.50' }),
+                      }}
+                    >
+                      <TableCell>
+                        <IconButton
                           size="small"
-                          icon={<Computer fontSize="small" />}
-                          label={nodeStatuses.find(n => n.nodeId === job.assignedNode)?.nodeName || job.assignedNode.slice(0, 8)}
-                          variant="outlined"
-                        />
-                      ) : (
-                        <Typography variant="caption" color="text.secondary">
-                          --
-                        </Typography>
-                      )}
-                    </TableCell>
-                    <TableCell align="right">
-                      <Box sx={{ display: 'flex', gap: 0.5, justifyContent: 'flex-end' }}>
-                        {job.status === 'queued' && (
-                          <Tooltip title="Start now">
-                            <IconButton
-                              size="small"
-                              onClick={() => handleStartJob(job.id)}
-                              color="primary"
-                            >
-                              <PlayArrow fontSize="small" />
-                            </IconButton>
-                          </Tooltip>
-                        )}
-                        {job.status === 'failed' && (
-                          <Tooltip title="Retry">
-                            <IconButton
-                              size="small"
-                              onClick={() => handleRetryJob(job.id)}
-                              color="warning"
-                            >
-                              <Replay fontSize="small" />
-                            </IconButton>
-                          </Tooltip>
-                        )}
-                        {job.outputUrl && (
-                          <Tooltip title="Preview">
-                            <IconButton
-                              size="small"
-                              onClick={() => setPreviewUrl(job.outputUrl!)}
-                              color="info"
-                            >
-                              <Visibility fontSize="small" />
-                            </IconButton>
-                          </Tooltip>
-                        )}
-                        <Tooltip title="Remove">
-                          <IconButton
-                            size="small"
-                            onClick={() => removeRenderJob(job.id)}
-                            color="error"
-                          >
-                            <Delete fontSize="small" />
-                          </IconButton>
-                        </Tooltip>
-                      </Box>
-                    </TableCell>
-                  </TableRow>
-
-                  {/* Expanded details */}
-                  <TableRow>
-                    <TableCell colSpan={7} sx={{ p: 0, borderBottom: 0 }}>
-                      <Collapse in={expandedJobs.has(job.id)} timeout="auto" unmountOnExit>
-                        <Box sx={{ p: 2, bgcolor: 'grey.50' }}>
-                          <Grid container spacing={2}>
-                            <Grid size={{ xs: 12, md: 6 }}>
-                              <Typography variant="caption" color="text.secondary">
-                                Positive Prompt:
-                              </Typography>
-                              <Paper sx={{ p: 1, mt: 0.5, maxHeight: 100, overflow: 'auto' }}>
-                                <Typography variant="body2" sx={{ fontSize: '0.75rem', fontFamily: 'monospace' }}>
-                                  {job.positivePrompt.slice(0, 500)}{job.positivePrompt.length > 500 ? '...' : ''}
-                                </Typography>
-                              </Paper>
-                            </Grid>
-                            <Grid size={{ xs: 12, md: 3 }}>
-                              <Typography variant="caption" color="text.secondary">
-                                Settings:
-                              </Typography>
-                              <Paper sx={{ p: 1, mt: 0.5 }}>
-                                <Typography variant="body2" sx={{ fontSize: '0.75rem' }}>
-                                  Workflow: {job.settings.workflow}<br />
-                                  Frames: {job.settings.numFrames}<br />
-                                  FPS: {job.settings.fps}<br />
-                                  Resolution: {job.settings.resolution}
-                                </Typography>
-                              </Paper>
-                            </Grid>
-                            <Grid size={{ xs: 12, md: 3 }}>
-                              {job.error && (
-                                <>
-                                  <Typography variant="caption" color="error.main">
-                                    Error:
-                                  </Typography>
-                                  <Paper sx={{ p: 1, mt: 0.5, bgcolor: 'error.50' }}>
-                                    <Typography variant="body2" sx={{ fontSize: '0.75rem' }} color="error">
-                                      {job.error}
-                                    </Typography>
-                                  </Paper>
-                                </>
-                              )}
-                              {job.outputUrl && (
-                                <>
-                                  <Typography variant="caption" color="success.main">
-                                    Output:
-                                  </Typography>
-                                  <Paper sx={{ p: 1, mt: 0.5, bgcolor: 'success.50' }}>
-                                    <Typography variant="body2" sx={{ fontSize: '0.75rem' }} noWrap>
-                                      {job.outputUrl}
-                                    </Typography>
-                                  </Paper>
-                                </>
-                              )}
-                            </Grid>
-                          </Grid>
+                          onClick={() => toggleJobExpansion(job.id)}
+                        >
+                          {expandedJobs.has(job.id) ? <ExpandLess /> : <ExpandMore />}
+                        </IconButton>
+                      </TableCell>
+                      <TableCell>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <Videocam sx={{ color: 'text.secondary', fontSize: 20 }} />
+                          <Box>
+                            <Typography variant="body2" fontWeight="medium" color="text.primary">
+                              {sourceInfo.name}: {job.title}
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                              {sourceInfo.source} ID: {sourceInfo.id} • Shot ID: {job.targetId.slice(0, 8)}
+                            </Typography>
+                          </Box>
                         </Box>
-                      </Collapse>
-                    </TableCell>
-                  </TableRow>
-                </React.Fragment>
-              ))}
+                      </TableCell>
+                      <TableCell>
+                        <Box sx={{ display: 'flex', gap: 0.5, flexWrap: 'wrap' }}>
+                          {getTypeChip(job.type)}
+                          {getModelChip(job.settings.workflow)}
+                        </Box>
+                      </TableCell>
+                      <TableCell>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                          <Box>
+                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                              {job.settings.numFrames} frames @ {job.settings.fps} FPS
+                            </Typography>
+                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                              {getDuration(job.settings.numFrames, job.settings.fps)} • {job.settings.resolution}
+                            </Typography>
+                          </Box>
+                        </Box>
+                      </TableCell>
+                      <TableCell>
+                        <Box>
+                          {getStatusChip(job.status)}
+                          {(job.status === 'rendering' || job.status === 'assigned') && (
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 1 }}>
+                              <LinearProgress
+                                variant="determinate"
+                                value={job.progress}
+                                sx={{ flex: 1, minWidth: 60 }}
+                              />
+                              <Typography variant="caption" sx={{ minWidth: 35 }}>
+                                {job.progress.toFixed(0)}%
+                              </Typography>
+                            </Box>
+                          )}
+                          {job.status === 'failed' && (
+                            <Typography variant="caption" color="error.main" sx={{ display: 'block', mt: 0.5 }}>
+                              Attempt {job.attempts}/{job.maxAttempts}
+                            </Typography>
+                          )}
+                        </Box>
+                      </TableCell>
+                      <TableCell>
+                        {job.assignedNode ? (
+                          <Chip
+                            size="small"
+                            icon={<Computer fontSize="small" />}
+                            label={nodeStatuses.find(n => n.nodeId === job.assignedNode)?.nodeName || job.assignedNode.slice(0, 8)}
+                            variant="outlined"
+                          />
+                        ) : (
+                          <Typography variant="caption" color="text.secondary">
+                            --
+                          </Typography>
+                        )}
+                      </TableCell>
+                      <TableCell align="right">
+                        <Box sx={{ display: 'flex', gap: 0.5, justifyContent: 'flex-end' }}>
+                          {job.status === 'queued' && (
+                            <Tooltip title="Start now">
+                              <IconButton
+                                size="small"
+                                onClick={() => handleStartJob(job.id)}
+                                color="primary"
+                              >
+                                <PlayArrow fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                          {job.status === 'failed' && (
+                            <Tooltip title="Retry">
+                              <IconButton
+                                size="small"
+                                onClick={() => handleRetryJob(job.id)}
+                                color="warning"
+                              >
+                                <Replay fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                          {job.outputUrl && (
+                            <Tooltip title="Preview">
+                              <IconButton
+                                size="small"
+                                onClick={() => setPreviewUrl(job.outputUrl!)}
+                                color="info"
+                              >
+                                <Visibility fontSize="small" />
+                              </IconButton>
+                            </Tooltip>
+                          )}
+                          <Tooltip title="Remove">
+                            <IconButton
+                              size="small"
+                              onClick={() => removeRenderJob(job.id)}
+                              color="error"
+                            >
+                              <Delete fontSize="small" />
+                            </IconButton>
+                          </Tooltip>
+                        </Box>
+                      </TableCell>
+                    </TableRow>
+
+                    {/* Expanded details */}
+                    <TableRow>
+                      <TableCell colSpan={7} sx={{ p: 0, borderBottom: 0 }}>
+                        <Collapse in={expandedJobs.has(job.id)} timeout="auto" unmountOnExit>
+                          <Box sx={{ p: 2, bgcolor: 'grey.50' }}>
+                            <Grid container spacing={2}>
+                              <Grid size={{ xs: 12, md: 5 }}>
+                                <Typography variant="caption" color="text.secondary" fontWeight="bold">
+                                  Positive Prompt:
+                                </Typography>
+                                <Paper sx={{ p: 1, mt: 0.5, maxHeight: 100, overflow: 'auto' }}>
+                                  <Typography variant="body2" sx={{ fontSize: '0.75rem', fontFamily: 'monospace' }}>
+                                    {job.positivePrompt.slice(0, 500)}{job.positivePrompt.length > 500 ? '...' : ''}
+                                  </Typography>
+                                </Paper>
+                              </Grid>
+                              <Grid size={{ xs: 12, md: 4 }}>
+                                <Typography variant="caption" color="text.secondary" fontWeight="bold">
+                                  Negative Prompt:
+                                </Typography>
+                                <Paper sx={{ p: 1, mt: 0.5, maxHeight: 100, overflow: 'auto', bgcolor: 'error.50' }}>
+                                  <Typography variant="body2" sx={{ fontSize: '0.75rem', fontFamily: 'monospace' }}>
+                                    {job.negativePrompt ? (
+                                      <>
+                                        {job.negativePrompt.slice(0, 300)}{job.negativePrompt.length > 300 ? '...' : ''}
+                                      </>
+                                    ) : (
+                                      <em>None</em>
+                                    )}
+                                  </Typography>
+                                </Paper>
+                              </Grid>
+                              <Grid size={{ xs: 12, md: 3 }}>
+                                <Typography variant="caption" color="text.secondary" fontWeight="bold">
+                                  Full Settings:
+                                </Typography>
+                                <Paper sx={{ p: 1, mt: 0.5 }}>
+                                  <Typography variant="body2" sx={{ fontSize: '0.75rem' }}>
+                                    Workflow: {job.settings.workflow}<br />
+                                    Frames: {job.settings.numFrames}<br />
+                                    FPS: {job.settings.fps}<br />
+                                    Resolution: {job.settings.resolution}<br />
+                                    {job.settings.steps && <>Steps: {job.settings.steps}<br /></>}
+                                    {job.settings.cfg && <>CFG: {job.settings.cfg}<br /></>}
+                                    {job.settings.seed && <>Seed: {job.settings.seed}</>}
+                                  </Typography>
+                                </Paper>
+                              </Grid>
+                              <Grid size={{ xs: 12, md: 3 }}>
+                                {job.error && (
+                                  <>
+                                    <Typography variant="caption" color="error.main" fontWeight="bold">
+                                      Error:
+                                    </Typography>
+                                    <Paper sx={{ p: 1, mt: 0.5, bgcolor: 'error.50' }}>
+                                      <Typography variant="body2" sx={{ fontSize: '0.75rem' }} color="error">
+                                        {job.error}
+                                      </Typography>
+                                    </Paper>
+                                  </>
+                                )}
+                                {job.outputUrl && (
+                                  <>
+                                    <Typography variant="caption" color="success.main" fontWeight="bold">
+                                      Output:
+                                    </Typography>
+                                    <Paper sx={{ p: 1, mt: 0.5, bgcolor: 'success.50' }}>
+                                      <Typography variant="body2" sx={{ fontSize: '0.75rem' }} noWrap>
+                                        {job.outputUrl}
+                                      </Typography>
+                                    </Paper>
+                                  </>
+                                )}
+                              </Grid>
+                            </Grid>
+                          </Box>
+                        </Collapse>
+                      </TableCell>
+                    </TableRow>
+                  </React.Fragment>
+                );
+              })}
             </TableBody>
           </Table>
         </TableContainer>
@@ -600,6 +733,12 @@ const RenderQueue: React.FC = () => {
           )}
         </DialogActions>
       </Dialog>
+
+      {/* Manual Render Job Dialog */}
+      <ManualRenderJobDialog
+        open={addJobDialogOpen}
+        onClose={() => setAddJobDialogOpen(false)}
+      />
     </Box>
   );
 };

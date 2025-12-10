@@ -11,6 +11,7 @@
 export type GenerationMethodId =
   | 'holocine'      // HoloCine: Scene-based multi-shot generation
   | 'wan22'         // Wan 2.2: Shot-by-shot generation
+  | 'hunyuan15'     // Hunyuan 1.5: High-quality text/image to video
   | 'kling'         // Kling: Shot-by-shot generation
   | 'cogvideox'     // CogVideoX: Shot-by-shot generation
   | 'custom';       // Custom: User-defined pipeline
@@ -286,12 +287,42 @@ export const GENERATION_METHODS: GenerationMethod[] = [
     available: true
   },
   {
+    id: 'hunyuan15',
+    name: 'Hunyuan 1.5',
+    description: 'High-quality text/image to video generation. Great for cinematic shots.',
+    pipelineType: 'shot-based',
+    icon: '🎞️',
+    color: '#ff9800',
+    features: {
+      multiShot: false,
+      characterConsistency: false,
+      maxDuration: 5,
+      resolutions: ['848x480', '480x848', '720x720'],
+      fps: [24]
+    },
+    pipeline: {
+      steps: SHOT_BASED_PIPELINE,
+      skipSteps: ['holocine_scenes'],
+      requiredSteps: ['story', 'segments', 'shots', 'characters', 'prompts']
+    },
+    model: {
+      name: 'Hunyuan Video 1.5',
+      type: 'comfyui',
+      endpoint: 'hunyuan_video_workflow',
+      defaultParams: {
+        steps: 30,
+        cfg: 7.0
+      }
+    },
+    available: true
+  },
+  {
     id: 'kling',
     name: 'Kling AI',
     description: 'API-based generation with consistent style. Great for quick iterations.',
     pipelineType: 'shot-based',
     icon: '⚡',
-    color: '#ff9800',
+    color: '#e91e63',
     features: {
       multiShot: false,
       characterConsistency: false,

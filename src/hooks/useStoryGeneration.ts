@@ -168,7 +168,7 @@ const useStoryGeneration = (): UseStoryGenerationReturn => {
       });
 
       // Start the generation process
-      const response = await fetch('http://localhost:8000/api/stories/generate', {
+      const response = await fetch('http://localhost:8001/api/stories/generate', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

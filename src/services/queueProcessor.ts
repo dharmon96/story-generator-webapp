@@ -157,10 +157,13 @@ class QueueProcessor {
     while (this.isRunning) {
       // Find next queued item by priority
       // Filter out items that have been processed or are currently being processed
+      // Also exclude custom/manual stories - they are processed step-by-step manually
       const queuedItems = queue.filter(item =>
         item.status === 'queued' &&
         !this.processingLock.has(item.id) &&
-        !processedItemIds.has(item.id)  // FIX: Don't re-process items from stale queue snapshot
+        !processedItemIds.has(item.id) &&  // FIX: Don't re-process items from stale queue snapshot
+        !item.isCustom &&                   // Custom stories are never auto-processed
+        !item.manualMode                    // Manual mode stories are never auto-processed
       );
 
       if (queuedItems.length === 0) {

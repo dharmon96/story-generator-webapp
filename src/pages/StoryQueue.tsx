@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Box,
   Card,
@@ -21,7 +21,6 @@ import {
   DialogContent,
   DialogActions,
   Alert,
-  Grid,
 } from '@mui/material';
 import {
   PlayArrow,
@@ -36,20 +35,26 @@ import {
   Visibility,
   Stop,
   Refresh,
+  Movie,
+  MovieFilter,
+  Build,
 } from '@mui/icons-material';
-import { useStore, Story } from '../store/useStore';
+import { useStore } from '../store/useStore';
 import { debugService } from '../services/debugService';
 import { nodeDiscoveryService } from '../services/nodeDiscovery';
 import { queueProcessor, ProcessingStatus } from '../services/queueProcessor';
+import { GENERATION_METHODS, SHOT_BASED_PIPELINE } from '../types/generationMethods';
+import CustomStoryDialog from '../components/CustomStoryDialog';
 
 interface StoryQueueProps {
   onOpenStory?: (storyId: string, queueItemId: string) => void;
 }
 
 const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
-  const { queue, removeFromQueue, clearCompletedQueue, moveQueueItem, updateQueueItem, addStory, reQueueItem, settings } = useStore();
+  const { queue, renderQueue, removeFromQueue, clearCompletedQueue, moveQueueItem, updateQueueItem, addStory, reQueueItem, settings } = useStore();
   const [selectedItem, setSelectedItem] = useState<string | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [customStoryDialogOpen, setCustomStoryDialogOpen] = useState(false);
   const [processingStatus, setProcessingStatus] = useState<ProcessingStatus>({
     isProcessing: false,
     currentItemId: null,
@@ -207,7 +212,71 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
     return stepNames[step] || step;
   };
 
-  const getStatusIcon = (status: string) => {
+  /**
+   * Get render status for a completed story with shot counts
+   */
+  interface RenderStatusInfo {
+    status: 'rendered' | 'rendering' | 'ready_to_render';
+    totalShots: number;
+    completedShots: number;
+    renderingShots: number;
+    failedShots: number;
+  }
+
+  const getRenderStatus = (storyId: string | undefined): RenderStatusInfo | null => {
+    if (!storyId) return null;
+
+    // Find all render jobs for this story
+    const storyRenderJobs = renderQueue.filter(job => job.storyId === storyId);
+
+    if (storyRenderJobs.length === 0) {
+      return {
+        status: 'ready_to_render',
+        totalShots: 0,
+        completedShots: 0,
+        renderingShots: 0,
+        failedShots: 0
+      };
+    }
+
+    const totalShots = storyRenderJobs.length;
+    const completedShots = storyRenderJobs.filter(job => job.status === 'completed').length;
+    const renderingShots = storyRenderJobs.filter(job =>
+      job.status === 'rendering' || job.status === 'assigned'
+    ).length;
+    const failedShots = storyRenderJobs.filter(job => job.status === 'failed').length;
+
+    let status: 'rendered' | 'rendering' | 'ready_to_render';
+    if (completedShots === totalShots) {
+      status = 'rendered';
+    } else if (renderingShots > 0 || completedShots > 0) {
+      status = 'rendering';
+    } else {
+      status = 'ready_to_render';
+    }
+
+    return {
+      status,
+      totalShots,
+      completedShots,
+      renderingShots,
+      failedShots
+    };
+  };
+
+  const getStatusIcon = (status: string, renderInfo?: RenderStatusInfo | null) => {
+    // For completed items, show render-specific icons
+    if (status === 'completed' && renderInfo) {
+      switch (renderInfo.status) {
+        case 'rendered':
+          return <MovieFilter sx={{ color: '#4caf50' }} />;  // Green film icon
+        case 'rendering':
+          return <Movie sx={{ color: '#2196f3' }} />;  // Blue film icon
+        case 'ready_to_render':
+          return <Movie sx={{ color: '#ff9800' }} />;  // Orange film icon
+      }
+    }
+
     switch (status) {
       case 'completed':
         return <CheckCircle color="success" />;
@@ -220,7 +289,33 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
     }
   };
 
-  const getStatusColor = (status: string): any => {
+  const getStatusLabel = (status: string, renderInfo?: RenderStatusInfo | null): string => {
+    if (status === 'completed' && renderInfo) {
+      switch (renderInfo.status) {
+        case 'rendered':
+          return `Rendered (${renderInfo.totalShots} shots)`;
+        case 'rendering':
+          return `Rendering ${renderInfo.completedShots}/${renderInfo.totalShots}`;
+        case 'ready_to_render':
+          return 'Ready to Render';
+      }
+    }
+    return status;
+  };
+
+  const getStatusColor = (status: string, renderInfo?: RenderStatusInfo | null): any => {
+    // For completed items, show render-specific colors
+    if (status === 'completed' && renderInfo) {
+      switch (renderInfo.status) {
+        case 'rendered':
+          return 'success';  // Green
+        case 'rendering':
+          return 'primary';  // Blue
+        case 'ready_to_render':
+          return 'warning';  // Orange
+      }
+    }
+
     switch (status) {
       case 'completed':
         return 'success';
@@ -242,13 +337,48 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
     return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
   };
 
-  // Auto-start only for high-priority items (from Generate button)
-  useEffect(() => {
-    const highPriorityQueuedItems = queue.filter(item => 
-      item.status === 'queued' && 
-      item.priority >= 10
+  /**
+   * Get pipeline info for a queue item
+   * Shows the video generation method and LLM model being used
+   */
+  const getPipelineInfo = (item: typeof queue[0]) => {
+    const methodId = item.config.generationMethod || 'wan22';
+    const method = GENERATION_METHODS.find(m => m.id === methodId);
+
+    // Find LLM model from settings (for the 'story' step)
+    const storyModelConfig = settings.modelConfigs?.find(
+      c => c.step === 'story' && c.enabled
     );
-    
+    const llmModel = storyModelConfig?.model || 'Default LLM';
+
+    // Shorten model name for display
+    const shortLlmName = llmModel
+      .replace('llama3.1:', '')
+      .replace('llama3:', '')
+      .replace('qwen2.5:', '')
+      .replace(':latest', '')
+      .split(':')[0];
+
+    return {
+      method,
+      methodName: method?.name || methodId,
+      methodIcon: method?.icon || '🎬',
+      methodColor: method?.color || '#666',
+      llmModel: shortLlmName,
+      pipelineType: method?.pipelineType || 'shot-based'
+    };
+  };
+
+  // Auto-start only for high-priority items (from Generate button)
+  // Excludes custom/manual stories - they are processed step-by-step manually
+  useEffect(() => {
+    const highPriorityQueuedItems = queue.filter(item =>
+      item.status === 'queued' &&
+      item.priority >= 10 &&
+      !item.isCustom &&    // Never auto-process custom stories
+      !item.manualMode     // Never auto-process manual mode stories
+    );
+
     // Only auto-start if we have genuinely new high-priority items and we're not processing
     if (highPriorityQueuedItems.length > 0 && !processingStatus.isProcessing && settings.processingEnabled) {
       debugService.info('queue', `🚀 High-priority queued items detected! Auto-starting processing for ${highPriorityQueuedItems.length} items`);
@@ -276,57 +406,190 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
 
   // Manual queue processing only starts when user clicks "Start Processing" button
 
+  // Calculate queue stats
+  const queueStats = {
+    total: queue.length,
+    queued: queue.filter(item => item.status === 'queued').length,
+    processing: queue.filter(item => item.status === 'processing').length,
+    completed: queue.filter(item => item.status === 'completed').length,
+    failed: queue.filter(item => item.status === 'failed').length,
+  };
+
+  // Calculate render stats
+  const renderStats = {
+    total: renderQueue.length,
+    queued: renderQueue.filter(j => j.status === 'queued').length,
+    rendering: renderQueue.filter(j => j.status === 'rendering' || j.status === 'assigned').length,
+    completed: renderQueue.filter(j => j.status === 'completed').length,
+  };
+
   return (
     <Box>
-      <Box sx={{ mb: 3, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <Typography variant="h4">Story Queue</Typography>
-        <Box sx={{ display: 'flex', gap: 2 }}>
-          <Button
-            variant="outlined"
-            startIcon={<Clear />}
-            onClick={() => {
-              clearCompletedQueue();
-              console.log('Cleared completed items');
-            }}
-            disabled={!queue.some(item => item.status === 'completed')}
-          >
-            Clear Completed
-          </Button>
-          <Button
-            variant="outlined"
-            startIcon={<Delete />}
-            onClick={() => {
-              if (window.confirm('Are you sure you want to clear ALL items from the queue?')) {
-                queue.forEach(item => {
-                  if (item.status !== 'processing') {
-                    removeFromQueue(item.id);
-                  }
-                });
-              }
-            }}
-            color="error"
-            disabled={queue.length === 0 || queue.every(item => item.status === 'processing')}
-          >
-            Clear All
-          </Button>
-          <Button
-            variant="contained"
-            startIcon={processingStatus.isProcessing ? <Pause /> : <PlayArrow />}
-            onClick={handleToggleProcessing}
-            color={processingStatus.isProcessing ? 'error' : 'primary'}
-          >
-            {processingStatus.isProcessing ? 'Stop Processing' : 'Start Processing'}
-          </Button>
-        </Box>
-      </Box>
-
-      <Grid container spacing={3}>
-        <Grid size={{ xs: 12, md: 8 }}>
-          <Card>
-            <CardContent>
-              <Typography variant="h6" gutterBottom>
-                Queue Items
+      {/* Header Banner with Stats */}
+      <Paper
+        sx={{
+          p: 3,
+          mb: 3,
+          background: processingStatus.isProcessing
+            ? 'linear-gradient(135deg, #1b5e20 0%, #2e7d32 100%)'
+            : 'linear-gradient(135deg, #1a237e 0%, #311b92 100%)',
+          color: 'white',
+          borderRadius: 2,
+        }}
+      >
+        <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 2 }}>
+          {/* Title and Status */}
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+            <Box>
+              <Typography variant="h4" fontWeight="bold">
+                Story Queue
               </Typography>
+              <Typography variant="body2" sx={{ opacity: 0.9 }}>
+                {processingStatus.isProcessing ? (
+                  <>Processing • {processingStatus.currentItemId ? `Working on story...` : 'Idle'}</>
+                ) : (
+                  `${queueStats.queued} stories waiting • ${renderStats.queued} shots ready to render`
+                )}
+              </Typography>
+            </Box>
+          </Box>
+
+          {/* Stats Cards */}
+          <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
+            <Box sx={{ textAlign: 'center', px: 2 }}>
+              <Typography variant="h4" fontWeight="bold">{queueStats.total}</Typography>
+              <Typography variant="caption" sx={{ opacity: 0.8 }}>Total</Typography>
+            </Box>
+            <Box sx={{ textAlign: 'center', px: 2, borderLeft: '1px solid rgba(255,255,255,0.3)' }}>
+              <Typography variant="h4" fontWeight="bold" sx={{ color: '#90caf9' }}>{queueStats.processing}</Typography>
+              <Typography variant="caption" sx={{ opacity: 0.8 }}>Processing</Typography>
+            </Box>
+            <Box sx={{ textAlign: 'center', px: 2, borderLeft: '1px solid rgba(255,255,255,0.3)' }}>
+              <Typography variant="h4" fontWeight="bold" sx={{ color: '#a5d6a7' }}>{queueStats.completed}</Typography>
+              <Typography variant="caption" sx={{ opacity: 0.8 }}>Complete</Typography>
+            </Box>
+            <Box sx={{ textAlign: 'center', px: 2, borderLeft: '1px solid rgba(255,255,255,0.3)' }}>
+              <Typography variant="h4" fontWeight="bold" sx={{ color: '#ffcc80' }}>{renderStats.queued}</Typography>
+              <Typography variant="caption" sx={{ opacity: 0.8 }}>Render Queue</Typography>
+            </Box>
+            <Box sx={{ textAlign: 'center', px: 2, borderLeft: '1px solid rgba(255,255,255,0.3)' }}>
+              <Typography variant="body2" sx={{ opacity: 0.8 }}>ETA</Typography>
+              <Typography variant="h5" fontWeight="bold">{calculateETA()}</Typography>
+            </Box>
+          </Box>
+
+          {/* Action Buttons */}
+          <Box sx={{ display: 'flex', gap: 1 }}>
+            <Button
+              variant="contained"
+              startIcon={<Build />}
+              onClick={() => setCustomStoryDialogOpen(true)}
+              sx={{
+                bgcolor: 'rgba(255,255,255,0.2)',
+                '&:hover': { bgcolor: 'rgba(255,255,255,0.3)' }
+              }}
+            >
+              Custom Story
+            </Button>
+            <Button
+              variant="contained"
+              startIcon={processingStatus.isProcessing ? <Pause /> : <PlayArrow />}
+              onClick={handleToggleProcessing}
+              sx={{
+                bgcolor: processingStatus.isProcessing ? 'error.main' : 'rgba(255,255,255,0.2)',
+                '&:hover': {
+                  bgcolor: processingStatus.isProcessing ? 'error.dark' : 'rgba(255,255,255,0.3)'
+                }
+              }}
+            >
+              {processingStatus.isProcessing ? 'Stop' : 'Start'}
+            </Button>
+            <Tooltip title="Clear completed">
+              <IconButton
+                onClick={() => clearCompletedQueue()}
+                disabled={!queue.some(item => item.status === 'completed')}
+                sx={{ color: 'white', opacity: queue.some(item => item.status === 'completed') ? 1 : 0.5 }}
+              >
+                <Clear />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="Clear all">
+              <IconButton
+                onClick={() => {
+                  if (window.confirm('Are you sure you want to clear ALL items from the queue?')) {
+                    queue.forEach(item => {
+                      if (item.status !== 'processing') {
+                        removeFromQueue(item.id);
+                      }
+                    });
+                  }
+                }}
+                disabled={queue.length === 0}
+                sx={{ color: 'white', opacity: queue.length > 0 ? 1 : 0.5 }}
+              >
+                <Delete />
+              </IconButton>
+            </Tooltip>
+          </Box>
+        </Box>
+
+        {/* Current Processing Info */}
+        {processingStatus.isProcessing && processingStatus.currentItemId && (() => {
+          const item = queue.find(q => q.id === processingStatus.currentItemId);
+          return item ? (
+            <Box sx={{ mt: 2, pt: 2, borderTop: '1px solid rgba(255,255,255,0.2)' }}>
+              <Box sx={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+                <Box sx={{ flex: 1 }}>
+                  <Typography variant="body2" sx={{ opacity: 0.8 }}>
+                    Currently Processing: <strong>{item.config.prompt?.slice(0, 50) || 'Story'}...</strong>
+                  </Typography>
+                  {item.currentStep && (
+                    <Typography variant="caption" sx={{ opacity: 0.7 }}>
+                      Step: {getStepDisplayName(item.currentStep)}
+                    </Typography>
+                  )}
+                </Box>
+                <Box sx={{ width: 200 }}>
+                  <LinearProgress
+                    variant="determinate"
+                    value={item.progress}
+                    sx={{
+                      height: 8,
+                      borderRadius: 4,
+                      bgcolor: 'rgba(255,255,255,0.2)',
+                      '& .MuiLinearProgress-bar': { bgcolor: 'white' }
+                    }}
+                  />
+                  <Typography variant="caption" sx={{ opacity: 0.8 }}>{item.progress}%</Typography>
+                </Box>
+              </Box>
+            </Box>
+          ) : null;
+        })()}
+
+        {/* Errors */}
+        {processingStatus.errors.length > 0 && (
+          <Alert severity="error" sx={{ mt: 2 }}>
+            {processingStatus.errors.map((error, i) => (
+              <Typography key={i} variant="body2">• {error}</Typography>
+            ))}
+          </Alert>
+        )}
+      </Paper>
+
+      {/* Queue Table - Full Width */}
+      <Card>
+        <CardContent>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+            <Typography variant="h6">
+              Queue Items ({queue.length})
+            </Typography>
+            {settings.modelConfigs && settings.modelConfigs.length > 0 && (
+              <Typography variant="body2" color="text.secondary">
+                {settings.modelConfigs.filter(c => c.enabled).length} models configured
+              </Typography>
+            )}
+          </Box>
               
               {queue.length === 0 ? (
                 <Alert severity="info">
@@ -339,7 +602,7 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
                       <TableRow>
                         <TableCell>Position</TableCell>
                         <TableCell>Story</TableCell>
-                        <TableCell>Genre</TableCell>
+                        <TableCell>Pipeline</TableCell>
                         <TableCell>Priority</TableCell>
                         <TableCell>Status</TableCell>
                         <TableCell>Progress</TableCell>
@@ -348,44 +611,174 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
                     </TableHead>
                     <TableBody>
                       {queue.map((item, index) => (
-                        <TableRow key={item.id}>
+                        <TableRow
+                          key={item.id}
+                          sx={{
+                            // Custom stories have a distinct visual style
+                            ...(item.isCustom && {
+                              bgcolor: 'rgba(255, 152, 0, 0.08)',
+                              borderLeft: '4px solid #ff9800',
+                            }),
+                            // Manual mode stories (converted from auto)
+                            ...(item.manualMode && !item.isCustom && {
+                              bgcolor: 'rgba(156, 39, 176, 0.08)',
+                              borderLeft: '4px solid #9c27b0',
+                            }),
+                          }}
+                        >
                           <TableCell>{index + 1}</TableCell>
                           <TableCell>
-                            <Typography variant="body2" noWrap sx={{ maxWidth: 200 }}>
-                              {item.config.prompt || 'Auto-generated'}
-                            </Typography>
+                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                              {/* Custom story icon */}
+                              {item.isCustom && (
+                                <Tooltip title="Custom Story - Manual Control">
+                                  <Build sx={{ fontSize: 18, color: 'warning.main' }} />
+                                </Tooltip>
+                              )}
+                              {item.manualMode && !item.isCustom && (
+                                <Tooltip title="Manual Mode - Converted from Auto">
+                                  <Build sx={{ fontSize: 18, color: 'secondary.main' }} />
+                                </Tooltip>
+                              )}
+                              <Box>
+                                <Typography variant="body2" noWrap sx={{ maxWidth: 180 }}>
+                                  {item.stepData?.title || item.config.prompt || 'Auto-generated'}
+                                </Typography>
+                                <Typography variant="caption" color="text.secondary">
+                                  {item.config.genre}
+                                  {item.isCustom && (
+                                    <Chip
+                                      label="Custom"
+                                      size="small"
+                                      sx={{
+                                        ml: 1,
+                                        height: 16,
+                                        fontSize: '0.65rem',
+                                        bgcolor: 'warning.main',
+                                        color: 'warning.contrastText',
+                                      }}
+                                    />
+                                  )}
+                                </Typography>
+                              </Box>
+                            </Box>
                           </TableCell>
-                          <TableCell>{item.config.genre}</TableCell>
                           <TableCell>
-                            <Chip 
-                              label={item.priority >= 10 ? 'Immediate' : 'Normal'} 
-                              size="small" 
+                            {(() => {
+                              const pipeline = getPipelineInfo(item);
+                              return (
+                                <Box sx={{ display: 'flex', flexDirection: 'column', gap: 0.5 }}>
+                                  <Tooltip title={`Video: ${pipeline.methodName} (${pipeline.pipelineType})`}>
+                                    <Chip
+                                      size="small"
+                                      label={pipeline.methodName}
+                                      icon={<span style={{ marginLeft: 6 }}>{pipeline.methodIcon}</span>}
+                                      sx={{
+                                        bgcolor: `${pipeline.methodColor}20`,
+                                        color: pipeline.methodColor,
+                                        borderColor: pipeline.methodColor,
+                                        fontWeight: 500,
+                                        fontSize: '0.7rem',
+                                        height: 22,
+                                      }}
+                                      variant="outlined"
+                                    />
+                                  </Tooltip>
+                                  <Tooltip title={`LLM: ${pipeline.llmModel}`}>
+                                    <Typography
+                                      variant="caption"
+                                      sx={{
+                                        color: 'text.secondary',
+                                        fontSize: '0.65rem',
+                                        display: 'block',
+                                        maxWidth: 100,
+                                        overflow: 'hidden',
+                                        textOverflow: 'ellipsis',
+                                        whiteSpace: 'nowrap'
+                                      }}
+                                    >
+                                      LLM: {pipeline.llmModel}
+                                    </Typography>
+                                  </Tooltip>
+                                </Box>
+                              );
+                            })()}
+                          </TableCell>
+                          <TableCell>
+                            <Chip
+                              label={item.priority >= 10 ? 'Immediate' : 'Normal'}
+                              size="small"
                               color={item.priority >= 10 ? 'error' : 'primary'}
                               variant={item.priority >= 10 ? 'filled' : 'outlined'}
                             />
                           </TableCell>
                           <TableCell>
-                            <Chip
-                              icon={getStatusIcon(item.status)}
-                              label={item.status}
-                              size="small"
-                              color={getStatusColor(item.status)}
-                            />
+                            {(() => {
+                              const renderInfo = item.status === 'completed' ? getRenderStatus(item.storyId) : null;
+                              return (
+                                <Chip
+                                  icon={getStatusIcon(item.status, renderInfo)}
+                                  label={getStatusLabel(item.status, renderInfo)}
+                                  size="small"
+                                  color={getStatusColor(item.status, renderInfo)}
+                                />
+                              );
+                            })()}
                           </TableCell>
                           <TableCell>
                             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
                               <Box sx={{ flex: 1 }}>
-                                <LinearProgress
-                                  variant="determinate"
-                                  value={item.progress}
-                                  sx={{ width: '100%', height: 8, borderRadius: 4 }}
-                                />
-                                <Typography variant="caption" color="text.secondary">
-                                  {item.progress}%
-                                  {item.status === 'processing' && item.currentStep && (
-                                    <> • {getStepDisplayName(item.currentStep)}</>
-                                  )}
-                                </Typography>
+                                {/* Custom stories show step progress instead of percentage */}
+                                {item.isCustom || item.manualMode ? (
+                                  <>
+                                    <Box sx={{ display: 'flex', gap: 0.5, mb: 0.5 }}>
+                                      {SHOT_BASED_PIPELINE.map((step, stepIdx) => {
+                                        const isCompleted = item.completedSteps?.includes(step.id);
+                                        const isSkipped = item.skippedSteps?.includes(step.id);
+                                        return (
+                                          <Tooltip
+                                            key={step.id}
+                                            title={`${step.name}${isCompleted ? ' ✓' : isSkipped ? ' (skipped)' : ''}`}
+                                          >
+                                            <Box
+                                              sx={{
+                                                width: 16,
+                                                height: 8,
+                                                borderRadius: 1,
+                                                bgcolor: isSkipped
+                                                  ? 'grey.300'
+                                                  : isCompleted
+                                                    ? 'success.main'
+                                                    : 'grey.400',
+                                                opacity: isSkipped ? 0.4 : 1,
+                                              }}
+                                            />
+                                          </Tooltip>
+                                        );
+                                      })}
+                                    </Box>
+                                    <Typography variant="caption" color="text.secondary">
+                                      {item.completedSteps?.length || 0}/{SHOT_BASED_PIPELINE.length - (item.skippedSteps?.length || 0)} steps
+                                      {item.skippedSteps && item.skippedSteps.length > 0 && (
+                                        <> • {item.skippedSteps.length} skipped</>
+                                      )}
+                                    </Typography>
+                                  </>
+                                ) : (
+                                  <>
+                                    <LinearProgress
+                                      variant="determinate"
+                                      value={item.progress}
+                                      sx={{ width: '100%', height: 8, borderRadius: 4 }}
+                                    />
+                                    <Typography variant="caption" color="text.secondary">
+                                      {item.progress}%
+                                      {item.status === 'processing' && item.currentStep && (
+                                        <> • {getStepDisplayName(item.currentStep)}</>
+                                      )}
+                                    </Typography>
+                                  </>
+                                )}
                               </Box>
                             </Box>
                           </TableCell>
@@ -481,122 +874,6 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
               )}
             </CardContent>
           </Card>
-        </Grid>
-
-        <Grid size={{ xs: 12, md: 4 }}>
-          <Card sx={{ mb: 3 }}>
-            <CardContent>
-              <Typography variant="h6" gutterBottom>
-                Queue Statistics
-              </Typography>
-              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                <Box>
-                  <Typography variant="body2" color="text.secondary">Total Items</Typography>
-                  <Typography variant="h4">{queue.length}</Typography>
-                </Box>
-                <Box>
-                  <Typography variant="body2" color="text.secondary">Processing</Typography>
-                  <Typography variant="h4">
-                    {queue.filter(item => item.status === 'processing').length}
-                  </Typography>
-                </Box>
-                <Box>
-                  <Typography variant="body2" color="text.secondary">Completed</Typography>
-                  <Typography variant="h4">
-                    {queue.filter(item => item.status === 'completed').length}
-                  </Typography>
-                </Box>
-                <Box>
-                  <Typography variant="body2" color="text.secondary">Estimated Time</Typography>
-                  <Typography variant="h4">{calculateETA()}</Typography>
-                </Box>
-              </Box>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardContent>
-              <Typography variant="h6" gutterBottom>
-                Processing Settings
-              </Typography>
-              <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                <Alert severity={processingStatus.isProcessing ? 'success' : 'info'}>
-                  Queue processing is {processingStatus.isProcessing ? 'active' : 'paused'}
-                  {processingStatus.currentItemId && (() => {
-                    const item = queue.find(q => q.id === processingStatus.currentItemId);
-                    return item ? (
-                      <>
-                        <br />
-                        <strong>Processing:</strong> {item.config.prompt.slice(0, 30)}...
-                        {item.currentStep && (
-                          <>
-                            <br />
-                            <strong>Step:</strong> {getStepDisplayName(item.currentStep)}
-                          </>
-                        )}
-                      </>
-                    ) : null;
-                  })()}
-                </Alert>
-                
-                <Alert severity="info" sx={{ mt: 1, fontSize: '0.875rem' }}>
-                  <strong>Processing Modes:</strong><br />
-                  • <strong>Immediate:</strong> Stories from "Generate" button start automatically<br />
-                  • <strong>Normal:</strong> Batch processing starts when you click "Start Processing"<br />
-                  • Immediate stories always process first (highest priority)
-                </Alert>
-                
-                <Button 
-                  size="small" 
-                  variant="outlined" 
-                  onClick={() => {
-                    console.log('🔍 DEBUG STATE DUMP:');
-                    console.log('📊 Queue:', queue);
-                    console.log('📊 Settings:', settings);
-                    console.log('📊 Processing Status:', processingStatus);
-                    console.log('📊 Available nodes:', nodeDiscoveryService.getNodes());
-                    
-                    // Show a brief alert
-                    alert(`Debug info logged to console:\n- Queue items: ${queue.length}\n- Processing: ${processingStatus.isProcessing}\n- Current item: ${processingStatus.currentItemId || 'none'}\n- Errors: ${processingStatus.errors.length}\n- Nodes: ${nodeDiscoveryService.getNodes().length}`);
-                  }}
-                >
-                  🐛 Debug State
-                </Button>
-                
-                {processingStatus.errors.length > 0 && (
-                  <Alert severity="error" sx={{ mb: 1 }}>
-                    <Typography variant="body2" fontWeight="bold">Processing Errors:</Typography>
-                    {processingStatus.errors.map((error, index) => (
-                      <Typography key={index} variant="body2" component="div">
-                        • {error}
-                      </Typography>
-                    ))}
-                  </Alert>
-                )}
-                
-                {settings.modelConfigs && settings.modelConfigs.length > 0 ? (
-                  <>
-                    <Typography variant="body2">
-                      Configured models: <strong>{settings.modelConfigs.filter(c => c.enabled).length}</strong>
-                    </Typography>
-                    <Typography variant="body2">
-                      Processing queue: <strong>{queue.filter(q => q.status === 'queued').length} queued</strong>
-                    </Typography>
-                    <Typography variant="body2">
-                      Auto-retry on failure: <strong>{settings.autoRetry ? `Yes (${settings.retryAttempts} attempts)` : 'No'}</strong>
-                    </Typography>
-                  </>
-                ) : (
-                  <Alert severity="warning">
-                    No model configurations found. Please configure models in Settings.
-                  </Alert>
-                )}
-              </Box>
-            </CardContent>
-          </Card>
-
-        </Grid>
-      </Grid>
 
       <Dialog open={deleteDialogOpen} onClose={() => setDeleteDialogOpen(false)}>
         <DialogTitle>Confirm Delete</DialogTitle>
@@ -610,6 +887,18 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
           </Button>
         </DialogActions>
       </Dialog>
+
+      {/* Custom Story Dialog */}
+      <CustomStoryDialog
+        open={customStoryDialogOpen}
+        onClose={() => setCustomStoryDialogOpen(false)}
+        onStoryCreated={(storyId, queueItemId) => {
+          // Navigate to the story view when custom story is created
+          if (onOpenStory) {
+            onOpenStory(storyId, queueItemId);
+          }
+        }}
+      />
     </Box>
   );
 };

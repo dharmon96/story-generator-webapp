@@ -17,6 +17,8 @@ import { useStore, RenderJob, StoryConfig } from '../store/useStore';
 import { nodeDiscoveryService, OllamaNode } from './nodeDiscovery';
 import { debugService } from './debugService';
 import { HoloCineScene, buildRawPromptString } from '../types/holocineTypes';
+import { buildWorkflowForRenderJob } from './comfyUIWorkflowBuilder';
+import { ComfyUINodeAssignment } from '../types/comfyuiTypes';
 
 interface NodeRenderStatus {
   nodeId: string;
@@ -132,9 +134,13 @@ class RenderQueueManager {
   private async assignJobToNode(job: RenderJob, node: OllamaNode): Promise<void> {
     const store = useStore.getState();
 
+    // Get workflow assignment for this job type
+    const assignment = this.getWorkflowAssignment(job);
+
     debugService.info('renderQueue', `🎬 Assigning job ${job.id} to node ${node.name}`, {
       jobTitle: job.title,
-      nodeId: node.id
+      nodeId: node.id,
+      workflowId: assignment?.workflowId || 'legacy'
     });
 
     // Update job status
@@ -157,17 +163,31 @@ class RenderQueueManager {
     nodeDiscoveryService.markNodeBusy(node.id, 'comfyui');
 
     try {
-      // Get the endpoint for ComfyUI
-      const endpoint = nodeDiscoveryService.getNodeEndpoint(node.id, 'comfyui');
+      // Get the endpoint for ComfyUI - prefer assigned node, fallback to discovered node
+      let endpoint: string | null = null;
+
+      if (assignment?.nodeId) {
+        endpoint = nodeDiscoveryService.getNodeEndpoint(assignment.nodeId, 'comfyui');
+      }
+
+      if (!endpoint) {
+        endpoint = nodeDiscoveryService.getNodeEndpoint(node.id, 'comfyui');
+      }
+
       if (!endpoint) {
         throw new Error('Could not get ComfyUI endpoint for node');
       }
 
-      // Build and send the workflow
-      const workflow = this.buildWorkflowForJob(job);
+      // Build the workflow using the assignment settings
+      const workflow = this.buildWorkflowForJob(job, assignment);
 
       // Update status to rendering
       store.updateRenderJob(job.id, { status: 'rendering' });
+
+      debugService.info('renderQueue', `📤 Sending workflow to ${endpoint}/prompt`, {
+        jobId: job.id,
+        nodeCount: Object.keys(workflow).length
+      });
 
       // Send to ComfyUI
       const response = await fetch(`${endpoint}/prompt`, {
@@ -187,7 +207,10 @@ class RenderQueueManager {
       const result = await response.json();
       const promptId = result.prompt_id;
 
-      debugService.success('renderQueue', `✅ Job ${job.id} queued in ComfyUI`, { promptId });
+      debugService.success('renderQueue', `✅ Job ${job.id} queued in ComfyUI`, {
+        promptId,
+        endpoint
+      });
 
       // Connect WebSocket for progress
       this.connectWebSocket(endpoint, node.id, job.id, promptId);
@@ -201,11 +224,60 @@ class RenderQueueManager {
   }
 
   /**
+   * Get the workflow assignment for a job based on its type
+   */
+  private getWorkflowAssignment(job: RenderJob): ComfyUINodeAssignment | null {
+    const store = useStore.getState();
+    const comfySettings = store.settings.comfyUISettings;
+    if (!comfySettings?.nodeAssignments) return null;
+
+    // Determine the step ID based on job type and workflow
+    let stepId: string;
+    if (job.type === 'holocine_scene') {
+      stepId = 'holocine_render';
+    } else if (job.settings.workflow === 'hunyuan15') {
+      stepId = 'hunyuan_render';
+    } else {
+      stepId = 'wan_render';
+    }
+
+    // Find enabled assignment for this step
+    const assignment = comfySettings.nodeAssignments.find(
+      a => a.stepId === stepId && a.enabled && a.nodeId && a.workflowId
+    );
+
+    return assignment || null;
+  }
+
+  /**
    * Build ComfyUI workflow payload from a render job
    */
-  private buildWorkflowForJob(job: RenderJob): Record<string, any> {
-    // For now, return a simple structure compatible with WanVideoWrapper
-    // This would be expanded based on the actual workflow requirements
+  private buildWorkflowForJob(job: RenderJob, assignment?: ComfyUINodeAssignment | null): Record<string, any> {
+    // If we have a workflow assignment, use the new workflow builder
+    if (assignment?.workflowId) {
+      try {
+        const result = buildWorkflowForRenderJob(
+          job,
+          assignment.workflowId,
+          assignment.modelOverrides
+        );
+
+        debugService.info('renderQueue', `Built ${result.workflowType} workflow`, {
+          workflowId: assignment.workflowId,
+          estimatedVRAM: `${result.estimatedVRAM}GB`,
+          warnings: result.warnings
+        });
+
+        return result.workflow;
+      } catch (error: any) {
+        debugService.warn('renderQueue', `Failed to build workflow, using fallback: ${error.message}`);
+        // Fall through to legacy format
+      }
+    }
+
+    // Fallback: Legacy format (simple structure)
+    // This may not work with all ComfyUI setups but provides backward compatibility
+    debugService.warn('renderQueue', 'Using legacy workflow format (no assignment configured)');
 
     if (job.type === 'holocine_scene') {
       // Build HoloCine multi-shot workflow
@@ -502,41 +574,167 @@ class RenderQueueManager {
   }
 
   /**
-   * Create render jobs from a story's shots (for shot-based pipelines)
+   * Get workflow settings based on generation method and config
    */
-  createJobsFromShots(
+  private getWorkflowSettings(config: StoryConfig): {
+    workflowType: 'wan22' | 'hunyuan15' | 'holocine';
+    numFrames: number;
+    fps: number;
+    cfg: number;
+    resolution: string;
+  } {
+    const generationMethod = config.generationMethod || 'wan22';
+    let workflowType: 'wan22' | 'hunyuan15' | 'holocine' = 'wan22';
+    let numFrames = 81;
+    let fps = parseInt(config.fps) || 16;
+    let cfg = 7.5;
+
+    if (generationMethod === 'hunyuan15') {
+      workflowType = 'hunyuan15';
+      numFrames = 129;
+      fps = 24;
+      cfg = 6.0;
+    } else if (generationMethod === 'holocine') {
+      workflowType = 'holocine';
+      numFrames = 81;
+      fps = 16;
+    }
+
+    // Get resolution based on aspect ratio and workflow
+    let resolution: string;
+    if (workflowType === 'hunyuan15') {
+      resolution = config.aspectRatio === '9:16' ? '720x1280' : '1280x720';
+    } else {
+      resolution = config.aspectRatio === '9:16' ? '480x832' : '832x480';
+    }
+
+    return { workflowType, numFrames, fps, cfg, resolution };
+  }
+
+  /**
+   * Create a single render job from a shot (called immediately when prompt completes)
+   */
+  createJobFromShot(
     storyId: string,
-    shots: { id: string; shotNumber: number; title: string; visualPrompt?: string; comfyUIPositivePrompt?: string }[],
+    shot: { id: string; shotNumber: number; title?: string; visualPrompt?: string; comfyUIPositivePrompt?: string; comfyUINegativePrompt?: string; duration?: number },
     config: StoryConfig
   ): void {
     const store = useStore.getState();
 
-    const jobs = shots
-      .filter(shot => shot.comfyUIPositivePrompt || shot.visualPrompt)
-      .map((shot, index) => ({
+    // Check if this shot already has a render job
+    const existingJob = store.renderQueue.find(
+      j => j.storyId === storyId && j.targetId === shot.id
+    );
+
+    if (existingJob) {
+      debugService.info('renderQueue', `Shot ${shot.shotNumber} already in render queue, skipping`);
+      return;
+    }
+
+    // Skip if no prompt
+    if (!shot.comfyUIPositivePrompt && !shot.visualPrompt) {
+      debugService.warn('renderQueue', `Shot ${shot.shotNumber} has no prompt, skipping`);
+      return;
+    }
+
+    const settings = this.getWorkflowSettings(config);
+
+    // Calculate frame count based on shot duration if available
+    // Use shot duration or fallback to workflow default
+    const shotDuration = shot.duration || 3; // Default 3 seconds if not specified
+    const calculatedFrames = Math.round(shotDuration * settings.fps);
+    // Clamp to reasonable limits based on workflow
+    const minFrames = 24;
+    const maxFrames = settings.workflowType === 'hunyuan15' ? 300 : 240;
+    const numFrames = Math.max(minFrames, Math.min(maxFrames, calculatedFrames));
+
+    const job = {
+      storyId,
+      type: 'shot' as const,
+      targetId: shot.id,
+      targetNumber: shot.shotNumber,
+      title: `Shot ${shot.shotNumber}: ${shot.title || 'Untitled'}`,
+      positivePrompt: shot.comfyUIPositivePrompt || shot.visualPrompt || '',
+      negativePrompt: shot.comfyUINegativePrompt || 'blurry, low quality, distorted, deformed, bad anatomy, watermark',
+      settings: {
+        workflow: settings.workflowType,
+        numFrames: numFrames,
+        fps: settings.fps,
+        resolution: settings.resolution,
+        steps: 30,
+        cfg: settings.cfg
+      },
+      status: 'queued' as const,
+      progress: 0,
+      maxAttempts: 3,
+      priority: shot.shotNumber  // Priority by shot order
+    };
+
+    store.addRenderJob(job);
+    debugService.info('renderQueue', `Added shot ${shot.shotNumber} to render queue (${settings.workflowType}, ${numFrames} frames for ${shotDuration}s)`);
+  }
+
+  /**
+   * Create render jobs from a story's shots (for shot-based pipelines)
+   * Note: This is now mainly used as a fallback. Shots are typically added individually
+   * via createJobFromShot as prompts complete.
+   */
+  createJobsFromShots(
+    storyId: string,
+    shots: { id: string; shotNumber: number; title: string; visualPrompt?: string; comfyUIPositivePrompt?: string; comfyUINegativePrompt?: string; duration?: number }[],
+    config: StoryConfig
+  ): void {
+    const store = useStore.getState();
+    const settings = this.getWorkflowSettings(config);
+
+    // Filter out shots that already have render jobs
+    const existingJobTargetIds = new Set(
+      store.renderQueue.filter(j => j.storyId === storyId).map(j => j.targetId)
+    );
+
+    const newShots = shots.filter(shot =>
+      (shot.comfyUIPositivePrompt || shot.visualPrompt) &&
+      !existingJobTargetIds.has(shot.id)
+    );
+
+    if (newShots.length === 0) {
+      debugService.info('renderQueue', `All shots already in render queue for story ${storyId}`);
+      return;
+    }
+
+    const jobs = newShots.map((shot, index) => {
+      // Calculate frame count based on shot duration
+      const shotDuration = shot.duration || 3;
+      const calculatedFrames = Math.round(shotDuration * settings.fps);
+      const minFrames = 24;
+      const maxFrames = settings.workflowType === 'hunyuan15' ? 300 : 240;
+      const numFrames = Math.max(minFrames, Math.min(maxFrames, calculatedFrames));
+
+      return {
         storyId,
         type: 'shot' as const,
         targetId: shot.id,
         targetNumber: shot.shotNumber,
         title: `Shot ${shot.shotNumber}: ${shot.title || 'Untitled'}`,
         positivePrompt: shot.comfyUIPositivePrompt || shot.visualPrompt || '',
-        negativePrompt: 'blurry, low quality, distorted, deformed, bad anatomy, watermark',
+        negativePrompt: shot.comfyUINegativePrompt || 'blurry, low quality, distorted, deformed, bad anatomy, watermark',
         settings: {
-          workflow: 'wan22' as const,
-          numFrames: 81,
-          fps: parseInt(config.fps) || 16,
-          resolution: config.aspectRatio === '9:16' ? '480x832' : '832x480',
+          workflow: settings.workflowType,
+          numFrames: numFrames,
+          fps: settings.fps,
+          resolution: settings.resolution,
           steps: 30,
-          cfg: 7.5
+          cfg: settings.cfg
         },
         status: 'queued' as const,
         progress: 0,
         maxAttempts: 3,
         priority: index
-      }));
+      };
+    });
 
     store.addRenderJobs(jobs);
-    debugService.info('renderQueue', `Added ${jobs.length} shot render jobs for story ${storyId}`);
+    debugService.info('renderQueue', `Added ${jobs.length} ${settings.workflowType} shot render jobs for story ${storyId}`);
   }
 
   /**

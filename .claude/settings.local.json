@@ -30,7 +30,13 @@
       "mcp__ide__executeCode",
       "Bash(find:*)",
       "Bash(findstr:*)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(del /Q \"c:\\AI\\Auto Video\\story-generator-webapp\\PLAN.md\")",
+      "Bash(exit 0)",
+      "Bash(netstat:*)",
+      "Bash(ping:*)",
+      "Bash(arp:*)",
+      "Bash(mkdir:*)"
     ],
     "deny": [],
     "ask": []

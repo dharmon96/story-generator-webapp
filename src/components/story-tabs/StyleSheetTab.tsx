@@ -22,6 +22,16 @@ import {
   Skeleton,
   Tooltip,
   alpha,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  FormControl,
+  InputLabel,
+  Select,
+  MenuItem,
+  Snackbar,
+  CircularProgress,
 } from '@mui/material';
 import {
   ExpandMore,
@@ -33,15 +43,24 @@ import {
   ContentCopy,
   Refresh,
   HourglassEmpty,
+  Add as AddIcon,
+  AutoAwesome as GenerateIcon,
+  AutoFixHigh as EnhanceIcon,
+  Delete as DeleteIcon,
 } from '@mui/icons-material';
 import { EnhancedCharacter, Location } from '../../types/storyTypes';
+import { manualModeAiService } from '../../services/manualModeAiService';
 
 interface StyleSheetTabProps {
   characters: EnhancedCharacter[];
   locations: Location[];
   storyId: string;
+  isManualMode?: boolean;
+  storyContent?: string;
   onUpdateCharacter?: (characterId: string, updates: Partial<EnhancedCharacter>) => void;
   onUpdateLocation?: (locationId: string, updates: Partial<Location>) => void;
+  onAddCharacter?: (character: Partial<EnhancedCharacter>) => void;
+  onAddLocation?: (location: Partial<Location>) => void;
   onGenerateStyleSheet?: () => void;
 }
 
@@ -49,8 +68,12 @@ const StyleSheetTab: React.FC<StyleSheetTabProps> = ({
   characters = [],
   locations = [],
   storyId,
+  isManualMode = false,
+  storyContent,
   onUpdateCharacter,
   onUpdateLocation,
+  onAddCharacter,
+  onAddLocation,
   onGenerateStyleSheet,
 }) => {
   const [editingCharacter, setEditingCharacter] = useState<string | null>(null);
@@ -60,6 +83,35 @@ const StyleSheetTab: React.FC<StyleSheetTabProps> = ({
   const [expandedCharacter, setExpandedCharacter] = useState<string | false>(false);
   const [expandedLocation, setExpandedLocation] = useState<string | false>(false);
   const [copiedPrompt, setCopiedPrompt] = useState<string | null>(null);
+
+  // Dialog states for adding new characters/locations
+  const [addCharacterDialogOpen, setAddCharacterDialogOpen] = useState(false);
+  const [addLocationDialogOpen, setAddLocationDialogOpen] = useState(false);
+  const [newCharacter, setNewCharacter] = useState<Partial<EnhancedCharacter>>({
+    name: '',
+    role: 'supporting',
+    physicalDescription: '',
+    age: '',
+    gender: 'unspecified',
+    clothing: '',
+    personality: '',
+    importanceLevel: 3,
+  });
+  const [newLocation, setNewLocation] = useState<Partial<Location>>({
+    name: '',
+    type: 'interior',
+    description: '',
+    atmosphere: '',
+    lighting: 'natural',
+    timeOfDay: 'midday',
+  });
+
+  // AI generation states
+  const [isGeneratingCharacter, setIsGeneratingCharacter] = useState(false);
+  const [isGeneratingLocation, setIsGeneratingLocation] = useState(false);
+  const [snackbar, setSnackbar] = useState<{ open: boolean; message: string; severity: 'success' | 'error' }>({
+    open: false, message: '', severity: 'success'
+  });
 
   // Prompt display component with pending state
   const PromptDisplay: React.FC<{
@@ -185,6 +237,130 @@ const StyleSheetTab: React.FC<StyleSheetTabProps> = ({
     }
   };
 
+  // Handle adding new character
+  const handleAddCharacter = () => {
+    if (!newCharacter.name?.trim()) {
+      setSnackbar({ open: true, message: 'Character name is required', severity: 'error' });
+      return;
+    }
+    if (onAddCharacter) {
+      onAddCharacter(newCharacter);
+      setNewCharacter({
+        name: '',
+        role: 'supporting',
+        physicalDescription: '',
+        age: '',
+        gender: 'unspecified',
+        clothing: '',
+        personality: '',
+        importanceLevel: 3,
+      });
+      setAddCharacterDialogOpen(false);
+      setSnackbar({ open: true, message: 'Character added successfully', severity: 'success' });
+    }
+  };
+
+  // Handle adding new location
+  const handleAddLocation = () => {
+    if (!newLocation.name?.trim()) {
+      setSnackbar({ open: true, message: 'Location name is required', severity: 'error' });
+      return;
+    }
+    if (onAddLocation) {
+      onAddLocation(newLocation);
+      setNewLocation({
+        name: '',
+        type: 'interior',
+        description: '',
+        atmosphere: '',
+        lighting: 'natural',
+        timeOfDay: 'midday',
+      });
+      setAddLocationDialogOpen(false);
+      setSnackbar({ open: true, message: 'Location added successfully', severity: 'success' });
+    }
+  };
+
+  // Generate character with AI
+  const handleGenerateCharacter = async () => {
+    setIsGeneratingCharacter(true);
+    try {
+      const result = await manualModeAiService.generateCharacter(
+        newCharacter.name || 'an interesting character',
+        storyContent
+      );
+      if (result.success) {
+        try {
+          // Try to parse JSON response
+          const parsed = JSON.parse(result.text);
+          setNewCharacter(prev => ({
+            ...prev,
+            name: parsed.name || prev.name,
+            physicalDescription: parsed.physical_description || parsed.physicalDescription || '',
+            age: parsed.age_range || parsed.age || '',
+            clothing: parsed.clothing || '',
+            personality: parsed.personality || '',
+            role: parsed.role === 'protagonist' ? 'protagonist' :
+                  parsed.role === 'antagonist' ? 'antagonist' : 'supporting',
+          }));
+        } catch {
+          // If not JSON, use as physical description
+          setNewCharacter(prev => ({
+            ...prev,
+            physicalDescription: result.text,
+          }));
+        }
+        setSnackbar({ open: true, message: 'Character details generated', severity: 'success' });
+      } else {
+        setSnackbar({ open: true, message: result.error || 'Failed to generate', severity: 'error' });
+      }
+    } catch (error: any) {
+      setSnackbar({ open: true, message: error.message, severity: 'error' });
+    } finally {
+      setIsGeneratingCharacter(false);
+    }
+  };
+
+  // Generate location with AI
+  const handleGenerateLocation = async () => {
+    setIsGeneratingLocation(true);
+    try {
+      const result = await manualModeAiService.generateLocation(
+        newLocation.name || 'an atmospheric location',
+        storyContent
+      );
+      if (result.success) {
+        try {
+          // Try to parse JSON response
+          const parsed = JSON.parse(result.text);
+          setNewLocation(prev => ({
+            ...prev,
+            name: parsed.name || prev.name,
+            description: parsed.description || '',
+            atmosphere: parsed.atmosphere || '',
+            type: parsed.type === 'exterior' ? 'exterior' :
+                  parsed.type === 'mixed' ? 'mixed' : 'interior',
+            lighting: parsed.lighting || prev.lighting,
+            timeOfDay: parsed.time_of_day || parsed.timeOfDay || prev.timeOfDay,
+          }));
+        } catch {
+          // If not JSON, use as description
+          setNewLocation(prev => ({
+            ...prev,
+            description: result.text,
+          }));
+        }
+        setSnackbar({ open: true, message: 'Location details generated', severity: 'success' });
+      } else {
+        setSnackbar({ open: true, message: result.error || 'Failed to generate', severity: 'error' });
+      }
+    } catch (error: any) {
+      setSnackbar({ open: true, message: error.message, severity: 'error' });
+    } finally {
+      setIsGeneratingLocation(false);
+    }
+  };
+
   const getRoleColor = (role: string) => {
     switch (role) {
       case 'protagonist': return 'primary';
@@ -200,21 +376,53 @@ const StyleSheetTab: React.FC<StyleSheetTabProps> = ({
 
   return (
     <Box>
+      {/* Manual Mode Banner */}
+      {isManualMode && (
+        <Alert severity="info" sx={{ mb: 2 }}>
+          <Typography variant="body2">
+            <strong>Manual Mode:</strong> Add characters and locations referenced in your story. Use AI to generate details.
+          </Typography>
+        </Alert>
+      )}
+
       {/* Header Summary */}
       <Card sx={{ mb: 3 }}>
         <CardContent>
           <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
             <Typography variant="h6">Style Sheet Summary</Typography>
-            {onGenerateStyleSheet && (
-              <Button
-                variant="outlined"
-                size="small"
-                startIcon={<Refresh />}
-                onClick={onGenerateStyleSheet}
-              >
-                Regenerate
-              </Button>
-            )}
+            <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
+              {isManualMode && onAddCharacter && (
+                <Button
+                  variant="contained"
+                  size="small"
+                  startIcon={<AddIcon />}
+                  onClick={() => setAddCharacterDialogOpen(true)}
+                >
+                  Add Character
+                </Button>
+              )}
+              {isManualMode && onAddLocation && (
+                <Button
+                  variant="contained"
+                  size="small"
+                  color="secondary"
+                  startIcon={<AddIcon />}
+                  onClick={() => setAddLocationDialogOpen(true)}
+                >
+                  Add Location
+                </Button>
+              )}
+              {onGenerateStyleSheet && (
+                <Button
+                  variant="outlined"
+                  size="small"
+                  startIcon={<Refresh />}
+                  onClick={onGenerateStyleSheet}
+                >
+                  Regenerate
+                </Button>
+              )}
+            </Box>
           </Box>
           
           <Grid container spacing={3}>
@@ -627,6 +835,243 @@ const StyleSheetTab: React.FC<StyleSheetTabProps> = ({
           </Grid>
         </Grid>
       )}
+
+      {/* Add Character Dialog */}
+      <Dialog
+        open={addCharacterDialogOpen}
+        onClose={() => setAddCharacterDialogOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <Typography variant="h6">Add Character</Typography>
+            <Tooltip title="Generate character details with AI">
+              <IconButton
+                onClick={handleGenerateCharacter}
+                disabled={isGeneratingCharacter}
+                color="primary"
+              >
+                {isGeneratingCharacter ? <CircularProgress size={24} /> : <GenerateIcon />}
+              </IconButton>
+            </Tooltip>
+          </Box>
+        </DialogTitle>
+        <DialogContent>
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
+            <TextField
+              label="Character Name"
+              value={newCharacter.name || ''}
+              onChange={(e) => setNewCharacter({ ...newCharacter, name: e.target.value })}
+              fullWidth
+              required
+              placeholder="Enter name or concept for AI generation"
+            />
+            <FormControl fullWidth>
+              <InputLabel>Role</InputLabel>
+              <Select
+                value={newCharacter.role || 'supporting'}
+                label="Role"
+                onChange={(e) => setNewCharacter({ ...newCharacter, role: e.target.value as any })}
+              >
+                <MenuItem value="protagonist">Protagonist</MenuItem>
+                <MenuItem value="antagonist">Antagonist</MenuItem>
+                <MenuItem value="supporting">Supporting</MenuItem>
+                <MenuItem value="background">Background</MenuItem>
+              </Select>
+            </FormControl>
+            <TextField
+              label="Physical Description"
+              value={newCharacter.physicalDescription || ''}
+              onChange={(e) => setNewCharacter({ ...newCharacter, physicalDescription: e.target.value })}
+              fullWidth
+              multiline
+              rows={3}
+              placeholder="Describe physical appearance..."
+            />
+            <Grid container spacing={2}>
+              <Grid size={{ xs: 6 }}>
+                <TextField
+                  label="Age"
+                  value={newCharacter.age || ''}
+                  onChange={(e) => setNewCharacter({ ...newCharacter, age: e.target.value })}
+                  fullWidth
+                  placeholder="e.g., 30s, young adult"
+                />
+              </Grid>
+              <Grid size={{ xs: 6 }}>
+                <FormControl fullWidth>
+                  <InputLabel>Gender</InputLabel>
+                  <Select
+                    value={newCharacter.gender || 'unspecified'}
+                    label="Gender"
+                    onChange={(e) => setNewCharacter({ ...newCharacter, gender: e.target.value })}
+                  >
+                    <MenuItem value="male">Male</MenuItem>
+                    <MenuItem value="female">Female</MenuItem>
+                    <MenuItem value="non-binary">Non-binary</MenuItem>
+                    <MenuItem value="unspecified">Unspecified</MenuItem>
+                  </Select>
+                </FormControl>
+              </Grid>
+            </Grid>
+            <TextField
+              label="Clothing Style"
+              value={newCharacter.clothing || ''}
+              onChange={(e) => setNewCharacter({ ...newCharacter, clothing: e.target.value })}
+              fullWidth
+              placeholder="Typical attire..."
+            />
+            <TextField
+              label="Personality"
+              value={newCharacter.personality || ''}
+              onChange={(e) => setNewCharacter({ ...newCharacter, personality: e.target.value })}
+              fullWidth
+              multiline
+              rows={2}
+              placeholder="Key personality traits..."
+            />
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setAddCharacterDialogOpen(false)}>Cancel</Button>
+          <Button
+            variant="contained"
+            onClick={handleAddCharacter}
+            disabled={!newCharacter.name?.trim()}
+          >
+            Add Character
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Add Location Dialog */}
+      <Dialog
+        open={addLocationDialogOpen}
+        onClose={() => setAddLocationDialogOpen(false)}
+        maxWidth="sm"
+        fullWidth
+      >
+        <DialogTitle>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            <Typography variant="h6">Add Location</Typography>
+            <Tooltip title="Generate location details with AI">
+              <IconButton
+                onClick={handleGenerateLocation}
+                disabled={isGeneratingLocation}
+                color="primary"
+              >
+                {isGeneratingLocation ? <CircularProgress size={24} /> : <GenerateIcon />}
+              </IconButton>
+            </Tooltip>
+          </Box>
+        </DialogTitle>
+        <DialogContent>
+          <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, pt: 1 }}>
+            <TextField
+              label="Location Name"
+              value={newLocation.name || ''}
+              onChange={(e) => setNewLocation({ ...newLocation, name: e.target.value })}
+              fullWidth
+              required
+              placeholder="Enter name or concept for AI generation"
+            />
+            <FormControl fullWidth>
+              <InputLabel>Type</InputLabel>
+              <Select
+                value={newLocation.type || 'interior'}
+                label="Type"
+                onChange={(e) => setNewLocation({ ...newLocation, type: e.target.value as any })}
+              >
+                <MenuItem value="interior">Interior</MenuItem>
+                <MenuItem value="exterior">Exterior</MenuItem>
+                <MenuItem value="mixed">Mixed</MenuItem>
+              </Select>
+            </FormControl>
+            <TextField
+              label="Description"
+              value={newLocation.description || ''}
+              onChange={(e) => setNewLocation({ ...newLocation, description: e.target.value })}
+              fullWidth
+              multiline
+              rows={3}
+              placeholder="Describe the location..."
+            />
+            <TextField
+              label="Atmosphere"
+              value={newLocation.atmosphere || ''}
+              onChange={(e) => setNewLocation({ ...newLocation, atmosphere: e.target.value })}
+              fullWidth
+              multiline
+              rows={2}
+              placeholder="Mood and feeling of the space..."
+            />
+            <Grid container spacing={2}>
+              <Grid size={{ xs: 6 }}>
+                <FormControl fullWidth>
+                  <InputLabel>Lighting</InputLabel>
+                  <Select
+                    value={newLocation.lighting || 'natural'}
+                    label="Lighting"
+                    onChange={(e) => setNewLocation({ ...newLocation, lighting: e.target.value as any })}
+                  >
+                    <MenuItem value="natural">Natural</MenuItem>
+                    <MenuItem value="artificial">Artificial</MenuItem>
+                    <MenuItem value="mixed">Mixed</MenuItem>
+                    <MenuItem value="dramatic">Dramatic</MenuItem>
+                    <MenuItem value="soft">Soft</MenuItem>
+                  </Select>
+                </FormControl>
+              </Grid>
+              <Grid size={{ xs: 6 }}>
+                <FormControl fullWidth>
+                  <InputLabel>Time of Day</InputLabel>
+                  <Select
+                    value={newLocation.timeOfDay || 'day'}
+                    label="Time of Day"
+                    onChange={(e) => setNewLocation({ ...newLocation, timeOfDay: e.target.value as any })}
+                  >
+                    <MenuItem value="dawn">Dawn</MenuItem>
+                    <MenuItem value="morning">Morning</MenuItem>
+                    <MenuItem value="midday">Midday</MenuItem>
+                    <MenuItem value="afternoon">Afternoon</MenuItem>
+                    <MenuItem value="evening">Evening</MenuItem>
+                    <MenuItem value="night">Night</MenuItem>
+                    <MenuItem value="variable">Variable</MenuItem>
+                  </Select>
+                </FormControl>
+              </Grid>
+            </Grid>
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setAddLocationDialogOpen(false)}>Cancel</Button>
+          <Button
+            variant="contained"
+            onClick={handleAddLocation}
+            disabled={!newLocation.name?.trim()}
+          >
+            Add Location
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* Snackbar for notifications */}
+      <Snackbar
+        open={snackbar.open}
+        autoHideDuration={4000}
+        onClose={() => setSnackbar({ ...snackbar, open: false })}
+        anchorOrigin={{ vertical: 'bottom', horizontal: 'center' }}
+      >
+        <Alert
+          onClose={() => setSnackbar({ ...snackbar, open: false })}
+          severity={snackbar.severity}
+          variant="filled"
+          sx={{ width: '100%' }}
+        >
+          {snackbar.message}
+        </Alert>
+      </Snackbar>
     </Box>
   );
 };

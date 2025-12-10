@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { devtools, persist } from 'zustand/middleware';
 import { debugService } from '../services/debugService';
 import { GenerationMethodId } from '../types/generationMethods';
+import { Shotlist, ShotlistShot, ShotlistGroup, createNewShotlist, createNewShot, createNewGroup } from '../types/shotlistTypes';
 
 export interface StoryConfig {
   prompt: string;
@@ -34,6 +35,14 @@ export interface QueueItem {
   startedAt?: Date;
   completedAt?: Date;
   storyId?: string;
+
+  // Custom/Manual story support
+  isCustom?: boolean;  // True if this is a custom/manual story (no auto-processing)
+  manualMode?: boolean;  // True if story was converted to manual mode from auto
+  completedSteps?: string[];  // List of completed step IDs for custom stories
+  skippedSteps?: string[];  // Steps that were skipped by the user
+  stepData?: Record<string, any>;  // Manual entry data for each step
+  stepGeneratedAt?: Record<string, string>;  // ISO timestamps for when each step was generated (for stale detection)
 }
 
 export interface StoryPart {
@@ -241,8 +250,9 @@ export interface StepCheckpoint {
 // Render job for video generation queue
 export interface RenderJob {
   id: string;
-  storyId: string;
-  type: 'holocine_scene' | 'shot' | 'character_reference';
+  storyId: string;  // For story-based jobs
+  shotlistId?: string;  // For standalone shotlist jobs
+  type: 'holocine_scene' | 'shot' | 'character_reference' | 'shotlist_shot';
   targetId: string;  // Scene ID or Shot ID
   targetNumber: number;  // For ordering
   title: string;
@@ -253,7 +263,7 @@ export interface RenderJob {
 
   // Generation settings (pulled from story config)
   settings: {
-    workflow: 'holocine' | 'wan22' | 'cogvideox';
+    workflow: 'holocine' | 'wan22' | 'hunyuan15' | 'cogvideox';
     numFrames: number;
     fps: number;
     resolution: string;
@@ -353,6 +363,25 @@ export interface StoreState {
   clearAllRenderJobs: (storyId?: string) => void;
   setRenderQueueEnabled: (enabled: boolean) => void;
   getNextRenderJob: () => RenderJob | null;
+
+  // Standalone Shotlist methods
+  shotlists: Shotlist[];
+  addShotlist: (shotlist?: Partial<Shotlist>) => Shotlist;
+  updateShotlist: (id: string, updates: Partial<Shotlist>) => void;
+  deleteShotlist: (id: string) => void;
+  addShotToShotlist: (shotlistId: string, shot?: Partial<ShotlistShot>) => ShotlistShot;
+  updateShot: (shotlistId: string, shotId: string, updates: Partial<ShotlistShot>) => void;
+  deleteShot: (shotlistId: string, shotId: string) => void;
+  reorderShots: (shotlistId: string, shotIds: string[]) => void;
+  addGroupToShotlist: (shotlistId: string, group?: Partial<ShotlistGroup>) => ShotlistGroup;
+  updateGroup: (shotlistId: string, groupId: string, updates: Partial<ShotlistGroup>) => void;
+  deleteGroup: (shotlistId: string, groupId: string, deleteShots?: boolean) => void;
+  moveShotToGroup: (shotlistId: string, shotId: string, groupId: string | undefined) => void;
+
+  // Shotlist render queue methods
+  queueShotlistShot: (shotlistId: string, shotId: string, priority?: number) => void;
+  queueShotlistGroup: (shotlistId: string, groupId: string, priority?: number) => void;
+  queueAllShotlistShots: (shotlistId: string, priority?: number) => void;
 }
 
 export const useStore = create<StoreState>()(
@@ -366,9 +395,9 @@ export const useStore = create<StoreState>()(
           theme: 'dark',
           autoSave: true,
           notificationsEnabled: true,
-          apiEndpoint: 'http://localhost:8000',
+          apiEndpoint: 'http://localhost:8001',
           ollamaHost: 'http://localhost:11434',
-          comfyUIHost: 'http://localhost:8188',
+          comfyUIHost: 'http://localhost:8000', // ComfyUI default port
           modelConfigs: [],
           processingEnabled: true,
           parallelProcessing: 3,
@@ -509,6 +538,8 @@ export const useStore = create<StoreState>()(
         
         deleteStory: (id) => set((state) => ({
           stories: state.stories.filter(story => story.id !== id),
+          // Also remove render jobs for this story
+          renderQueue: state.renderQueue.filter(job => job.storyId !== id),
         })),
 
         upsertStory: (storyData) => set((state) => {
@@ -713,10 +744,43 @@ export const useStore = create<StoreState>()(
             return state;
           }
           debugService.info('store', `📝 Updated render job ${id}`, { status: updates.status, progress: updates.progress });
+
+          // Also update shotlist shot status if this is a shotlist_shot job
+          let updatedShotlists = state.shotlists;
+          if (job.type === 'shotlist_shot' && job.shotlistId && updates.status) {
+            updatedShotlists = state.shotlists.map((sl) =>
+              sl.id === job.shotlistId
+                ? {
+                    ...sl,
+                    shots: sl.shots.map((s) =>
+                      s.id === job.targetId
+                        ? {
+                            ...s,
+                            renderStatus: updates.status === 'assigned' ? 'rendering'
+                              : updates.status === 'completed' ? 'completed'
+                              : updates.status === 'failed' ? 'failed'
+                              : updates.status === 'rendering' ? 'rendering'
+                              : s.renderStatus,
+                            outputUrl: updates.outputUrl || s.outputUrl,
+                            renderJobId: job.id,
+                            updatedAt: new Date(),
+                          }
+                        : s
+                    ),
+                    renderedShots: updates.status === 'completed'
+                      ? sl.shots.filter((s) => s.renderStatus === 'completed' || s.id === job.targetId).length
+                      : sl.renderedShots,
+                    updatedAt: new Date(),
+                  }
+                : sl
+            );
+          }
+
           return {
             renderQueue: state.renderQueue.map(j =>
               j.id === id ? { ...j, ...updates } : j
-            )
+            ),
+            shotlists: updatedShotlists,
           };
         }),
 
@@ -749,6 +813,271 @@ export const useStore = create<StoreState>()(
             });
           return queuedJobs[0] || null;
         },
+
+        // Standalone Shotlist state and methods
+        shotlists: [],
+
+        addShotlist: (partial) => {
+          const newShotlist = createNewShotlist(partial?.title || 'New Shotlist');
+          const merged = { ...newShotlist, ...partial, id: newShotlist.id };
+          set((state) => ({
+            shotlists: [...state.shotlists, merged],
+          }));
+          debugService.info('shotlist', `Created new shotlist: ${merged.title}`);
+          return merged;
+        },
+
+        updateShotlist: (id, updates) => set((state) => ({
+          shotlists: state.shotlists.map((sl) =>
+            sl.id === id ? { ...sl, ...updates, updatedAt: new Date() } : sl
+          ),
+        })),
+
+        deleteShotlist: (id) => set((state) => ({
+          shotlists: state.shotlists.filter((sl) => sl.id !== id),
+          // Also remove render jobs for this shotlist
+          renderQueue: state.renderQueue.filter(job => job.shotlistId !== id),
+        })),
+
+        addShotToShotlist: (shotlistId, partial) => {
+          const shotlist = get().shotlists.find((sl) => sl.id === shotlistId);
+          if (!shotlist) {
+            throw new Error(`Shotlist ${shotlistId} not found`);
+          }
+          const order = shotlist.shots.length;
+          const newShot = createNewShot(shotlistId, order, partial);
+          set((state) => ({
+            shotlists: state.shotlists.map((sl) =>
+              sl.id === shotlistId
+                ? {
+                    ...sl,
+                    shots: [...sl.shots, newShot],
+                    totalShots: sl.shots.length + 1,
+                    updatedAt: new Date(),
+                  }
+                : sl
+            ),
+          }));
+          debugService.info('shotlist', `Added shot ${newShot.title} to ${shotlist.title}`);
+          return newShot;
+        },
+
+        updateShot: (shotlistId, shotId, updates) => set((state) => ({
+          shotlists: state.shotlists.map((sl) =>
+            sl.id === shotlistId
+              ? {
+                  ...sl,
+                  shots: sl.shots.map((shot) =>
+                    shot.id === shotId
+                      ? { ...shot, ...updates, updatedAt: new Date() }
+                      : shot
+                  ),
+                  updatedAt: new Date(),
+                }
+              : sl
+          ),
+        })),
+
+        deleteShot: (shotlistId, shotId) => set((state) => ({
+          shotlists: state.shotlists.map((sl) =>
+            sl.id === shotlistId
+              ? {
+                  ...sl,
+                  shots: sl.shots.filter((shot) => shot.id !== shotId),
+                  totalShots: sl.shots.length - 1,
+                  updatedAt: new Date(),
+                }
+              : sl
+          ),
+        })),
+
+        reorderShots: (shotlistId, shotIds) => set((state) => ({
+          shotlists: state.shotlists.map((sl) =>
+            sl.id === shotlistId
+              ? {
+                  ...sl,
+                  shots: shotIds
+                    .map((id, index) => {
+                      const shot = sl.shots.find((s) => s.id === id);
+                      return shot ? { ...shot, order: index } : null;
+                    })
+                    .filter((s): s is ShotlistShot => s !== null),
+                  updatedAt: new Date(),
+                }
+              : sl
+          ),
+        })),
+
+        addGroupToShotlist: (shotlistId, partial) => {
+          const shotlist = get().shotlists.find((sl) => sl.id === shotlistId);
+          if (!shotlist) {
+            throw new Error(`Shotlist ${shotlistId} not found`);
+          }
+          const order = shotlist.groups.length;
+          const newGroup = createNewGroup(shotlistId, order, partial?.name, partial?.color);
+          const merged = { ...newGroup, ...partial, id: newGroup.id };
+          set((state) => ({
+            shotlists: state.shotlists.map((sl) =>
+              sl.id === shotlistId
+                ? {
+                    ...sl,
+                    groups: [...sl.groups, merged],
+                    updatedAt: new Date(),
+                  }
+                : sl
+            ),
+          }));
+          debugService.info('shotlist', `Added group ${merged.name} to ${shotlist.title}`);
+          return merged;
+        },
+
+        updateGroup: (shotlistId, groupId, updates) => set((state) => ({
+          shotlists: state.shotlists.map((sl) =>
+            sl.id === shotlistId
+              ? {
+                  ...sl,
+                  groups: sl.groups.map((group) =>
+                    group.id === groupId
+                      ? { ...group, ...updates, updatedAt: new Date() }
+                      : group
+                  ),
+                  updatedAt: new Date(),
+                }
+              : sl
+          ),
+        })),
+
+        deleteGroup: (shotlistId, groupId, deleteShots = false) => set((state) => ({
+          shotlists: state.shotlists.map((sl) =>
+            sl.id === shotlistId
+              ? {
+                  ...sl,
+                  groups: sl.groups.filter((group) => group.id !== groupId),
+                  // If deleteShots is false, just ungroup the shots; otherwise delete them
+                  shots: deleteShots
+                    ? sl.shots.filter((shot) => shot.groupId !== groupId)
+                    : sl.shots.map((shot) =>
+                        shot.groupId === groupId ? { ...shot, groupId: undefined } : shot
+                      ),
+                  totalShots: deleteShots
+                    ? sl.shots.filter((shot) => shot.groupId !== groupId).length
+                    : sl.totalShots,
+                  updatedAt: new Date(),
+                }
+              : sl
+          ),
+        })),
+
+        moveShotToGroup: (shotlistId, shotId, groupId) => set((state) => ({
+          shotlists: state.shotlists.map((sl) =>
+            sl.id === shotlistId
+              ? {
+                  ...sl,
+                  shots: sl.shots.map((shot) =>
+                    shot.id === shotId ? { ...shot, groupId, updatedAt: new Date() } : shot
+                  ),
+                  updatedAt: new Date(),
+                }
+              : sl
+          ),
+        })),
+
+        // Shotlist render queue methods
+        queueShotlistShot: (shotlistId, shotId, priority = 5) => {
+          const shotlist = get().shotlists.find((sl) => sl.id === shotlistId);
+          if (!shotlist) {
+            debugService.warn('shotlist', `Shotlist ${shotlistId} not found`);
+            return;
+          }
+          const shot = shotlist.shots.find((s) => s.id === shotId);
+          if (!shot) {
+            debugService.warn('shotlist', `Shot ${shotId} not found in shotlist ${shotlistId}`);
+            return;
+          }
+          if (shot.renderStatus === 'queued' || shot.renderStatus === 'rendering') {
+            debugService.info('shotlist', `Shot ${shot.title} is already ${shot.renderStatus}`);
+            return;
+          }
+
+          // Create render job for this shot
+          const renderJob: Omit<RenderJob, 'id' | 'createdAt' | 'attempts'> = {
+            storyId: '',  // Empty for shotlist shots
+            shotlistId,
+            type: 'shotlist_shot',
+            targetId: shot.id,
+            targetNumber: shot.order,
+            title: shot.title || `Shot ${shot.order + 1}`,
+            positivePrompt: shot.workflowType === 'shot'
+              ? shot.positivePrompt
+              : shot.globalCaption || '',
+            negativePrompt: shot.negativePrompt || '',
+            settings: {
+              workflow: shot.generationMethod === 'holocine' ? 'holocine'
+                : shot.generationMethod === 'hunyuan15' ? 'hunyuan15'
+                : shot.generationMethod === 'cogvideox' ? 'cogvideox'
+                : 'wan22',
+              numFrames: shot.settings.numFrames,
+              fps: shot.settings.fps,
+              resolution: shot.settings.resolution,
+              steps: shot.settings.steps,
+              cfg: shot.settings.cfg,
+              seed: shot.settings.seed,
+            },
+            status: 'queued',
+            progress: 0,
+            maxAttempts: 3,
+            priority,
+          };
+
+          get().addRenderJob(renderJob);
+
+          // Update shot status to queued
+          set((state) => ({
+            shotlists: state.shotlists.map((sl) =>
+              sl.id === shotlistId
+                ? {
+                    ...sl,
+                    shots: sl.shots.map((s) =>
+                      s.id === shotId ? { ...s, renderStatus: 'queued' as const, updatedAt: new Date() } : s
+                    ),
+                    updatedAt: new Date(),
+                  }
+                : sl
+            ),
+          }));
+
+          debugService.info('shotlist', `Queued shot ${shot.title} for rendering`);
+        },
+
+        queueShotlistGroup: (shotlistId, groupId, priority = 5) => {
+          const shotlist = get().shotlists.find((sl) => sl.id === shotlistId);
+          if (!shotlist) return;
+
+          const shotsInGroup = shotlist.shots.filter(
+            (s) => s.groupId === groupId && s.renderStatus !== 'queued' && s.renderStatus !== 'rendering'
+          );
+
+          shotsInGroup.forEach((shot) => {
+            get().queueShotlistShot(shotlistId, shot.id, priority);
+          });
+
+          debugService.info('shotlist', `Queued ${shotsInGroup.length} shots from group for rendering`);
+        },
+
+        queueAllShotlistShots: (shotlistId, priority = 5) => {
+          const shotlist = get().shotlists.find((sl) => sl.id === shotlistId);
+          if (!shotlist) return;
+
+          const pendingShots = shotlist.shots.filter(
+            (s) => s.renderStatus !== 'queued' && s.renderStatus !== 'rendering' && s.renderStatus !== 'completed'
+          );
+
+          pendingShots.forEach((shot) => {
+            get().queueShotlistShot(shotlistId, shot.id, priority);
+          });
+
+          debugService.info('shotlist', `Queued ${pendingShots.length} shots from shotlist ${shotlist.title}`);
+        },
       }),
       {
         name: 'story-generator-storage',
@@ -759,6 +1088,7 @@ export const useStore = create<StoreState>()(
           checkpoints: state.checkpoints,  // Persist checkpoints for resume
           renderQueue: state.renderQueue,  // Persist render queue
           renderQueueEnabled: state.renderQueueEnabled,
+          shotlists: state.shotlists,  // Persist standalone shotlists
         }),
       }
     )

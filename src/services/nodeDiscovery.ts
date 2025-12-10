@@ -45,17 +45,219 @@ export interface ModelConfig {
 
 class NodeDiscoveryService {
   private nodes: Map<string, OllamaNode> = new Map();
-  private commonPorts = [11434, 11435, 11436, 8080, 8000, 3000, 7860, 8188];
-  private commonHosts = ['localhost', '127.0.0.1'];
+  private commonPorts = [11434, 11435, 11436, 8188, 8080, 7860]; // Ollama ports + ComfyUI default (8188)
+  private commonHosts = ['localhost']; // Only use localhost - 127.0.0.1 is equivalent and causes duplicates
   private apiKeys: { [key: string]: string } = {};
+  private knownHosts: Set<string> = new Set(); // Remember hosts that were successfully connected
+  private backendUrl: string = 'http://localhost:8001'; // Backend API URL for proxy requests
+  private useProxy: boolean = true; // Whether to use backend proxy (bypasses CORS)
+  private localMachineIP: string | null = null; // Detected local machine's network IP (to avoid duplicates)
 
   constructor() {
     // Load API keys from localStorage on initialization
     this.loadAPIKeysFromStorage();
+    // Load known hosts from localStorage
+    this.loadKnownHostsFromStorage();
     // Initialize API nodes if keys exist - delayed to ensure methods are available
     setTimeout(async () => {
       await this.initializeAPINodesWithValidation();
     }, 0);
+  }
+
+  /**
+   * Set the backend URL (if different from default)
+   */
+  setBackendUrl(url: string): void {
+    this.backendUrl = url;
+  }
+
+  /**
+   * Check if backend proxy is available
+   */
+  private async isBackendAvailable(): Promise<boolean> {
+    try {
+      const response = await fetch(`${this.backendUrl}/api/health`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(2000)
+      });
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Use backend proxy to check a node (bypasses CORS)
+   */
+  private async proxyCheckNode(host: string, port: number, type?: 'ollama' | 'comfyui'): Promise<{
+    online: boolean;
+    models?: string[];
+    comfyUIData?: OllamaNode['comfyUIData'];
+    type?: string;
+  }> {
+    try {
+      const response = await fetch(`${this.backendUrl}/api/proxy/check-node`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host, port, type }),
+        signal: AbortSignal.timeout(10000)
+      });
+
+      if (response.ok) {
+        return await response.json();
+      }
+    } catch (error) {
+      console.warn(`Proxy check failed for ${host}:${port}:`, error);
+    }
+    return { online: false };
+  }
+
+  /**
+   * Use backend proxy to scan a host for both services
+   */
+  private async proxyScanHost(host: string, ollamaPort: number = 11434, comfyuiPorts: number[] = [8188]): Promise<{
+    host: string;
+    ollama: { online: boolean; port: number; models: string[] };
+    comfyui: { online: boolean; port: number | null; models: string[]; comfyUIData: OllamaNode['comfyUIData'] | null };
+  } | null> {
+    try {
+      const response = await fetch(`${this.backendUrl}/api/proxy/scan-host`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ host, ollamaPort, comfyuiPorts }),
+        signal: AbortSignal.timeout(15000)
+      });
+
+      if (response.ok) {
+        return await response.json();
+      }
+    } catch (error) {
+      console.warn(`Proxy scan failed for ${host}:`, error);
+    }
+    return null;
+  }
+
+  /**
+   * Use backend proxy for full network scan (much faster, no CORS)
+   */
+  private async proxyNetworkScan(hosts: string[], ranges: string[], ollamaPort: number = 11434, comfyuiPorts: number[] = [8188]): Promise<{
+    nodes: Array<{
+      host: string;
+      ollama: { online: boolean; port: number; models: string[] };
+      comfyui: { online: boolean; port: number | null; models: string[]; comfyUIData: OllamaNode['comfyUIData'] | null };
+    }>;
+    scanned: number;
+  }> {
+    try {
+      const response = await fetch(`${this.backendUrl}/api/proxy/scan-network`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hosts, ranges, ollamaPort, comfyuiPorts, concurrency: 30 }),
+        signal: AbortSignal.timeout(120000) // 2 minute timeout for network scan
+      });
+
+      if (response.ok) {
+        return await response.json();
+      }
+    } catch (error) {
+      console.warn('Proxy network scan failed:', error);
+    }
+    return { nodes: [], scanned: 0 };
+  }
+
+  /**
+   * Convert proxy scan result to OllamaNode
+   */
+  private proxyResultToNode(result: {
+    host: string;
+    ollama: { online: boolean; port: number; models: string[] };
+    comfyui: { online: boolean; port: number | null; models: string[]; comfyUIData: OllamaNode['comfyUIData'] | null };
+  }): OllamaNode {
+    const hasOllama = result.ollama.online;
+    const hasComfyUI = result.comfyui.online;
+    const isUnified = hasOllama && hasComfyUI;
+
+    const nodeId = isUnified
+      ? `unified_${result.host}`
+      : hasOllama
+        ? `${result.host}:${result.ollama.port}`
+        : `comfyui_${result.host}:${result.comfyui.port}`;
+
+    return {
+      id: nodeId,
+      name: this.generateUnifiedNodeName(result.host, hasOllama, hasComfyUI),
+      host: result.host,
+      port: hasOllama ? result.ollama.port : (result.comfyui.port || 8188),
+      status: 'online',
+      models: [
+        ...result.ollama.models,
+        ...result.comfyui.models.filter(m => m.startsWith('['))
+      ],
+      lastChecked: new Date(),
+      type: isUnified ? 'unified' : (hasOllama ? 'ollama' : 'comfyui'),
+      category: 'local',
+      capabilities: {
+        ollama: hasOllama,
+        comfyui: hasComfyUI
+      },
+      ollamaPort: hasOllama ? result.ollama.port : undefined,
+      comfyUIPort: hasComfyUI ? (result.comfyui.port || undefined) : undefined,
+      ollamaStatus: hasOllama ? 'online' : 'offline',
+      comfyuiStatus: hasComfyUI ? 'online' : 'offline',
+      comfyUIData: result.comfyui.comfyUIData || undefined
+    };
+  }
+
+  private loadKnownHostsFromStorage(): void {
+    try {
+      const stored = localStorage.getItem('story-generator-known-hosts');
+      if (stored) {
+        const hosts = JSON.parse(stored);
+        this.knownHosts = new Set(hosts);
+        console.log(`📋 Loaded ${this.knownHosts.size} known hosts from storage`);
+      }
+    } catch (error) {
+      console.warn('Failed to load known hosts from localStorage:', error);
+    }
+  }
+
+  private saveKnownHostsToStorage(): void {
+    try {
+      localStorage.setItem('story-generator-known-hosts', JSON.stringify(Array.from(this.knownHosts)));
+    } catch (error) {
+      console.warn('Failed to save known hosts to localStorage:', error);
+    }
+  }
+
+  private addKnownHost(host: string): void {
+    if (!this.knownHosts.has(host)) {
+      this.knownHosts.add(host);
+      this.saveKnownHostsToStorage();
+    }
+  }
+
+  /**
+   * Clear all known hosts - useful for forcing a fresh network scan
+   */
+  clearKnownHosts(): void {
+    this.knownHosts.clear();
+    this.localMachineIP = null;
+    localStorage.removeItem('story-generator-known-hosts');
+    console.log('🧹 Cleared all known hosts - next scan will be fresh');
+  }
+
+  /**
+   * Get list of known hosts (for debugging)
+   */
+  getKnownHosts(): string[] {
+    return Array.from(this.knownHosts);
+  }
+
+  /**
+   * Get the detected local machine IP (for debugging)
+   */
+  getLocalMachineIP(): string | null {
+    return this.localMachineIP;
   }
 
   private loadAPIKeysFromStorage(): void {
@@ -78,13 +280,336 @@ class NodeDiscoveryService {
     }
   }
 
+  /**
+   * Fetch registered node agents from the backend
+   * These are nodes running the node-agent script that actively report their status
+   */
+  private async fetchRegisteredAgents(): Promise<Array<{
+    source: 'agent';
+    node_id: string;
+    hostname: string;
+    ip_addresses: string[];
+    agent_port: number;
+    agent_url: string | null;
+    status: 'online' | 'offline';
+    ollama: { available: boolean; models?: string[]; port?: number; current_job?: unknown };
+    comfyui: { available: boolean; port?: number; current_job?: unknown };
+    system: { cpu_percent?: number; memory_percent?: number; gpu_info?: unknown };
+    last_heartbeat: string;
+  }>> {
+    try {
+      const response = await fetch(`${this.backendUrl}/api/nodes`, {
+        method: 'GET',
+        signal: AbortSignal.timeout(5000)
+      });
 
-  async scanLocalNetwork(): Promise<OllamaNode[]> {
-    console.log('🔍 Starting network scan for Ollama and ComfyUI nodes...');
+      if (response.ok) {
+        const data = await response.json();
+        return data.nodes || [];
+      }
+    } catch (error) {
+      console.warn('Failed to fetch registered agents:', error);
+    }
+    return [];
+  }
+
+  /**
+   * Convert a registered agent to an OllamaNode
+   */
+  private agentToNode(agent: {
+    node_id: string;
+    hostname: string;
+    ip_addresses: string[];
+    agent_port: number;
+    agent_url: string | null;
+    status: 'online' | 'offline';
+    ollama: { available: boolean; models?: string[]; port?: number; current_job?: unknown };
+    comfyui: { available: boolean; port?: number; current_job?: unknown };
+    system: { cpu_percent?: number; memory_percent?: number; gpu_info?: unknown };
+  }): OllamaNode {
+    const hasOllama = agent.ollama?.available || false;
+    const hasComfyUI = agent.comfyui?.available || false;
+    const isUnified = hasOllama && hasComfyUI;
+    const primaryIP = agent.ip_addresses[0] || agent.hostname;
+
+    return {
+      id: `agent_${agent.node_id}`,
+      name: `${agent.hostname} (Agent)`,
+      host: primaryIP,
+      port: agent.ollama?.port || 11434,
+      status: agent.status === 'online' ? 'online' : 'offline',
+      models: agent.ollama?.models || [],
+      lastChecked: new Date(),
+      type: isUnified ? 'unified' : (hasOllama ? 'ollama' : 'comfyui'),
+      category: 'local',
+      capabilities: {
+        ollama: hasOllama,
+        comfyui: hasComfyUI
+      },
+      ollamaPort: agent.ollama?.port,
+      comfyUIPort: agent.comfyui?.port,
+      ollamaStatus: hasOllama ? (agent.ollama?.current_job ? 'busy' : 'online') : 'offline',
+      comfyuiStatus: hasComfyUI ? (agent.comfyui?.current_job ? 'busy' : 'online') : 'offline'
+    };
+  }
+
+  /**
+   * Quick scan - only checks localhost and previously known hosts
+   * Uses backend proxy if available (bypasses CORS, much faster)
+   * Also fetches registered node agents for instant discovery
+   */
+  async quickScan(): Promise<OllamaNode[]> {
+    console.log('⚡ Starting quick scan (localhost + known hosts + registered agents)...');
+
+    // ComfyUI default port is 8188
+    const comfyUIPorts = [8188, 8080, 7860];
+
+    // Check if backend proxy is available
+    const backendAvailable = await this.isBackendAvailable();
+
+    if (backendAvailable) {
+      console.log('✅ Backend proxy available - using fast CORS-free scanning');
+
+      // First, fetch any registered node agents (instant, no network scan needed)
+      const registeredAgents = await this.fetchRegisteredAgents();
+      const agentIPs = new Set<string>();
+
+      if (registeredAgents.length > 0) {
+        console.log(`📡 Found ${registeredAgents.length} registered node agent(s)`);
+        for (const agent of registeredAgents) {
+          const node = this.agentToNode(agent);
+          this.nodes.set(node.id, node);
+          // Track agent IPs to avoid duplicate scanning
+          agent.ip_addresses.forEach(ip => agentIPs.add(ip));
+          // Add to known hosts for future scans
+          if (agent.ip_addresses[0]) {
+            this.addKnownHost(agent.ip_addresses[0]);
+          }
+          console.log(`📡 Agent: ${agent.hostname} at ${agent.ip_addresses.join(', ')} - Ollama: ${agent.ollama?.available ? '✅' : '❌'}, ComfyUI: ${agent.comfyui?.available ? '✅' : '❌'}`);
+        }
+      }
+
+      // Collect hosts to scan - exclude local machine's detected network IP to avoid duplicates
+      const hostsToScan = ['localhost'];
+      for (const host of Array.from(this.knownHosts)) {
+        // Skip localhost variants and the detected local machine IP
+        if (host === 'localhost' || host === '127.0.0.1') continue;
+        if (this.localMachineIP && host === this.localMachineIP) {
+          console.log(`⏭️ Skipping ${host} (detected as local machine IP)`);
+          continue;
+        }
+        // Skip hosts that are covered by registered agents
+        if (agentIPs.has(host)) {
+          console.log(`⏭️ Skipping ${host} (already registered via agent)`);
+          continue;
+        }
+        hostsToScan.push(host);
+      }
+
+      console.log(`⚡ Quick scan targets: ${hostsToScan.join(', ')}`);
+
+      // Scan all hosts via backend proxy in parallel
+      const scanPromises = hostsToScan.map(host => this.proxyScanHost(host, 11434, comfyUIPorts));
+      const results = await Promise.all(scanPromises);
+
+      const foundNodes: OllamaNode[] = [];
+      for (const result of results) {
+        if (result && (result.ollama.online || result.comfyui.online)) {
+          const node = this.proxyResultToNode(result);
+          foundNodes.push(node);
+          this.nodes.set(node.id, node);
+          // Only add to known hosts if not localhost
+          if (result.host !== 'localhost') {
+            this.addKnownHost(result.host);
+          }
+          console.log(`✅ Found: ${node.name} at ${result.host}`);
+        }
+      }
+
+      console.log(`⚡ Quick scan complete! Found ${foundNodes.length} scanned nodes + ${registeredAgents.length} agent nodes.`);
+      return Array.from(this.nodes.values());
+    }
+
+    // Fallback to direct browser scanning (may be blocked by CORS)
+    console.log('⚠️ Backend proxy not available - falling back to browser scanning (may fail due to CORS)');
+
     const promises: Promise<OllamaNode | null>[] = [];
 
-    // Common ComfyUI ports (in addition to default 8188)
-    const comfyUIPorts = [8188, 8000, 8080, 7860];
+    // Scan localhost on all common ports (only localhost, not 127.0.0.1)
+    for (const host of this.commonHosts) {
+      for (const port of this.commonPorts) {
+        promises.push(this.checkNode(host, port));
+      }
+      for (const port of comfyUIPorts) {
+        promises.push(this.checkStandaloneComfyUI(host, port));
+      }
+    }
+
+    // Scan all previously known hosts (excluding detected local machine IP)
+    for (const host of Array.from(this.knownHosts)) {
+      if (host === 'localhost' || host === '127.0.0.1') continue;
+      if (this.localMachineIP && host === this.localMachineIP) continue;
+
+      // Check for Ollama
+      promises.push(this.checkNode(host, 11434));
+      // Check for ComfyUI on common ports
+      for (const port of comfyUIPorts) {
+        promises.push(this.checkStandaloneComfyUI(host, port));
+      }
+    }
+
+    // Run all checks in parallel (small number of hosts)
+    const results = await Promise.allSettled(promises);
+    const foundNodes: OllamaNode[] = [];
+
+    results.forEach(result => {
+      if (result.status === 'fulfilled' && result.value) {
+        foundNodes.push(result.value);
+        // Remember this host for future quick scans (not localhost)
+        if (result.value.host !== 'localhost') {
+          this.addKnownHost(result.value.host);
+        }
+      }
+    });
+
+    // Update nodes map
+    foundNodes.forEach(node => {
+      this.nodes.set(node.id, node);
+    });
+
+    console.log(`⚡ Quick scan complete! Found ${foundNodes.length} nodes.`);
+    return Array.from(this.nodes.values());
+  }
+
+  /**
+   * Full network scan - scans all IP ranges
+   * Uses backend proxy if available (much faster, no CORS issues)
+   */
+  async scanLocalNetwork(fullScan: boolean = true): Promise<OllamaNode[]> {
+    // If not a full scan, use quick scan
+    if (!fullScan) {
+      return this.quickScan();
+    }
+
+    console.log('🔍 Starting full network scan for Ollama and ComfyUI nodes...');
+
+    // ComfyUI default port is 8188
+    const comfyUIPorts = [8188, 8080, 7860];
+
+    // Check if backend proxy is available
+    const backendAvailable = await this.isBackendAvailable();
+
+    if (backendAvailable) {
+      console.log('✅ Backend proxy available - using fast server-side network scan');
+
+      // Use backend proxy for network scan (no CORS, parallel, fast)
+      const knownHostsList = Array.from(this.knownHosts).filter(h => h !== 'localhost' && h !== '127.0.0.1');
+      const commonHostnames = ['ollama', 'ai', 'gpu', 'server', 'comfyui', 'render'];
+      const hostnameVariants = commonHostnames.flatMap(h => [h, `${h}.local`]);
+
+      // Expanded IP ranges to scan - cover common network configurations
+      const ipRanges = [
+        '192.168.0.',   // Common router default
+        '192.168.1.',   // Common router default
+        '192.168.2.',   // Some routers use this
+        '192.168.10.',  // Common corporate/custom
+        '192.168.100.', // Some mesh networks
+        '10.0.0.',      // Private network Class A
+        '10.0.1.',      // Private network Class A
+      ];
+
+      console.log(`🔍 Scanning IP ranges: ${ipRanges.join(', ')}`);
+      console.log(`🔍 Known hosts to prioritize: ${knownHostsList.length > 0 ? knownHostsList.join(', ') : '(none)'}`);
+
+      const result = await this.proxyNetworkScan(
+        ['localhost', ...knownHostsList, ...hostnameVariants],
+        ipRanges,
+        11434, // Ollama port
+        comfyUIPorts
+      );
+
+      console.log(`🔍 Backend scan complete: scanned ${result.scanned} hosts, found ${result.nodes.length} nodes`);
+
+      // First pass: identify localhost's network IP to avoid duplicates
+      // localhost will have a 192.168.x.x or 10.x.x.x IP on the network
+      let localNetworkIP: string | null = null;
+      const localhostResult = result.nodes.find(n => n.host === 'localhost');
+
+      if (localhostResult && localhostResult.ollama.online) {
+        const localhostModels = localhostResult.ollama.models.sort().join(',');
+
+        // Find network IPs with identical models to localhost
+        for (const nodeResult of result.nodes) {
+          if (nodeResult.host !== 'localhost' &&
+              nodeResult.host !== '127.0.0.1' &&
+              nodeResult.ollama.online) {
+            const nodeModels = nodeResult.ollama.models.sort().join(',');
+            if (nodeModels === localhostModels && localhostModels.length > 0) {
+              // This is likely the local machine's network IP
+              localNetworkIP = nodeResult.host;
+              this.localMachineIP = localNetworkIP;
+              console.log(`🏠 Detected local machine network IP: ${localNetworkIP} (same models as localhost)`);
+              break;
+            }
+          }
+        }
+      }
+
+      // Convert results to OllamaNodes and deduplicate
+      const foundNodes: OllamaNode[] = [];
+      const seenHosts = new Set<string>();
+
+      for (const nodeResult of result.nodes) {
+        // Skip 127.0.0.1 (use localhost instead)
+        if (nodeResult.host === '127.0.0.1') {
+          console.log(`⏭️ Skipping 127.0.0.1 (using localhost instead)`);
+          continue;
+        }
+
+        // Skip local machine's network IP (it's the same as localhost)
+        if (localNetworkIP && nodeResult.host === localNetworkIP) {
+          console.log(`⏭️ Skipping ${localNetworkIP} (it's the local machine, already have localhost)`);
+          continue;
+        }
+
+        // Skip if we've already seen this host
+        if (seenHosts.has(nodeResult.host)) {
+          console.log(`⏭️ Skipping duplicate: ${nodeResult.host}`);
+          continue;
+        }
+        seenHosts.add(nodeResult.host);
+
+        const node = this.proxyResultToNode(nodeResult);
+        foundNodes.push(node);
+        this.nodes.set(node.id, node);
+
+        // Only add to known hosts if it's not localhost
+        if (nodeResult.host !== 'localhost') {
+          this.addKnownHost(nodeResult.host);
+        }
+
+        console.log(`✅ Found node: ${node.name} at ${nodeResult.host} (Ollama: ${nodeResult.ollama.online}, ComfyUI: ${nodeResult.comfyui.online})`);
+      }
+
+      // Update offline status for nodes not found
+      const foundHostIds = new Set(foundNodes.map(n => n.id));
+      Array.from(this.nodes.entries()).forEach(([nodeId, node]) => {
+        if (node.category === 'local' && !foundHostIds.has(nodeId)) {
+          this.nodes.set(nodeId, { ...node, status: 'offline', lastChecked: new Date() });
+        }
+      });
+
+      console.log(`✅ Network scan complete! Found ${foundNodes.length} unique nodes.`);
+      foundNodes.forEach(n => {
+        console.log(`  🖥️ ${n.name} (${n.host}) - ${n.type} - ${n.models.length} models`);
+      });
+      return Array.from(this.nodes.values());
+    }
+
+    // Fallback to browser-based scanning (slower, may be blocked by CORS)
+    console.log('⚠️ Backend proxy not available - falling back to browser scanning (slower, may fail due to CORS)');
+
+    const promises: Promise<OllamaNode | null>[] = [];
 
     // Scan common local addresses for Ollama AND ComfyUI (localhost only gets full port scan)
     for (const host of this.commonHosts) {
@@ -94,6 +619,16 @@ class NodeDiscoveryService {
       // Scan for standalone ComfyUI on common ports - ONLY for localhost
       for (const port of comfyUIPorts) {
         promises.push(this.checkStandaloneComfyUI(host, port));
+      }
+    }
+
+    // First scan all known hosts (they're more likely to respond)
+    for (const host of Array.from(this.knownHosts)) {
+      if (host !== 'localhost' && host !== '127.0.0.1') {
+        promises.push(this.checkNode(host, 11434));
+        for (const port of comfyUIPorts) {
+          promises.push(this.checkStandaloneComfyUI(host, port));
+        }
       }
     }
 
@@ -108,21 +643,18 @@ class NodeDiscoveryService {
     }
 
     // Try common IP ranges (works if no CORS restrictions)
-    // Scan the FULL range 1-254 for each common network prefix
-    // NOTE: Only scan Ollama port (11434) for network ranges to avoid overwhelming the network
-    // ComfyUI on specific IPs can be added manually or via "Add Unified Node"
+    // Expanded to cover more common network configurations
     const networkRanges = [
-      '192.168.0.',
-      '192.168.1.',
-      '192.168.2.',
-      '10.0.0.',
-      '10.0.1.',
-      '10.1.0.',
-      '172.16.0.',
+      '192.168.0.',   // Common router default
+      '192.168.1.',   // Common router default
+      '192.168.2.',   // Some routers
+      '192.168.10.',  // Corporate/custom
+      '10.0.0.',      // Private Class A
+      '10.0.1.',      // Private Class A
     ];
 
     for (const range of networkRanges) {
-      // Scan FULL IP range 1-254 for Ollama (port 11434 only)
+      // Scan IP range 1-254 for Ollama (port 11434 only)
       // checkNode will also check for ComfyUI on port 8188 when Ollama is found
       for (let i = 1; i <= 254; i++) {
         promises.push(this.checkNode(`${range}${i}`, 11434));
@@ -132,34 +664,34 @@ class NodeDiscoveryService {
     // Process in larger batches for faster scanning
     const batchSize = 50;
     const foundNodes: OllamaNode[] = [];
-    
+
     for (let i = 0; i < promises.length; i += batchSize) {
       const batch = promises.slice(i, i + batchSize);
       const batchResults = await Promise.allSettled(batch);
-      
+
       batchResults.forEach(result => {
         if (result.status === 'fulfilled' && result.value) {
           foundNodes.push(result.value);
         }
       });
-      
+
       // Smaller delay for faster scanning
       if (i + batchSize < promises.length) {
         await new Promise(resolve => setTimeout(resolve, 50));
       }
-      
+
       // Show progress
       const progress = Math.round(((i + batchSize) / promises.length) * 100);
       console.log(`🔍 Scanning progress: ${Math.min(progress, 100)}% (${foundNodes.length} found so far)`);
     }
-    
+
     // Enhanced deduplication - merge localhost variants and local network IP
     const deduplicatedNodes = new Map<string, OllamaNode>();
-    
+
     // First, identify local network IP by finding nodes with same models as localhost
     let localhostNode: OllamaNode | null = null;
     let localNetworkIP: string | null = null;
-    
+
     // Find localhost node first
     for (const node of foundNodes) {
       if (node.host === 'localhost' || node.host === '127.0.0.1') {
@@ -167,20 +699,20 @@ class NodeDiscoveryService {
         break;
       }
     }
-    
+
     // Only merge if we can detect the actual local machine's network IP
     // We'll be conservative - only merge if we find exactly one 192.168.x.x IP with identical models
     if (localhostNode) {
       const localhostModels = localhostNode.models.sort().join(',');
       const potentialLocalIPs: string[] = [];
-      
+
       // Find all 192.168.x.x IPs with identical models to localhost
       for (const node of foundNodes) {
         if (node.host.startsWith('192.168.') && node.models.sort().join(',') === localhostModels) {
           potentialLocalIPs.push(node.host);
         }
       }
-      
+
       // Only merge if there's exactly one potential match (to avoid false positives)
       if (potentialLocalIPs.length === 1) {
         localNetworkIP = potentialLocalIPs[0];
@@ -193,7 +725,12 @@ class NodeDiscoveryService {
     foundNodes.forEach(node => {
       let key = node.id;
       let finalNode = node;
-      
+
+      // Remember this host for future quick scans
+      if (node.host !== 'localhost' && node.host !== '127.0.0.1') {
+        this.addKnownHost(node.host);
+      }
+
       // Normalize localhost/127.0.0.1 to single localhost entry
       if (node.host === '127.0.0.1') {
         key = `localhost:${node.port}`;
@@ -507,7 +1044,11 @@ class NodeDiscoveryService {
     return port === 11434 ? `Ollama (${host})` : `Ollama (${host}:${port})`;
   }
 
-  addCustomNode(host: string, port: number = 11434): void {
+  /**
+   * Add a custom Ollama node
+   * Uses backend proxy if available to bypass CORS
+   */
+  async addCustomNode(host: string, port: number = 11434): Promise<void> {
     const id = `${host}:${port}`;
     const node: OllamaNode = {
       id,
@@ -523,24 +1064,51 @@ class NodeDiscoveryService {
 
     this.nodes.set(id, node);
 
-    // Check the node in the background
-    this.checkNode(host, port).then(checkedNode => {
+    // Remember this host for future quick scans
+    if (host !== 'localhost' && host !== '127.0.0.1') {
+      this.addKnownHost(host);
+    }
+
+    // Check the node - prefer backend proxy
+    const backendAvailable = await this.isBackendAvailable();
+
+    if (backendAvailable) {
+      console.log(`🔍 Using backend proxy to check ${host}:${port}...`);
+      const result = await this.proxyScanHost(host, port, [8188]);
+
+      if (result && result.ollama.online) {
+        const checkedNode = this.proxyResultToNode(result);
+        checkedNode.id = id; // Keep original ID
+        this.nodes.set(id, checkedNode);
+        console.log(`✅ Found Ollama at ${host}:${port} via proxy`);
+      } else {
+        this.nodes.set(id, { ...node, status: 'offline' });
+        console.log(`❌ No Ollama found at ${host}:${port}`);
+      }
+    } else {
+      // Fallback to direct browser check
+      const checkedNode = await this.checkNode(host, port);
       if (checkedNode) {
         this.nodes.set(id, checkedNode);
       } else {
         this.nodes.set(id, { ...node, status: 'offline' });
       }
-    });
+    }
   }
 
   /**
    * Add a ComfyUI instance
-   * ComfyUI has a different API structure than Ollama
+   * Uses backend proxy if available to bypass CORS
    */
-  async addComfyUINode(host: string, port: number = 8188): Promise<OllamaNode | null> {
+  async addComfyUINode(host: string, port: number = 8000): Promise<OllamaNode | null> {
     const id = `comfyui_${host}:${port}`;
 
     console.log(`🎨 Adding ComfyUI node at ${host}:${port}...`);
+
+    // Remember this host for future quick scans
+    if (host !== 'localhost' && host !== '127.0.0.1') {
+      this.addKnownHost(host);
+    }
 
     const node: OllamaNode = {
       id,
@@ -556,7 +1124,35 @@ class NodeDiscoveryService {
 
     this.nodes.set(id, node);
 
-    // Check the node
+    // Check if backend proxy is available (preferred - no CORS issues)
+    const backendAvailable = await this.isBackendAvailable();
+
+    if (backendAvailable) {
+      console.log(`🔍 Using backend proxy to check ComfyUI at ${host}:${port}...`);
+      const result = await this.proxyCheckNode(host, port, 'comfyui');
+
+      if (result.online) {
+        const checkedNode: OllamaNode = {
+          ...node,
+          status: 'online',
+          models: result.models || [],
+          comfyUIData: result.comfyUIData,
+          capabilities: { ollama: false, comfyui: true },
+          comfyUIPort: port,
+          comfyuiStatus: 'online',
+        };
+        this.nodes.set(id, checkedNode);
+        console.log(`✅ Found ComfyUI at ${host}:${port} via proxy`);
+        return checkedNode;
+      } else {
+        const offlineNode = { ...node, status: 'offline' as const };
+        this.nodes.set(id, offlineNode);
+        console.log(`❌ No ComfyUI found at ${host}:${port}`);
+        return offlineNode;
+      }
+    }
+
+    // Fallback to direct browser check (may fail due to CORS)
     const checkedNode = await this.checkComfyUINode(host, port);
     if (checkedNode) {
       this.nodes.set(id, checkedNode);

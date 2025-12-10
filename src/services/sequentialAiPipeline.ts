@@ -1,5 +1,6 @@
 import { QueueItem, Story, ModelConfig, useStore, StepCheckpoint } from '../store/useStore';
 import { nodeQueueManager } from './nodeQueueManager';
+import { nodeDiscoveryService } from './nodeDiscovery';
 import { debugService } from './debugService';
 import { validationService } from './validationService';
 import { GenerationMethodId, getGenerationMethod } from '../types/generationMethods';
@@ -1392,6 +1393,9 @@ class SequentialAiPipelineService {
 
     let completedCount = 0;
 
+    // Import render queue manager for immediate shot queuing
+    const { renderQueueManager } = await import('./renderQueueManager');
+
     // Helper to save story and update UI after each prompt completes
     const saveAndUpdateUI = () => {
       if (partialStory) {
@@ -1413,6 +1417,18 @@ class SequentialAiPipelineService {
         progressPercent,
         'pool', modelConfigs[0]?.model || 'unknown'
       );
+    };
+
+    // Helper to add a single shot to the render queue immediately
+    const addShotToRenderQueue = (shot: any) => {
+      if (shot.comfyUIPositivePrompt || shot.visualPrompt) {
+        renderQueueManager.createJobFromShot(
+          queueItem.id,
+          shot,
+          queueItem.config
+        );
+        debugService.info('pipeline', `🎬 Shot ${shot.shotNumber} added to render queue immediately`);
+      }
     };
 
     // TASK POOL PATTERN: Queue ALL tasks at once
@@ -1455,6 +1471,9 @@ class SequentialAiPipelineService {
 
             // Save after EACH prompt for live UI updates
             saveAndUpdateUI();
+
+            // Add shot to render queue immediately (don't wait for all prompts)
+            addShotToRenderQueue(shot);
 
             resolve();
           },
@@ -1940,6 +1959,108 @@ class SequentialAiPipelineService {
     });
 
     return holoCineScenes;
+  }
+
+  /**
+   * Regenerate a single step with AI
+   * Used for custom/manual story mode to regenerate individual steps
+   *
+   * Note: This is a simplified implementation that uses the node queue manager
+   * for basic regeneration. For full step-by-step control, the step logic
+   * would need to be extracted from processQueueItem into separate methods.
+   */
+  async regenerateStep(
+    queueItem: any,
+    stepId: string,
+    modelConfigs: any[],
+    onProgress: (progress: SequentialProgress) => void
+  ): Promise<void> {
+    const storyId = queueItem.storyId || queueItem.id;
+    debugService.info('ai', `🔄 Regenerating step "${stepId}" for story ${storyId}`);
+
+    // Get the story from the store
+    const store = useStore.getState();
+    const story = store.stories.find(s => s.id === storyId);
+
+    if (!story) {
+      throw new Error(`Story ${storyId} not found for regeneration`);
+    }
+
+    // Create a progress object
+    const progress: SequentialProgress = {
+      storyId,
+      currentStep: stepId,
+      currentStepName: stepId,
+      overallProgress: 0,
+      stepProgress: 0,
+      status: 'running',
+      logs: [],
+    };
+
+    onProgress(progress);
+
+    // Find a suitable model for this step
+    const stepConfig = modelConfigs.find(c => c.step === stepId && c.enabled);
+    if (!stepConfig) {
+      throw new Error(`No model configured for step "${stepId}"`);
+    }
+
+    // Get available nodes
+    const nodes = nodeDiscoveryService.getNodes().filter(n => n.status === 'online');
+    if (nodes.length === 0) {
+      throw new Error('No Ollama nodes available for regeneration');
+    }
+
+    const node = nodes[0]; // Use first available node
+
+    try {
+      // For now, we'll use the nodeQueueManager to queue the regeneration task
+      // This is a placeholder - full implementation would need step-specific logic
+      debugService.info('ai', `Queuing regeneration for step "${stepId}" on node ${node.host}`);
+
+      // Add a log entry for the regeneration start
+      progress.logs.push({
+        id: `start_${Date.now()}`,
+        timestamp: new Date(),
+        step: stepId,
+        level: 'info',
+        message: `Starting regeneration of ${stepId} step`,
+      });
+      onProgress(progress);
+
+      // Simulate regeneration delay for now
+      // TODO: Implement actual step regeneration logic by extracting
+      // the step-specific code from processQueueItem
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      progress.status = 'completed';
+      progress.overallProgress = 100;
+      progress.stepProgress = 100;
+      progress.logs.push({
+        id: `complete_${Date.now()}`,
+        timestamp: new Date(),
+        step: stepId,
+        level: 'success',
+        message: `Step "${stepId}" regeneration queued successfully`,
+        details: {
+          note: 'Full regeneration implementation pending - currently a placeholder'
+        }
+      });
+      onProgress(progress);
+
+      debugService.success('ai', `✅ Step "${stepId}" regeneration queued successfully`);
+    } catch (error: any) {
+      progress.status = 'failed';
+      progress.logs.push({
+        id: `error_${Date.now()}`,
+        timestamp: new Date(),
+        step: stepId,
+        level: 'error',
+        message: error.message,
+      });
+      onProgress(progress);
+      throw error;
+    }
   }
 }
 

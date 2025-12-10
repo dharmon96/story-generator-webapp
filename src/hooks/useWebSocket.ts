@@ -35,7 +35,7 @@ interface UseWebSocketReturn {
 }
 
 const useWebSocket = ({
-  url = `ws://localhost:8000/api/ws/connect`,
+  url = `ws://localhost:8001/api/ws/connect`,
   clientId,
   onMessage,
   onProgress,

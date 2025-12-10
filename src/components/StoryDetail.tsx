@@ -29,6 +29,7 @@ import {
   HourglassEmpty as PendingIcon,
   ExpandMore as ExpandMoreIcon,
   ExpandLess as ExpandLessIcon,
+  Build as BuildIcon,
 } from '@mui/icons-material';
 
 // Import the tab components
@@ -38,6 +39,7 @@ import AIChatTab from './story-tabs/AIChatTab';
 import GenerationSettingsTab from './story-tabs/GenerationSettingsTab';
 import StyleSheetTab from './story-tabs/StyleSheetTab';
 import ScenesTab from './story-tabs/ScenesTab';
+import PipelineStepsTab from './story-tabs/PipelineStepsTab';
 
 import { useStore, StepCheckpoint } from '../store/useStore';
 import { EnhancedStory, AILogEntry } from '../types/storyTypes';
@@ -415,8 +417,41 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
   const isSceneBased = generationMethod?.pipelineType === 'scene-based';
   const isShotBased = generationMethod?.pipelineType === 'shot-based';
 
-  // Determine which tabs to show based on generation method
+  // Determine if story is in manual mode
+  const isManualMode = queueItem?.manualMode || queueItem?.isCustom || false;
+
+  // Determine which tabs to show based on generation method and manual mode
   const tabs = useMemo(() => {
+    // Manual mode: Story, Style, Shots/Scenes, Logs (Pipeline), Settings
+    if (isManualMode) {
+      const manualTabs = [
+        { id: 'story', icon: <StoryIcon />, label: 'Story', alwaysShow: true },
+        { id: 'stylesheet', icon: <StyleIcon />, label: 'Style', alwaysShow: true },
+      ];
+
+      // Add shots/scenes based on generation method
+      if (isShotBased) {
+        manualTabs.push({ id: 'shotlist', icon: <ShotlistIcon />, label: 'Shots', alwaysShow: true });
+        if (story?.holoCineScenes && story.holoCineScenes.length > 0) {
+          manualTabs.push({ id: 'scenes', icon: <ScenesIcon />, label: 'Scenes', alwaysShow: false });
+        }
+      } else {
+        manualTabs.push({ id: 'scenes', icon: <ScenesIcon />, label: 'Scenes', alwaysShow: true });
+        if (story?.shots && story.shots.length > 0) {
+          manualTabs.push({ id: 'shotlist', icon: <ShotlistIcon />, label: 'Shots', alwaysShow: false });
+        }
+      }
+
+      // Logs and Settings at the end
+      manualTabs.push(
+        { id: 'pipeline', icon: <BuildIcon />, label: 'Logs', alwaysShow: true },
+        { id: 'settings', icon: <SettingsIcon />, label: 'Settings', alwaysShow: true }
+      );
+
+      return manualTabs;
+    }
+
+    // Auto mode: Original tab order
     const baseTabs = [
       { id: 'story', icon: <StoryIcon />, label: 'Story', alwaysShow: true },
     ];
@@ -440,12 +475,13 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
     // Always show these tabs
     baseTabs.push(
       { id: 'stylesheet', icon: <StyleIcon />, label: 'Style Sheet', alwaysShow: true },
+      { id: 'pipeline', icon: <BuildIcon />, label: 'Pipeline', alwaysShow: true },
       { id: 'aichat', icon: <ChatIcon />, label: 'AI Chat', alwaysShow: true },
       { id: 'settings', icon: <SettingsIcon />, label: 'Settings', alwaysShow: true }
     );
 
     return baseTabs;
-  }, [isShotBased, story?.holoCineScenes, story?.shots]);
+  }, [isManualMode, isShotBased, story?.holoCineScenes, story?.shots]);
 
   // Map tab index to tab id for content rendering
   const getTabIdForIndex = (index: number) => tabs[index]?.id || 'story';
@@ -722,6 +758,7 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
           <StoryTab
             storyData={storyData}
             isGenerating={isGenerating}
+            isManualMode={isManualMode}
             onUpdateStory={(updates) => {
               // Update story in store and local state
               const storeUpdates: any = {};
@@ -742,6 +779,8 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
         {getTabIdForIndex(currentTab) === 'shotlist' && (
           <ShotlistTab
             storyData={storyData}
+            storyId={storyId}
+            isManualMode={isManualMode}
             onUpdateShot={(shotId, updates) => {
               // Update shot in local state and store
               if (storyData && Array.isArray(storyData.shots)) {
@@ -750,6 +789,51 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
                 );
                 const updatedStory = { ...storyData, shots: updatedShots };
                 setStoryData(updatedStory);
+
+                // Convert to store format
+                const basicShots = updatedShots.map(shot => ({
+                  id: shot.id,
+                  storyId: storyId,
+                  shotNumber: shot.shotNumber,
+                  description: shot.description,
+                  duration: shot.duration,
+                  frames: Math.floor(shot.duration * 24),
+                  camera: 'medium shot',
+                  visualPrompt: shot.visualPrompt || '',
+                  comfyUIPositivePrompt: shot.comfyUIPositivePrompt || '',
+                  comfyUINegativePrompt: shot.comfyUINegativePrompt || '',
+                  narration: shot.narration || '',
+                  musicCue: shot.musicCue || undefined,
+                  renderStatus: (shot.renderStatus as 'pending' | 'rendering' | 'completed') || 'pending'
+                }));
+                updateStory(storyId, { shots: basicShots });
+              }
+            }}
+            onAddShot={(shotData) => {
+              // Add new shot in manual mode
+              if (storyData) {
+                const newShot = {
+                  id: `shot_${Date.now()}`,
+                  shotNumber: shotData.shotNumber || (storyData.shots?.length || 0) + 1,
+                  title: `Shot ${shotData.shotNumber || (storyData.shots?.length || 0) + 1}`,
+                  description: shotData.description || '',
+                  duration: shotData.duration || 3,
+                  cameraMovement: shotData.cameraMovement || 'static',
+                  shotType: shotData.shotType || 'medium',
+                  angle: shotData.angle || 'eye-level',
+                  characters: shotData.characters || [],
+                  locations: shotData.locations || [],
+                  actions: [],
+                  dialogue: [],
+                  narration: shotData.narration || '',
+                  visualPrompt: shotData.visualPrompt || '',
+                  comfyUIPositivePrompt: shotData.comfyUIPositivePrompt || '',
+                  comfyUINegativePrompt: shotData.comfyUINegativePrompt || '',
+                  renderStatus: 'pending' as const,
+                  createdAt: new Date(),
+                } as any;
+                const updatedShots = [...(storyData.shots || []), newShot];
+                setStoryData({ ...storyData, shots: updatedShots } as any);
 
                 // Convert to store format
                 const basicShots = updatedShots.map(shot => ({
@@ -788,6 +872,8 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
             characters={storyData?.characters || []}
             locations={storyData?.locations || []}
             storyId={storyId}
+            isManualMode={isManualMode}
+            storyContent={storyData?.content}
             onUpdateCharacter={(charId, updates) => {
               // Update character in local state
               if (storyData && Array.isArray(storyData.characters)) {
@@ -814,6 +900,67 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
                   loc.id === locId ? { ...loc, ...updates } : loc
                 );
                 setStoryData({ ...storyData, locations: updatedLocations });
+              }
+            }}
+            onAddCharacter={(character) => {
+              // Add new character
+              if (storyData) {
+                const newChar = {
+                  ...character,
+                  id: `char_${Date.now()}`,
+                  name: character.name || 'Unnamed Character',
+                  role: character.role || 'supporting',
+                  createdAt: new Date(),
+                } as any;
+                const updatedCharacters = [...(storyData.characters || []), newChar];
+                setStoryData({ ...storyData, characters: updatedCharacters } as any);
+
+                // Update store
+                const basicCharacters = updatedCharacters.map(char => ({
+                  name: char.name || 'Unknown',
+                  role: char.role === 'protagonist' ? 'main' : 'supporting',
+                  physical_description: char.physicalDescription || '',
+                  age_range: char.age || 'adult',
+                  importance_level: char.importanceLevel || 3
+                }));
+                updateStory(storyId, { characters: basicCharacters });
+              }
+            }}
+            onAddLocation={(location) => {
+              // Add new location
+              if (storyData) {
+                const newLoc = {
+                  ...location,
+                  id: `loc_${Date.now()}`,
+                  name: location.name || 'Unnamed Location',
+                  type: location.type || 'interior',
+                  createdAt: new Date(),
+                } as any;
+                const updatedLocations = [...(storyData.locations || []), newLoc];
+                setStoryData({ ...storyData, locations: updatedLocations } as any);
+
+                // Update store
+                updateStory(storyId, { locations: updatedLocations });
+              }
+            }}
+          />
+        )}
+
+        {/* Pipeline Steps Tab */}
+        {getTabIdForIndex(currentTab) === 'pipeline' && (
+          <PipelineStepsTab
+            storyId={storyId}
+            queueItem={queueItem || null}
+            isCustomStory={queueItem?.isCustom || false}
+            isManualMode={queueItem?.manualMode || false}
+            onConvertToManual={() => {
+              // Convert this story to manual mode
+              if (queueItem) {
+                updateQueueItem(queueItem.id, {
+                  manualMode: true,
+                  // Preserve any completed steps
+                  completedSteps: queueItem.completedSteps || [],
+                });
               }
             }}
           />

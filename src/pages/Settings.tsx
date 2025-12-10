@@ -176,12 +176,12 @@ const Settings: React.FC = () => {
   const loadNodes = async () => {
     const existingNodes = nodeDiscoveryService.getNodes();
     setNodes(existingNodes);
-    
-    // Auto-scan if no nodes found
+
+    // Auto-scan if no nodes found - use quick scan for faster startup
     if (existingNodes.length === 0) {
-      handleScanNetwork();
+      handleScanNetwork(false); // Quick scan on initial load
     }
-    
+
     // Initialize API nodes if they have keys
     if (apiKeys.openai && !existingNodes.find(n => n.id === 'api_openai')) {
       nodeDiscoveryService.addAPINode('openai', apiKeys.openai);
@@ -191,11 +191,11 @@ const Settings: React.FC = () => {
     }
   };
 
-  const handleScanNetwork = async () => {
+  const handleScanNetwork = async (fullScan: boolean = true) => {
     setScanning(true);
     try {
-      console.log('🔍 Starting comprehensive network scan for Ollama nodes...');
-      const foundNodes = await nodeDiscoveryService.scanLocalNetwork();
+      console.log(fullScan ? '🔍 Starting full network scan...' : '⚡ Starting quick scan...');
+      const foundNodes = await nodeDiscoveryService.scanLocalNetwork(fullScan);
       
       // Re-add API nodes if they have keys but aren't present
       if (apiKeys.openai && !foundNodes.find(n => n.id === 'api_openai')) {
@@ -592,9 +592,23 @@ const Settings: React.FC = () => {
                   </Box>
                 </Box>
                 <Box sx={{ display: 'flex', gap: 1 }}>
-                  <Tooltip title="Scan Network">
+                  <Tooltip title="Quick Scan (localhost + known hosts)">
                     <IconButton
-                      onClick={handleScanNetwork}
+                      onClick={() => handleScanNetwork(false)}
+                      disabled={scanning}
+                      sx={{
+                        backgroundColor: 'rgba(76, 175, 80, 0.3)',
+                        color: 'white',
+                        '&:hover': { backgroundColor: 'rgba(76, 175, 80, 0.5)' },
+                        '&:disabled': { backgroundColor: 'rgba(255,255,255,0.1)', color: 'rgba(255,255,255,0.5)' }
+                      }}
+                    >
+                      {scanning ? <CircularProgress size={20} color="inherit" /> : <Speed />}
+                    </IconButton>
+                  </Tooltip>
+                  <Tooltip title="Full Network Scan (slower, scans IP ranges)">
+                    <IconButton
+                      onClick={() => handleScanNetwork(true)}
                       disabled={scanning}
                       sx={{
                         backgroundColor: 'rgba(255,255,255,0.2)',
@@ -1571,12 +1585,12 @@ const Settings: React.FC = () => {
                   <Typography variant="body2" sx={{ color: 'rgba(255,255,255,0.8)', mb: 2 }}>
                     Scan your network, add a custom node, or configure API keys to get started
                   </Typography>
-                  <Button 
-                    variant="outlined" 
-                    startIcon={<Search />} 
-                    onClick={handleScanNetwork}
-                    sx={{ 
-                      borderColor: 'rgba(255,255,255,0.5)', 
+                  <Button
+                    variant="outlined"
+                    startIcon={<Search />}
+                    onClick={() => handleScanNetwork(true)}
+                    sx={{
+                      borderColor: 'rgba(255,255,255,0.5)',
                       color: 'white',
                       '&:hover': { borderColor: 'white', backgroundColor: 'rgba(255,255,255,0.1)' }
                     }}

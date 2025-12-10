@@ -5,7 +5,7 @@ const path = require('path');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-const PORT = process.env.PORT || 8000;
+const PORT = process.env.PORT || 8001; // Changed from 8000 to avoid conflict with ComfyUI default port
 
 // Middleware
 app.use(cors());
@@ -457,6 +457,557 @@ app.get('/api/generations/:storyId', async (req, res) => {
 app.use((err, req, res, next) => {
   console.error('❌ Server error:', err);
   res.status(500).json({ error: 'Internal server error' });
+});
+
+// ============== NODE DISCOVERY PROXY ENDPOINTS ==============
+// These endpoints allow the frontend to discover Ollama/ComfyUI nodes
+// without CORS restrictions (server-side requests have no CORS)
+
+const http = require('http');
+
+/**
+ * Helper to make HTTP request with timeout (no CORS issues server-side)
+ */
+function proxyFetch(url, timeout = 3000) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || 80,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'GET',
+      timeout: timeout,
+      headers: {
+        'Accept': 'application/json',
+      }
+    };
+
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try {
+            resolve({ ok: true, status: res.statusCode, data: JSON.parse(data) });
+          } catch {
+            resolve({ ok: true, status: res.statusCode, data: data });
+          }
+        } else {
+          resolve({ ok: false, status: res.statusCode, error: `HTTP ${res.statusCode}` });
+        }
+      });
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ ok: false, error: 'timeout' });
+    });
+
+    req.on('error', (err) => {
+      resolve({ ok: false, error: err.message });
+    });
+
+    req.end();
+  });
+}
+
+/**
+ * Check if Ollama is running on a host:port
+ */
+async function checkOllama(host, port) {
+  try {
+    const result = await proxyFetch(`http://${host}:${port}/api/tags`, 2000);
+    if (result.ok && result.data?.models) {
+      return {
+        online: true,
+        models: result.data.models.map(m => m.name),
+        type: 'ollama'
+      };
+    }
+  } catch (e) {
+    // Silent fail
+  }
+  return { online: false };
+}
+
+/**
+ * Check if ComfyUI is running on a host:port
+ * Tries multiple endpoints since ComfyUI API varies by version
+ */
+async function checkComfyUI(host, port) {
+  const endpoints = [
+    '/system_stats',
+    '/api/system_stats',
+    '/object_info',
+    '/api/object_info',
+    '/queue',
+    '/api/queue'
+  ];
+
+  for (const endpoint of endpoints) {
+    try {
+      const result = await proxyFetch(`http://${host}:${port}${endpoint}`, 3000);
+      if (result.ok) {
+        // Found ComfyUI - try to get models from object_info
+        let models = [];
+        let comfyUIData = null;
+
+        // Get models/checkpoints if we haven't already
+        if (!endpoint.includes('object_info')) {
+          const objInfo = await proxyFetch(`http://${host}:${port}/object_info`, 5000);
+          if (objInfo.ok && objInfo.data) {
+            const parsed = parseComfyUIObjectInfo(objInfo.data);
+            models = parsed.models;
+            comfyUIData = parsed.comfyUIData;
+          }
+        } else if (result.data) {
+          const parsed = parseComfyUIObjectInfo(result.data);
+          models = parsed.models;
+          comfyUIData = parsed.comfyUIData;
+        }
+
+        return {
+          online: true,
+          models,
+          comfyUIData,
+          type: 'comfyui',
+          endpoint: endpoint
+        };
+      }
+    } catch (e) {
+      // Continue to next endpoint
+    }
+  }
+  return { online: false };
+}
+
+/**
+ * Parse ComfyUI object_info response to extract models
+ */
+function parseComfyUIObjectInfo(objectInfo) {
+  const comfyUIData = {
+    checkpoints: [],
+    vaes: [],
+    loras: [],
+    clipModels: [],
+    unets: [],
+    customNodes: Object.keys(objectInfo || {}),
+    embeddings: []
+  };
+  const models = [];
+
+  if (!objectInfo) return { models, comfyUIData };
+
+  // Extract checkpoints
+  if (objectInfo.CheckpointLoaderSimple?.input?.required?.ckpt_name?.[0]) {
+    comfyUIData.checkpoints = objectInfo.CheckpointLoaderSimple.input.required.ckpt_name[0];
+    models.push(...comfyUIData.checkpoints.map(m => `[Checkpoint] ${m}`));
+  }
+
+  // Extract VAEs
+  if (objectInfo.VAELoader?.input?.required?.vae_name?.[0]) {
+    comfyUIData.vaes = objectInfo.VAELoader.input.required.vae_name[0];
+  }
+
+  // Extract LoRAs
+  if (objectInfo.LoraLoader?.input?.required?.lora_name?.[0]) {
+    comfyUIData.loras = objectInfo.LoraLoader.input.required.lora_name[0];
+  }
+
+  // Extract UNETs
+  if (objectInfo.UNETLoader?.input?.required?.unet_name?.[0]) {
+    comfyUIData.unets = objectInfo.UNETLoader.input.required.unet_name[0];
+  }
+
+  // Look for video generation models (Wan, HoloCine, etc.)
+  const videoLoaders = ['DownloadAndLoadWanVideo2Model', 'WanVideoModelLoader', 'LoadWanVideoModel'];
+  for (const loader of videoLoaders) {
+    if (objectInfo[loader]?.input?.required?.model?.[0]) {
+      const videoModels = objectInfo[loader].input.required.model[0];
+      comfyUIData.unets.push(...videoModels);
+      models.push(...videoModels.map(m => `[Video Model] ${m}`));
+    }
+  }
+
+  // Check for video generation nodes
+  const videoNodes = [
+    'WanVideoWrapper', 'WanVideoSampler', 'WanVideoVAEDecode',
+    'HoloCineLoader', 'HoloCineSceneLoader',
+    'CogVideoXLoader', 'CogVideoXSampler'
+  ];
+  for (const nodeName of videoNodes) {
+    if (objectInfo[nodeName]) {
+      models.push(`[Video Node] ${nodeName}`);
+    }
+  }
+
+  return { models, comfyUIData };
+}
+
+/**
+ * POST /api/proxy/check-node
+ * Check a single node for Ollama or ComfyUI
+ */
+app.post('/api/proxy/check-node', async (req, res) => {
+  const { host, port, type } = req.body;
+
+  if (!host || !port) {
+    return res.status(400).json({ error: 'host and port are required' });
+  }
+
+  console.log(`🔍 Proxy checking ${type || 'auto'} at ${host}:${port}...`);
+
+  try {
+    if (type === 'ollama') {
+      const result = await checkOllama(host, port);
+      return res.json(result);
+    } else if (type === 'comfyui') {
+      const result = await checkComfyUI(host, port);
+      return res.json(result);
+    } else {
+      // Auto-detect: try both
+      const [ollamaResult, comfyResult] = await Promise.all([
+        checkOllama(host, port),
+        checkComfyUI(host, port)
+      ]);
+
+      if (ollamaResult.online) {
+        return res.json(ollamaResult);
+      } else if (comfyResult.online) {
+        return res.json(comfyResult);
+      } else {
+        return res.json({ online: false });
+      }
+    }
+  } catch (error) {
+    console.error(`Error checking node ${host}:${port}:`, error);
+    res.json({ online: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/proxy/scan-host
+ * Scan a single host for both Ollama and ComfyUI
+ */
+app.post('/api/proxy/scan-host', async (req, res) => {
+  const { host, ollamaPort = 11434, comfyuiPorts = [8188, 8080, 7860] } = req.body; // ComfyUI default is 8188
+
+  if (!host) {
+    return res.status(400).json({ error: 'host is required' });
+  }
+
+  console.log(`🔍 Scanning host ${host} for Ollama (${ollamaPort}) and ComfyUI (${comfyuiPorts.join(',')})...`);
+
+  try {
+    // Check Ollama
+    const ollamaResult = await checkOllama(host, ollamaPort);
+
+    // Check ComfyUI on multiple ports
+    let comfyResult = { online: false };
+    let comfyPort = null;
+    for (const port of comfyuiPorts) {
+      const result = await checkComfyUI(host, port);
+      if (result.online) {
+        comfyResult = result;
+        comfyPort = port;
+        break;
+      }
+    }
+
+    res.json({
+      host,
+      ollama: {
+        online: ollamaResult.online,
+        port: ollamaPort,
+        models: ollamaResult.models || []
+      },
+      comfyui: {
+        online: comfyResult.online,
+        port: comfyPort,
+        models: comfyResult.models || [],
+        comfyUIData: comfyResult.comfyUIData || null
+      }
+    });
+  } catch (error) {
+    console.error(`Error scanning host ${host}:`, error);
+    res.json({ host, error: error.message, ollama: { online: false }, comfyui: { online: false } });
+  }
+});
+
+/**
+ * POST /api/proxy/scan-network
+ * Batch scan multiple hosts in parallel (much faster than browser)
+ */
+app.post('/api/proxy/scan-network', async (req, res) => {
+  const {
+    hosts = [],
+    ranges = [],
+    ollamaPort = 11434,
+    comfyuiPorts = [8188, 8080, 7860], // ComfyUI default is 8188
+    concurrency = 30 // Increased for faster scanning
+  } = req.body;
+
+  console.log(`🔍 Network scan: ${hosts.length} hosts, ${ranges.length} ranges, concurrency ${concurrency}`);
+
+  // Build list of all hosts to scan
+  const allHosts = [...hosts];
+
+  // Expand IP ranges
+  for (const range of ranges) {
+    // e.g., "192.168.1." -> 192.168.1.1 to 192.168.1.254
+    for (let i = 1; i <= 254; i++) {
+      allHosts.push(`${range}${i}`);
+    }
+  }
+
+  console.log(`🔍 Scanning ${allHosts.length} total hosts...`);
+
+  const results = [];
+
+  // Process in batches for controlled concurrency
+  // Scan for BOTH Ollama AND ComfyUI (standalone ComfyUI instances are common)
+  for (let i = 0; i < allHosts.length; i += concurrency) {
+    const batch = allHosts.slice(i, i + concurrency);
+    const batchPromises = batch.map(async (host) => {
+      // Check Ollama first (fast check)
+      const ollamaResult = await checkOllama(host, ollamaPort);
+
+      // Check ComfyUI on all ports (even if no Ollama - standalone ComfyUI is common)
+      let comfyResult = { online: false };
+      let comfyPort = null;
+      for (const port of comfyuiPorts) {
+        const result = await checkComfyUI(host, port);
+        if (result.online) {
+          comfyResult = result;
+          comfyPort = port;
+          break;
+        }
+      }
+
+      // Return if either Ollama OR ComfyUI is found
+      if (ollamaResult.online || comfyResult.online) {
+        return {
+          host,
+          ollama: { online: ollamaResult.online, port: ollamaPort, models: ollamaResult.models || [] },
+          comfyui: { online: comfyResult.online, port: comfyPort, models: comfyResult.models || [], comfyUIData: comfyResult.comfyUIData }
+        };
+      }
+      return null; // Neither found
+    });
+
+    const batchResults = await Promise.all(batchPromises);
+    results.push(...batchResults.filter(r => r !== null));
+
+    // Log progress
+    const progress = Math.min(100, Math.round(((i + concurrency) / allHosts.length) * 100));
+    console.log(`🔍 Scan progress: ${progress}% (${results.length} found)`);
+  }
+
+  console.log(`✅ Network scan complete: found ${results.length} nodes`);
+  res.json({ nodes: results, scanned: allHosts.length });
+});
+
+/**
+ * POST /api/proxy/fetch
+ * Generic proxy fetch for any URL (used for ComfyUI object_info, etc.)
+ */
+app.post('/api/proxy/fetch', async (req, res) => {
+  const { url, timeout = 5000 } = req.body;
+
+  if (!url) {
+    return res.status(400).json({ error: 'url is required' });
+  }
+
+  try {
+    const result = await proxyFetch(url, timeout);
+    res.json(result);
+  } catch (error) {
+    res.json({ ok: false, error: error.message });
+  }
+});
+
+// ============================================
+// NODE AGENT REGISTRY
+// Tracks nodes that have registered via heartbeat
+// ============================================
+
+// In-memory registry of active nodes (cleared on server restart)
+const nodeRegistry = new Map();
+const NODE_TIMEOUT = 90000; // 90 seconds - consider node offline if no heartbeat
+
+/**
+ * POST /api/nodes/heartbeat
+ * Receive heartbeat from a node agent
+ */
+app.post('/api/nodes/heartbeat', (req, res) => {
+  const {
+    node_id,
+    hostname,
+    ip_addresses,
+    agent_port,
+    ollama,
+    comfyui,
+    system,
+    timestamp
+  } = req.body;
+
+  if (!node_id) {
+    return res.status(400).json({ error: 'node_id is required' });
+  }
+
+  const nodeData = {
+    node_id,
+    hostname,
+    ip_addresses: ip_addresses || [],
+    agent_port: agent_port || 8765,
+    ollama: ollama || { available: false },
+    comfyui: comfyui || { available: false },
+    system: system || {},
+    last_heartbeat: new Date().toISOString(),
+    received_timestamp: timestamp
+  };
+
+  nodeRegistry.set(node_id, nodeData);
+  console.log(`💓 Heartbeat from ${hostname} (${node_id.slice(0, 8)}...) - Ollama: ${ollama?.available ? '✅' : '❌'}, ComfyUI: ${comfyui?.available ? '✅' : '❌'}`);
+
+  res.json({ status: 'ok', registered: true });
+});
+
+/**
+ * GET /api/nodes
+ * Get all registered nodes (filters out stale nodes)
+ */
+app.get('/api/nodes', (req, res) => {
+  const now = Date.now();
+  const activeNodes = [];
+
+  for (const [nodeId, node] of nodeRegistry) {
+    const lastHeartbeat = new Date(node.last_heartbeat).getTime();
+    const isStale = (now - lastHeartbeat) > NODE_TIMEOUT;
+
+    if (isStale) {
+      // Mark as offline but keep in registry
+      node.status = 'offline';
+    } else {
+      node.status = 'online';
+    }
+
+    activeNodes.push(node);
+  }
+
+  res.json({
+    nodes: activeNodes,
+    total: activeNodes.length,
+    online: activeNodes.filter(n => n.status === 'online').length
+  });
+});
+
+/**
+ * GET /api/nodes/:nodeId
+ * Get a specific node by ID
+ */
+app.get('/api/nodes/:nodeId', (req, res) => {
+  const node = nodeRegistry.get(req.params.nodeId);
+
+  if (!node) {
+    return res.status(404).json({ error: 'Node not found' });
+  }
+
+  // Check if stale
+  const now = Date.now();
+  const lastHeartbeat = new Date(node.last_heartbeat).getTime();
+  node.status = (now - lastHeartbeat) > NODE_TIMEOUT ? 'offline' : 'online';
+
+  res.json(node);
+});
+
+/**
+ * DELETE /api/nodes/:nodeId
+ * Remove a node from the registry
+ */
+app.delete('/api/nodes/:nodeId', (req, res) => {
+  const deleted = nodeRegistry.delete(req.params.nodeId);
+  res.json({ deleted });
+});
+
+/**
+ * GET /api/nodes/discover
+ * Get all nodes - combines registered agents + network scan results
+ * This is the unified endpoint for the frontend
+ */
+app.get('/api/nodes/discover', async (req, res) => {
+  const includeNetworkScan = req.query.scan !== 'false';
+
+  // Get registered nodes
+  const now = Date.now();
+  const registeredNodes = [];
+
+  for (const [nodeId, node] of nodeRegistry) {
+    const lastHeartbeat = new Date(node.last_heartbeat).getTime();
+    const isOnline = (now - lastHeartbeat) <= NODE_TIMEOUT;
+
+    registeredNodes.push({
+      source: 'agent',
+      node_id: node.node_id,
+      hostname: node.hostname,
+      ip_addresses: node.ip_addresses,
+      agent_port: node.agent_port,
+      agent_url: node.ip_addresses[0] ? `http://${node.ip_addresses[0]}:${node.agent_port}` : null,
+      status: isOnline ? 'online' : 'offline',
+      ollama: node.ollama,
+      comfyui: node.comfyui,
+      system: node.system,
+      last_heartbeat: node.last_heartbeat
+    });
+  }
+
+  // Optionally do a quick network scan for nodes without agents
+  let scannedNodes = [];
+  if (includeNetworkScan) {
+    // Quick scan of common hosts (not full IP range scan)
+    const quickHosts = ['localhost'];
+
+    // Add IPs from registered nodes to cross-check
+    for (const node of registeredNodes) {
+      for (const ip of node.ip_addresses) {
+        if (!quickHosts.includes(ip)) {
+          quickHosts.push(ip);
+        }
+      }
+    }
+
+    for (const host of quickHosts) {
+      // Skip if we already have this host from agent registry
+      const alreadyRegistered = registeredNodes.some(n =>
+        n.ip_addresses.includes(host) || n.hostname === host
+      );
+
+      if (!alreadyRegistered || host === 'localhost') {
+        const ollamaResult = await checkOllama(host, 11434);
+        const comfyResult = await checkComfyUI(host, 8188);
+
+        if (ollamaResult.online || comfyResult.online) {
+          scannedNodes.push({
+            source: 'scan',
+            host,
+            status: 'online',
+            ollama: { available: ollamaResult.online, models: ollamaResult.models || [], port: 11434 },
+            comfyui: { available: comfyResult.online, port: 8188 }
+          });
+        }
+      }
+    }
+  }
+
+  res.json({
+    registered: registeredNodes,
+    scanned: scannedNodes,
+    summary: {
+      total_registered: registeredNodes.length,
+      online_registered: registeredNodes.filter(n => n.status === 'online').length,
+      scanned_found: scannedNodes.length
+    }
+  });
 });
 
 // 404 handler

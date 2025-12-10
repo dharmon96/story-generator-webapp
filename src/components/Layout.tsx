@@ -24,6 +24,7 @@ import {
   Settings as SettingsIcon,
   ChevronLeft as ChevronLeftIcon,
   Movie as RenderQueueIcon,
+  Videocam as ShotlistIcon,
 } from '@mui/icons-material';
 
 const drawerWidth = 260;
@@ -36,6 +37,7 @@ const menuItems = [
   { text: 'Dashboard', icon: <DashboardIcon />, path: '/' },
   { text: 'Story Generator', icon: <GeneratorIcon />, path: '/generator' },
   { text: 'Story Queue', icon: <QueueIcon />, path: '/queue' },
+  { text: 'Shotlists', icon: <ShotlistIcon />, path: '/shotlists' },
   { text: 'Render Queue', icon: <RenderQueueIcon />, path: '/render-queue' },
   { text: 'Research', icon: <ResearchIcon />, path: '/research' },
   { text: 'Metrics', icon: <MetricsIcon />, path: '/metrics' },
