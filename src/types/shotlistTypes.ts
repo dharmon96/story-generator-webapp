@@ -170,32 +170,35 @@ export const GROUP_COLORS = [
 
 /**
  * Default settings for new shotlists
+ * Note: These are fallbacks - actual defaults should come from getWorkflowDefaults()
  */
 export const DEFAULT_SHOTLIST_SETTINGS = {
   defaultWorkflowType: 'shot' as WorkflowType,
   defaultGenerationMethod: 'wan22' as GenerationMethodId,
   defaultSettings: {
     numFrames: 81,
-    fps: 24,
-    resolution: '1280x720',
-    steps: 30,
-    cfg: 7.0,
+    fps: 16,
+    resolution: '640x640',
+    steps: 4,
+    cfg: 1,
   },
-  defaultNegativePrompt: 'blurry, low quality, distorted, deformed, bad anatomy, watermark, text, logo',
+  // Chinese negative from Wan 2.2 workflow
+  defaultNegativePrompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走，裸露，NSFW',
 };
 
 /**
  * Default settings for new shots
+ * Note: These are fallbacks - actual defaults should come from getWorkflowDefaults()
  */
 export const DEFAULT_SHOT_SETTINGS = {
   workflowType: 'shot' as WorkflowType,
   generationMethod: 'wan22' as GenerationMethodId,
   settings: {
     numFrames: 81,
-    fps: 24,
-    resolution: '1280x720',
-    steps: 30,
-    cfg: 7.0,
+    fps: 16,
+    resolution: '640x640',
+    steps: 4,
+    cfg: 1,
   },
 };
 

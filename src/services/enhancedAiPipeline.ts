@@ -1,9 +1,32 @@
 import { QueueItem, ModelConfig } from '../store/useStore';
 import { EnhancedStory, AILogEntry } from '../types/storyTypes';
 import { nodeQueueManager } from './nodeQueueManager';
-import { PipelineProgress } from './aiPipeline';
 import { storyDataManager } from './storyDataManager';
 import { validationService } from './validationService';
+
+// Pipeline step interface (moved from deprecated aiPipeline.ts)
+export interface PipelineStep {
+  id: string;
+  name: string;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  nodeId?: string;
+  model?: string;
+  startTime?: Date;
+  endTime?: Date;
+  input?: string;
+  output?: string;
+  error?: string;
+}
+
+// Pipeline progress interface (moved from deprecated aiPipeline.ts)
+export interface PipelineProgress {
+  storyId: string;
+  queueItemId: string;
+  currentStep: string;
+  steps: PipelineStep[];
+  overallProgress: number;
+  logs: AILogEntry[];
+}
 
 class EnhancedAIPipelineService {
   private progressCallbacks: Map<string, (progress: PipelineProgress) => void> = new Map();

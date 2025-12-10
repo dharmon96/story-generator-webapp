@@ -46,7 +46,6 @@ import {
   Title as TitleIcon,
 } from '@mui/icons-material';
 import { EnhancedStory } from '../../types/storyTypes';
-import AITextField from '../AITextField';
 import { manualModeAiService } from '../../services/manualModeAiService';
 
 // Available genres
@@ -84,10 +83,12 @@ const StoryTab: React.FC<StoryTabProps> = ({ storyData, isGenerating, isManualMo
   }, [storyData]);
 
   // In manual mode, start in editing mode by default
+  // isEditing intentionally excluded - we only want this to run once when entering manual mode
   React.useEffect(() => {
     if (isManualMode && storyData && !isEditing) {
       setIsEditing(true);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isManualMode, storyData]);
 
   if (!storyData) {

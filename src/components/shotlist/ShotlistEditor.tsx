@@ -26,7 +26,6 @@ import {
   InputLabel,
   Divider,
   Chip,
-  Tooltip,
   Dialog,
   DialogTitle,
   DialogContent,
@@ -35,7 +34,6 @@ import {
   Menu,
   ListItemIcon,
   ListItemText,
-  Badge,
 } from '@mui/material';
 import {
   Add,
@@ -45,7 +43,6 @@ import {
   Videocam,
   Movie,
   Folder,
-  Queue as QueueIcon,
   CheckCircle,
   Schedule,
   Error as ErrorIcon,
@@ -57,12 +54,9 @@ import {
 } from '@mui/icons-material';
 import { useStore } from '../../store/useStore';
 import {
-  Shotlist,
   ShotlistShot,
   ShotlistGroup,
   WorkflowType,
-  createNewShot,
-  createNewGroup,
   calculateShotlistStats,
   GROUP_COLORS,
 } from '../../types/shotlistTypes';
@@ -97,7 +91,6 @@ const ShotlistEditor: React.FC<ShotlistEditorProps> = ({ shotlistId, onBack }) =
     addShotToShotlist,
     updateShot,
     deleteShot,
-    reorderShots,
     addGroupToShotlist,
     updateGroup,
     deleteGroup,
@@ -152,7 +145,6 @@ const ShotlistEditor: React.FC<ShotlistEditorProps> = ({ shotlistId, onBack }) =
     if (!shotlist) return [];
 
     const sortedGroups = [...shotlist.groups].sort((a, b) => a.order - b.order);
-    const rootGroups = sortedGroups.filter((g) => !g.parentGroupId);
 
     const buildTree = (parentId?: string): (ShotlistGroup & { children: any[] })[] => {
       return sortedGroups

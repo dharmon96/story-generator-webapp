@@ -127,7 +127,7 @@ export interface RenderJob {
 
   // Generation settings
   settings: {
-    workflow: 'holocine' | 'wan22' | 'cogvideox';
+    workflow: 'holocine' | 'wan22' | 'hunyuan15';
     numFrames: number;
     fps: number;
     resolution: string;

@@ -13,7 +13,9 @@ export type GenerationMethodId =
   | 'wan22'         // Wan 2.2: Shot-by-shot generation
   | 'hunyuan15'     // Hunyuan 1.5: High-quality text/image to video
   | 'kling'         // Kling: Shot-by-shot generation
-  | 'cogvideox'     // CogVideoX: Shot-by-shot generation
+  | 'sora'          // OpenAI Sora: High-quality video generation
+  | 'veo'           // Google Veo: Gemini-powered video generation
+  | 'nanobanana'    // Nano Banana: Fast API-based generation
   | 'custom';       // Custom: User-defined pipeline
 
 /**
@@ -148,7 +150,7 @@ export const HOLOCINE_PIPELINE: GenerationStep[] = [
 ];
 
 /**
- * Shot-Based Pipeline Steps (Wan 2.2, Kling, CogVideoX)
+ * Shot-Based Pipeline Steps (Wan 2.2, Kling, Sora, Veo, Nano Banana)
  * Story → Segments → Shots → Prompts
  */
 export const SHOT_BASED_PIPELINE: GenerationStep[] = [
@@ -344,18 +346,18 @@ export const GENERATION_METHODS: GenerationMethod[] = [
     comingSoon: true
   },
   {
-    id: 'cogvideox',
-    name: 'CogVideoX',
-    description: 'Open-source video generation. Good balance of quality and speed.',
+    id: 'sora',
+    name: 'OpenAI Sora',
+    description: 'OpenAI\'s text-to-video model. High quality cinematic output with excellent prompt following.',
     pipelineType: 'shot-based',
-    icon: '🧠',
-    color: '#4caf50',
+    icon: '🌟',
+    color: '#10a37f',  // OpenAI green
     features: {
       multiShot: false,
       characterConsistency: false,
-      maxDuration: 6,
-      resolutions: ['720x480', '480x720'],
-      fps: [8, 16]
+      maxDuration: 20,
+      resolutions: ['1920x1080', '1080x1920', '1280x720'],
+      fps: [24, 30]
     },
     pipeline: {
       steps: SHOT_BASED_PIPELINE,
@@ -363,9 +365,74 @@ export const GENERATION_METHODS: GenerationMethod[] = [
       requiredSteps: ['story', 'segments', 'shots', 'characters', 'prompts']
     },
     model: {
-      name: 'CogVideoX',
-      type: 'comfyui',
-      endpoint: 'cogvideox_workflow'
+      name: 'Sora',
+      type: 'api',
+      endpoint: '/api/openai/sora/generate',
+      defaultParams: {
+        quality: 'high',
+        style: 'cinematic'
+      }
+    },
+    available: false,
+    comingSoon: true
+  },
+  {
+    id: 'veo',
+    name: 'Google Veo',
+    description: 'Google DeepMind\'s video generation model. Powered by Gemini for excellent text understanding.',
+    pipelineType: 'shot-based',
+    icon: '🔷',
+    color: '#4285f4',  // Google blue
+    features: {
+      multiShot: false,
+      characterConsistency: false,
+      maxDuration: 8,
+      resolutions: ['1920x1080', '1080x1920', '1280x720'],
+      fps: [24]
+    },
+    pipeline: {
+      steps: SHOT_BASED_PIPELINE,
+      skipSteps: ['holocine_scenes'],
+      requiredSteps: ['story', 'segments', 'shots', 'characters', 'prompts']
+    },
+    model: {
+      name: 'Veo',
+      type: 'api',
+      endpoint: '/api/google/veo/generate',
+      defaultParams: {
+        aspectRatio: '16:9'
+      }
+    },
+    available: false,
+    comingSoon: true
+  },
+  {
+    id: 'nanobanana',
+    name: 'Nano Banana',
+    description: 'Fast and affordable API-based video generation. Great for quick iterations and prototyping.',
+    pipelineType: 'shot-based',
+    icon: '🍌',
+    color: '#ffc107',  // Banana yellow
+    features: {
+      multiShot: false,
+      characterConsistency: false,
+      maxDuration: 10,
+      resolutions: ['1280x720', '720x1280', '1024x1024'],
+      fps: [16, 24]
+    },
+    pipeline: {
+      steps: SHOT_BASED_PIPELINE,
+      skipSteps: ['holocine_scenes'],
+      requiredSteps: ['story', 'segments', 'shots', 'characters', 'prompts']
+    },
+    model: {
+      name: 'Nano Banana',
+      type: 'api',
+      endpoint: '/api/nanobanana/generate',
+      defaultParams: {
+        model: 'default',
+        quality: 'standard'
+      }
     },
     available: false,
     comingSoon: true

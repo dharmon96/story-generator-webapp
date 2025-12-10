@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useCallback } from 'react';
 import {
   Box,
   Card,
@@ -59,7 +59,6 @@ import {
   Cancel,
   Add as AddIcon,
   AutoAwesome as GenerateIcon,
-  AutoFixHigh as EnhanceIcon,
 } from '@mui/icons-material';
 import { EnhancedStory, EnhancedShot } from '../../types/storyTypes';
 import { useStore, RenderJob } from '../../store/useStore';
@@ -132,9 +131,9 @@ const ShotlistTab: React.FC<ShotlistTabProps> = ({
   }, [storyRenderJobs]);
 
   // Get render job status for a shot
-  const getRenderJobForShot = (shotId: string): RenderJob | undefined => {
+  const getRenderJobForShot = useCallback((shotId: string): RenderJob | undefined => {
     return shotRenderJobMap.get(shotId);
-  };
+  }, [shotRenderJobMap]);
 
   // Add shot to render queue
   const handleAddToRenderQueue = (shot: EnhancedShot) => {
@@ -323,7 +322,7 @@ const ShotlistTab: React.FC<ShotlistTabProps> = ({
     const notInQueue = storyData.shots.filter(s => s.comfyUIPositivePrompt && !getRenderJobForShot(s.id)).length;
 
     return { inQueue, queued, rendering, completed, failed, notInQueue };
-  }, [storyRenderJobs, storyData]);
+  }, [storyRenderJobs, storyData, getRenderJobForShot]);
 
   if (!storyData) {
     return (

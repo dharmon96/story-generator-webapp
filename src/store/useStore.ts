@@ -3,6 +3,17 @@ import { devtools, persist } from 'zustand/middleware';
 import { debugService } from '../services/debugService';
 import { GenerationMethodId } from '../types/generationMethods';
 import { Shotlist, ShotlistShot, ShotlistGroup, createNewShotlist, createNewShot, createNewGroup } from '../types/shotlistTypes';
+import {
+  AgentNode,
+  CloudServiceNode,
+  PipelineModelAssignment,
+  VideoModelStatus,
+  DEFAULT_CLOUD_SERVICES,
+  DEFAULT_PIPELINE_ASSIGNMENTS,
+  maskApiKey,
+  VideoMethodId,
+  VIDEO_MODELS
+} from '../types/agentTypes';
 
 export interface StoryConfig {
   prompt: string;
@@ -215,7 +226,7 @@ export interface ComfyUINodeAssignment {
 // ComfyUI-specific settings
 export interface ComfyUISettings {
   nodeAssignments: ComfyUINodeAssignment[];
-  defaultWorkflow: 'holocine' | 'wan22' | 'cogvideox' | 'custom';
+  defaultWorkflow: 'holocine' | 'wan22' | 'hunyuan15' | 'custom';
   modelMappings: Record<string, string>;  // Friendly name -> actual file name
   autoValidateModels: boolean;
   defaultNegativePrompt: string;
@@ -263,7 +274,7 @@ export interface RenderJob {
 
   // Generation settings (pulled from story config)
   settings: {
-    workflow: 'holocine' | 'wan22' | 'hunyuan15' | 'cogvideox';
+    workflow: 'holocine' | 'wan22' | 'hunyuan15';
     numFrames: number;
     fps: number;
     resolution: string;
@@ -276,6 +287,7 @@ export interface RenderJob {
   status: 'queued' | 'assigned' | 'rendering' | 'completed' | 'failed';
   progress: number;
   assignedNode?: string;
+  comfyPromptId?: string;  // ComfyUI prompt ID for tracking
 
   // Output
   outputUrl?: string;
@@ -329,6 +341,13 @@ export interface StoreState {
   renderQueue: RenderJob[];
   renderQueueEnabled: boolean;  // Auto-render toggle
 
+  // ============== AGENT STATE ==============
+  agents: AgentNode[];
+  cloudServices: CloudServiceNode[];
+  pipelineAssignments: PipelineModelAssignment[];
+  isScanning: boolean;
+  lastScanTime: string | null;
+
   addToQueue: (item: Omit<QueueItem, 'id' | 'createdAt'>) => void;
   removeFromQueue: (id: string) => void;
   updateQueueItem: (id: string, updates: Partial<QueueItem>) => void;
@@ -363,6 +382,37 @@ export interface StoreState {
   clearAllRenderJobs: (storyId?: string) => void;
   setRenderQueueEnabled: (enabled: boolean) => void;
   getNextRenderJob: () => RenderJob | null;
+
+  // ============== AGENT METHODS ==============
+  // Agent actions
+  setAgents: (agents: AgentNode[]) => void;
+  addAgent: (agent: AgentNode) => void;
+  updateAgent: (id: string, updates: Partial<AgentNode>) => void;
+  removeAgent: (id: string) => void;
+  clearAgents: () => void;
+
+  // Cloud service actions
+  setCloudServices: (services: CloudServiceNode[]) => void;
+  updateCloudService: (id: string, updates: Partial<CloudServiceNode>) => void;
+  setCloudServiceApiKey: (id: string, apiKey: string) => void;
+
+  // Pipeline assignment actions
+  setPipelineAssignments: (assignments: PipelineModelAssignment[]) => void;
+  updatePipelineAssignment: (stepId: string, updates: Partial<PipelineModelAssignment>) => void;
+  setAllPipelineModels: (modelId: string) => void;
+
+  // Scanning actions
+  setScanning: (isScanning: boolean) => void;
+  setLastScanTime: (time: string | null) => void;
+
+  // Computed getters for agents
+  getOnlineAgents: () => AgentNode[];
+  getLocalAgents: () => AgentNode[];
+  getAllAvailableModels: () => string[];
+  getAgentsForModel: (modelId: string) => AgentNode[];
+  getVideoModelStatus: () => VideoModelStatus[];
+  getConfiguredCloudServices: () => CloudServiceNode[];
+  canExecuteStep: (stepId: string) => boolean;
 
   // Standalone Shotlist methods
   shotlists: Shotlist[];
@@ -416,6 +466,13 @@ export const useStore = create<StoreState>()(
         // Render queue for video generation
         renderQueue: [],
         renderQueueEnabled: false,  // Off by default, user can toggle
+
+        // ============== AGENT STATE ==============
+        agents: [],
+        cloudServices: DEFAULT_CLOUD_SERVICES,
+        pipelineAssignments: DEFAULT_PIPELINE_ASSIGNMENTS,
+        isScanning: false,
+        lastScanTime: null,
 
         addToQueue: (item) => set((state) => {
           try {
@@ -814,6 +871,222 @@ export const useStore = create<StoreState>()(
           return queuedJobs[0] || null;
         },
 
+        // ============== AGENT METHODS ==============
+
+        // Agent actions
+        setAgents: (agents) => set({ agents }),
+
+        addAgent: (agent) =>
+          set((state) => {
+            // Check if agent already exists
+            const exists = state.agents.find((a) => a.id === agent.id);
+            if (exists) {
+              // Update existing agent
+              return {
+                agents: state.agents.map((a) => (a.id === agent.id ? { ...a, ...agent } : a))
+              };
+            }
+            debugService.info('store', `🤖 Added agent: ${agent.displayName}`);
+            return { agents: [...state.agents, agent] };
+          }),
+
+        updateAgent: (id, updates) =>
+          set((state) => ({
+            agents: state.agents.map((agent) =>
+              agent.id === id ? { ...agent, ...updates } : agent
+            )
+          })),
+
+        removeAgent: (id) =>
+          set((state) => {
+            debugService.info('store', `🗑️ Removed agent: ${id}`);
+            return {
+              agents: state.agents.filter((agent) => agent.id !== id)
+            };
+          }),
+
+        clearAgents: () => set({ agents: [] }),
+
+        // Cloud service actions
+        setCloudServices: (services) => set({ cloudServices: services }),
+
+        updateCloudService: (id, updates) =>
+          set((state) => ({
+            cloudServices: state.cloudServices.map((service) =>
+              service.id === id ? { ...service, ...updates } : service
+            )
+          })),
+
+        setCloudServiceApiKey: (id, apiKey) =>
+          set((state) => ({
+            cloudServices: state.cloudServices.map((service) =>
+              service.id === id
+                ? {
+                    ...service,
+                    apiKey,
+                    apiKeyMasked: maskApiKey(apiKey),
+                    status: apiKey ? 'validating' : 'unconfigured'
+                  }
+                : service
+            )
+          })),
+
+        // Pipeline assignment actions
+        setPipelineAssignments: (assignments) => set({ pipelineAssignments: assignments }),
+
+        updatePipelineAssignment: (stepId, updates) =>
+          set((state) => ({
+            pipelineAssignments: state.pipelineAssignments.map((assignment) =>
+              assignment.stepId === stepId ? { ...assignment, ...updates } : assignment
+            )
+          })),
+
+        setAllPipelineModels: (modelId) =>
+          set((state) => ({
+            pipelineAssignments: state.pipelineAssignments.map((assignment) => ({
+              ...assignment,
+              modelId
+            }))
+          })),
+
+        // Scanning actions
+        setScanning: (isScanning) => set({ isScanning }),
+
+        setLastScanTime: (time) => set({ lastScanTime: time }),
+
+        // Computed getters for agents
+        getOnlineAgents: () => {
+          const { agents } = get();
+          return agents.filter((agent) => agent.status === 'online' || agent.status === 'busy');
+        },
+
+        getLocalAgents: () => {
+          const { agents } = get();
+          return agents.filter((agent) => agent.category === 'local');
+        },
+
+        getAllAvailableModels: () => {
+          const { agents, cloudServices } = get();
+          const models = new Set<string>();
+
+          // Collect models from local agents
+          agents.forEach((agent) => {
+            if (agent.ollama?.available && agent.ollama.models) {
+              agent.ollama.models.forEach((model) => models.add(model));
+            }
+          });
+
+          // Collect models from configured cloud services
+          cloudServices.forEach((service) => {
+            if (service.status === 'online') {
+              service.models.chat.forEach((model) => models.add(`${service.type}:${model}`));
+            }
+          });
+
+          return Array.from(models).sort();
+        },
+
+        getAgentsForModel: (modelId) => {
+          const { agents } = get();
+
+          // Check if it's a cloud model (format: "provider:model")
+          if (modelId.includes(':')) {
+            return []; // Cloud models don't have local agents
+          }
+
+          return agents.filter(
+            (agent) =>
+              agent.ollama?.available &&
+              agent.ollama.models.includes(modelId) &&
+              (agent.status === 'online' || agent.status === 'busy')
+          );
+        },
+
+        getVideoModelStatus: () => {
+          const { agents, cloudServices } = get();
+
+          return VIDEO_MODELS.map((model) => {
+            let enabled = false;
+            let agentCount = 0;
+            const agentIds: string[] = [];
+
+            if (model.type === 'local') {
+              // Check local agents for this workflow
+              agents.forEach((agent) => {
+                if (agent.comfyui?.available && agent.comfyui.workflows) {
+                  const workflow = agent.comfyui.workflows.find((w) => w.id === model.id);
+                  if (workflow?.available) {
+                    enabled = true;
+                    agentCount++;
+                    agentIds.push(agent.id);
+                  }
+                }
+              });
+            } else {
+              // Check cloud services
+              const serviceMap: Record<VideoMethodId, string> = {
+                sora: 'openai',
+                veo: 'google',
+                kling: 'nanobanana',
+                nanobanana: 'nanobanana',
+                holocine: '',
+                wan22: '',
+                hunyuan15: ''
+              };
+
+              const serviceType = serviceMap[model.id];
+              if (serviceType) {
+                const service = cloudServices.find((s) => s.type === serviceType);
+                if (service?.status === 'online' && service.capabilities.video) {
+                  enabled = true;
+                  agentCount = 1;
+                  agentIds.push(service.id);
+                }
+              }
+            }
+
+            return {
+              ...model,
+              enabled,
+              agentCount,
+              agents: agentIds
+            };
+          });
+        },
+
+        getConfiguredCloudServices: () => {
+          const { cloudServices } = get();
+          return cloudServices.filter((service) => service.status === 'online');
+        },
+
+        canExecuteStep: (stepId) => {
+          const { pipelineAssignments, agents, cloudServices } = get();
+          const assignment = pipelineAssignments.find((a) => a.stepId === stepId);
+
+          if (!assignment || !assignment.enabled || !assignment.modelId) {
+            return false;
+          }
+
+          const modelId = assignment.modelId;
+
+          // Check if it's a cloud model
+          if (modelId.includes(':')) {
+            const [provider] = modelId.split(':');
+            const service = cloudServices.find((s) => s.type === provider);
+            return service?.status === 'online';
+          }
+
+          // Check local agents
+          const availableAgents = agents.filter(
+            (agent) =>
+              agent.ollama?.available &&
+              agent.ollama.models.includes(modelId) &&
+              agent.status === 'online'
+          );
+
+          return availableAgents.length > 0;
+        },
+
         // Standalone Shotlist state and methods
         shotlists: [],
 
@@ -1014,7 +1287,6 @@ export const useStore = create<StoreState>()(
             settings: {
               workflow: shot.generationMethod === 'holocine' ? 'holocine'
                 : shot.generationMethod === 'hunyuan15' ? 'hunyuan15'
-                : shot.generationMethod === 'cogvideox' ? 'cogvideox'
                 : 'wan22',
               numFrames: shot.settings.numFrames,
               fps: shot.settings.fps,
@@ -1089,6 +1361,11 @@ export const useStore = create<StoreState>()(
           renderQueue: state.renderQueue,  // Persist render queue
           renderQueueEnabled: state.renderQueueEnabled,
           shotlists: state.shotlists,  // Persist standalone shotlists
+          // Agent state persistence
+          agents: state.agents,
+          cloudServices: state.cloudServices,
+          pipelineAssignments: state.pipelineAssignments,
+          lastScanTime: state.lastScanTime,
         }),
       }
     )

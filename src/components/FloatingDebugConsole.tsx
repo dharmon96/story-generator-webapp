@@ -48,7 +48,6 @@ const FloatingDebugConsole: React.FC<FloatingDebugConsoleProps> = ({
   const [isUserScrolling, setIsUserScrolling] = useState(false);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
-  const scrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   useEffect(() => {
     const unsubscribe = debugService.subscribe(setLogs);

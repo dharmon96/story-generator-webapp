@@ -45,7 +45,7 @@ export interface ComfyUIRenderStep {
   key: string;           // e.g., 'holocine_render', 'wan_render'
   label: string;         // Display name
   description: string;   // Help text
-  workflowType: 'holocine' | 'wan22' | 'hunyuan15' | 'cogvideox' | 'all';  // Which workflow type this step uses
+  workflowType: 'holocine' | 'wan22' | 'hunyuan15' | 'all';  // Which workflow type this step uses
   color: string;         // Theme color for the step
 }
 

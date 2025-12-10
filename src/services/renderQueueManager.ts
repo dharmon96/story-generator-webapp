@@ -33,6 +33,8 @@ class RenderQueueManager {
   private pollIntervalMs: number = 2000;  // Check for new jobs every 2 seconds
   private nodeStatus: Map<string, NodeRenderStatus> = new Map();
   private wsConnections: Map<string, WebSocket> = new Map();
+  private statusCheckInterval: NodeJS.Timeout | null = null;
+  private statusCheckIntervalMs: number = 10000;  // Check rendering jobs every 10 seconds
 
   /**
    * Start the render queue processing loop
@@ -47,8 +49,14 @@ class RenderQueueManager {
     this.isProcessing = true;
     this.pollInterval = setInterval(() => this.processQueue(), this.pollIntervalMs);
 
+    // Start status checking for rendering jobs (fallback for disconnected WebSockets)
+    this.statusCheckInterval = setInterval(() => this.checkRenderingJobsStatus(), this.statusCheckIntervalMs);
+
     // Do an immediate check
     this.processQueue();
+
+    // Also check for any jobs that might have completed while we were offline
+    this.checkRenderingJobsStatus();
   }
 
   /**
@@ -58,6 +66,10 @@ class RenderQueueManager {
     if (this.pollInterval) {
       clearInterval(this.pollInterval);
       this.pollInterval = null;
+    }
+    if (this.statusCheckInterval) {
+      clearInterval(this.statusCheckInterval);
+      this.statusCheckInterval = null;
     }
     this.isProcessing = false;
 
@@ -186,7 +198,9 @@ class RenderQueueManager {
 
       debugService.info('renderQueue', `📤 Sending workflow to ${endpoint}/prompt`, {
         jobId: job.id,
-        nodeCount: Object.keys(workflow).length
+        workflowId: assignment?.workflowId || 'legacy',
+        nodeCount: Object.keys(workflow).length,
+        positivePromptPreview: job.positivePrompt.substring(0, 100) + (job.positivePrompt.length > 100 ? '...' : '')
       });
 
       // Send to ComfyUI
@@ -206,6 +220,9 @@ class RenderQueueManager {
 
       const result = await response.json();
       const promptId = result.prompt_id;
+
+      // Store the promptId on the job for fallback status checking
+      store.updateRenderJob(job.id, { comfyPromptId: promptId });
 
       debugService.success('renderQueue', `✅ Job ${job.id} queued in ComfyUI`, {
         promptId,
@@ -229,11 +246,10 @@ class RenderQueueManager {
   private getWorkflowAssignment(job: RenderJob): ComfyUINodeAssignment | null {
     const store = useStore.getState();
     const comfySettings = store.settings.comfyUISettings;
-    if (!comfySettings?.nodeAssignments) return null;
 
     // Determine the step ID based on job type and workflow
     let stepId: string;
-    if (job.type === 'holocine_scene') {
+    if (job.type === 'holocine_scene' || job.settings.workflow === 'holocine') {
       stepId = 'holocine_render';
     } else if (job.settings.workflow === 'hunyuan15') {
       stepId = 'hunyuan_render';
@@ -241,12 +257,44 @@ class RenderQueueManager {
       stepId = 'wan_render';
     }
 
-    // Find enabled assignment for this step
-    const assignment = comfySettings.nodeAssignments.find(
-      a => a.stepId === stepId && a.enabled && a.nodeId && a.workflowId
-    );
+    // Try to find configured node assignment
+    if (comfySettings?.nodeAssignments) {
+      const assignment = comfySettings.nodeAssignments.find(
+        a => a.stepId === stepId && a.enabled && a.nodeId && a.workflowId
+      );
+      if (assignment) return assignment;
+    }
 
-    return assignment || null;
+    // If no configured assignment, create a default one based on job.settings.workflow
+    // This ensures we use the correct workflow builder even without explicit node assignment
+    const workflowId = this.getWorkflowIdFromSettings(job.settings.workflow);
+    if (workflowId) {
+      return {
+        stepId,
+        nodeId: '', // Will use first available node
+        workflowId,
+        enabled: true,
+        modelOverrides: {}
+      };
+    }
+
+    return null;
+  }
+
+  /**
+   * Map job workflow setting to ComfyUI workflow ID
+   */
+  private getWorkflowIdFromSettings(workflow: string | undefined): string | null {
+    switch (workflow) {
+      case 'holocine':
+        return 'holocine_native';
+      case 'wan22':
+        return 'wan22_14b_t2v';
+      case 'hunyuan15':
+        return 'hunyuan15_t2v';
+      default:
+        return null;
+    }
   }
 
   /**
@@ -397,9 +445,20 @@ class RenderQueueManager {
       debugService.info('renderQueue', `Job ${jobId}: ${progress.toFixed(1)}%`);
     }
 
-    // Execution complete
+    // ComfyUI signals completion with 'executing' type where node is null
+    // This is the official way to detect when a prompt has finished
+    if (data.type === 'executing' && data.data?.prompt_id === promptId && data.data?.node === null) {
+      debugService.info('renderQueue', `Job ${jobId}: Execution finished, fetching output...`);
+      this.fetchOutputAndComplete(jobId, nodeId, promptId);
+    }
+
+    // Also handle 'executed' for individual node completions (some workflows emit this)
     if (data.type === 'executed' && data.data?.prompt_id === promptId) {
-      this.handleJobComplete(jobId, nodeId, data.data);
+      // Store output data for later - the final 'executing' with null node will trigger completion
+      debugService.info('renderQueue', `Job ${jobId}: Node executed`, {
+        nodeId: data.data.node,
+        hasOutput: !!data.data.output
+      });
     }
 
     // Execution error
@@ -409,6 +468,177 @@ class RenderQueueManager {
       if (job) {
         const node = nodeDiscoveryService.getNodes().find(n => n.id === nodeId);
         this.handleJobFailure(job, node!, error);
+      }
+    }
+  }
+
+  /**
+   * Fetch output from ComfyUI history endpoint and complete the job
+   */
+  private async fetchOutputAndComplete(jobId: string, nodeId: string, promptId: string): Promise<void> {
+    const endpoint = nodeDiscoveryService.getNodeEndpoint(nodeId, 'comfyui');
+
+    if (!endpoint) {
+      debugService.error('renderQueue', `No endpoint for node ${nodeId} to fetch output`);
+      this.handleJobComplete(jobId, nodeId, {});
+      return;
+    }
+
+    try {
+      // Fetch the history for this prompt to get output files
+      const response = await fetch(`${endpoint}/history/${promptId}`);
+
+      if (!response.ok) {
+        debugService.warn('renderQueue', `Failed to fetch history for prompt ${promptId}`);
+        this.handleJobComplete(jobId, nodeId, {});
+        return;
+      }
+
+      const history = await response.json();
+      const promptHistory = history[promptId];
+
+      if (!promptHistory) {
+        debugService.warn('renderQueue', `No history found for prompt ${promptId}`);
+        this.handleJobComplete(jobId, nodeId, {});
+        return;
+      }
+
+      // Extract outputs from all nodes
+      const outputs = promptHistory.outputs || {};
+      let outputData: any = {};
+
+      // Find video or image outputs from any node
+      for (const [nodeIdKey, nodeOutput] of Object.entries(outputs) as [string, any][]) {
+        if (nodeOutput.videos?.length) {
+          outputData = { output: { videos: nodeOutput.videos } };
+          debugService.info('renderQueue', `Found video output from node ${nodeIdKey}`, {
+            filename: nodeOutput.videos[0].filename
+          });
+          break;
+        }
+        if (nodeOutput.images?.length) {
+          outputData = { output: { images: nodeOutput.images } };
+          debugService.info('renderQueue', `Found image output from node ${nodeIdKey}`, {
+            filename: nodeOutput.images[0].filename
+          });
+          break;
+        }
+        if (nodeOutput.gifs?.length) {
+          outputData = { output: { videos: nodeOutput.gifs } };
+          debugService.info('renderQueue', `Found GIF output from node ${nodeIdKey}`, {
+            filename: nodeOutput.gifs[0].filename
+          });
+          break;
+        }
+      }
+
+      this.handleJobComplete(jobId, nodeId, outputData);
+    } catch (error: any) {
+      debugService.error('renderQueue', `Error fetching output for job ${jobId}`, { error: error.message });
+      this.handleJobComplete(jobId, nodeId, {});
+    }
+  }
+
+  /**
+   * Check status of rendering jobs via ComfyUI history API
+   * This is a fallback for when WebSocket connections are lost (e.g., page refresh)
+   */
+  private async checkRenderingJobsStatus(): Promise<void> {
+    const store = useStore.getState();
+    const renderingJobs = store.renderQueue.filter(
+      j => (j.status === 'rendering' || j.status === 'assigned') && j.comfyPromptId
+    );
+
+    if (renderingJobs.length === 0) return;
+
+    // Get ComfyUI endpoint
+    const comfyNodes = nodeDiscoveryService.getComfyUICapableNodes();
+    if (comfyNodes.length === 0) return;
+
+    const endpoint = nodeDiscoveryService.getNodeEndpoint(comfyNodes[0].id, 'comfyui');
+    if (!endpoint) return;
+
+    for (const job of renderingJobs) {
+      if (!job.comfyPromptId) continue;
+
+      try {
+        const response = await fetch(`${endpoint}/history/${job.comfyPromptId}`);
+        if (!response.ok) continue;
+
+        const history = await response.json();
+        const promptHistory = history[job.comfyPromptId];
+
+        if (!promptHistory) continue;
+
+        // Check if execution completed (has outputs or status indicates completion)
+        const outputs = promptHistory.outputs || {};
+        const hasOutputs = Object.keys(outputs).length > 0;
+        const statusMsgs = promptHistory.status?.messages || [];
+        const isComplete = hasOutputs || statusMsgs.some((m: any) => m[0] === 'execution_success');
+        const hasError = statusMsgs.some((m: any) => m[0] === 'execution_error');
+
+        if (hasError) {
+          const errorMsg = statusMsgs.find((m: any) => m[0] === 'execution_error');
+          const errorText = errorMsg?.[1]?.exception_message || 'Execution failed';
+          debugService.warn('renderQueue', `Job ${job.id} failed (detected via polling)`, { error: errorText });
+
+          store.updateRenderJob(job.id, {
+            status: 'failed',
+            error: errorText,
+            completedAt: new Date()
+          });
+
+          // Release the node
+          if (job.assignedNode) {
+            this.releaseNode(job.assignedNode);
+          }
+          continue;
+        }
+
+        if (isComplete) {
+          debugService.info('renderQueue', `Job ${job.id} completed (detected via polling)`);
+
+          // Extract output data
+          let outputData: any = {};
+          for (const [, nodeOutput] of Object.entries(outputs) as [string, any][]) {
+            if (nodeOutput.videos?.length) {
+              outputData = { output: { videos: nodeOutput.videos } };
+              break;
+            }
+            if (nodeOutput.images?.length) {
+              outputData = { output: { images: nodeOutput.images } };
+              break;
+            }
+            if (nodeOutput.gifs?.length) {
+              outputData = { output: { videos: nodeOutput.gifs } };
+              break;
+            }
+          }
+
+          // Build output URL
+          let outputUrl: string | undefined;
+          if (outputData.output?.videos?.[0]) {
+            outputUrl = `${endpoint}/view?filename=${outputData.output.videos[0].filename}&type=output`;
+          } else if (outputData.output?.images?.[0]) {
+            outputUrl = `${endpoint}/view?filename=${outputData.output.images[0].filename}&type=output`;
+          }
+
+          store.updateRenderJob(job.id, {
+            status: 'completed',
+            progress: 100,
+            completedAt: new Date(),
+            outputUrl
+          });
+
+          debugService.success('renderQueue', `✅ Job ${job.id} completed via polling!`, { outputUrl });
+
+          // Release the node
+          if (job.assignedNode) {
+            this.releaseNode(job.assignedNode);
+          }
+        }
+      } catch (error) {
+        // Ignore errors - the WebSocket might handle it
       }
     }
   }

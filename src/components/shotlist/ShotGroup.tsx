@@ -42,7 +42,6 @@ import {
   PlayArrow,
   MoreVert,
   Edit,
-  ColorLens,
   DragIndicator,
   CheckCircle,
   Schedule,
@@ -114,7 +113,6 @@ const ShotGroup: React.FC<ShotGroupProps> = ({
 
   // Calculate group stats
   const stats = calculateShotlistStats(shots);
-  const totalInGroup = shots.length + childGroups.reduce((sum, cg) => sum + (cg.children?.length || 0), 0);
 
   // Handle collapse toggle
   const handleToggleCollapse = () => {

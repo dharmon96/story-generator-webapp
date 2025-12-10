@@ -36,7 +36,11 @@
       "Bash(netstat:*)",
       "Bash(ping:*)",
       "Bash(arp:*)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "Bash(tree:*)",
+      "Bash(wc:*)",
+      "Bash(xargs:*)",
+      "Bash(ls -la \"d:\\AI\\story-generator-webapp\\backend\\src\"\" 2>/dev/null || ls -la \"d:AIstory-generator-webappbackend \")"
     ],
     "deny": [],
     "ask": []

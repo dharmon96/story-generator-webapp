@@ -53,6 +53,54 @@ interface StoryDetailProps {
   onBack: () => void;
 }
 
+// Raw character data from AI (with both snake_case and camelCase variants)
+interface RawCharacter {
+  id?: string;
+  name?: string;
+  role?: string;
+  physical_description?: string;
+  physicalDescription?: string;
+  age_range?: string;
+  age?: string;
+  gender?: string;
+  clothing?: string;
+  clothing_style?: string;
+  distinctiveFeatures?: string[];
+  distinctive_features?: string[];
+  personality?: string;
+  personality_traits?: string;
+  visualPrompt?: string;
+  visual_prompt?: string;
+  importance_level?: number;
+  importanceLevel?: number;
+  screenTime?: number;
+  screen_time?: number;
+}
+
+// Raw location data from AI (with both snake_case and camelCase variants)
+interface RawLocation {
+  id?: string;
+  name?: string;
+  type?: string;
+  environment_type?: string;
+  description?: string;
+  atmosphere?: string;
+  lighting?: string;
+  lighting_style?: string;
+  timeOfDay?: string;
+  time_of_day?: string;
+  weather?: string;
+  visualStyle?: string;
+  colorPalette?: string[];
+  color_palette?: string[];
+  keyElements?: string[];
+  key_elements?: string[];
+  visualPrompt?: string;
+  visual_prompt?: string;
+  usedInShots?: string[];
+  estimatedComplexity?: string;
+}
+
 const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack }) => {
   const { queue, stories, updateStory, checkpoints, renderQueue, settings, updateQueueItem } = useStore();
   const [currentTab, setCurrentTab] = useState(0);
@@ -187,7 +235,7 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
   // Listen for AI log updates
   useEffect(() => {
     const handleLogUpdate = (event: CustomEvent) => {
-      const { storyId: logStoryId, entry } = event.detail;
+      const { storyId: logStoryId } = event.detail;
       if (logStoryId === storyId) {
         // Get formatted logs from the service
         const logs = aiLogService.getLogs(storyId);
@@ -284,7 +332,7 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
           renderUrl: shot.renderUrl || undefined,
           createdAt: new Date(),
         })) : [],
-        characters: Array.isArray(story.characters) ? story.characters.map((char: any, index) => ({
+        characters: Array.isArray(story.characters) ? story.characters.map((char: RawCharacter, index: number) => ({
           id: char?.id || `char_${char?.name || 'unknown'}_${index}`,
           name: char?.name || 'Unknown Character',
           role: (char?.role === 'main' ? 'protagonist' : (char?.role || 'supporting')) as 'protagonist' | 'antagonist' | 'supporting' | 'background',
@@ -301,7 +349,7 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
           screenTime: char?.screenTime || char?.screen_time || 0,
           createdAt: new Date(),
         })) : [],
-        locations: Array.isArray(story.locations) ? story.locations.map((loc: any, index) => ({
+        locations: Array.isArray(story.locations) ? story.locations.map((loc: RawLocation, index: number) => ({
           id: loc?.id || `loc_${loc?.name || 'unknown'}_${index}`,
           name: loc?.name || 'Unknown Location',
           type: (loc?.type || loc?.environment_type || 'interior') as 'interior' | 'exterior' | 'mixed',
@@ -414,7 +462,6 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
   }, [story?.generationMethod, queueItem?.config?.generationMethod, story?.holoCineScenes, story?.shots]);
 
   const generationMethod = getGenerationMethod(generationMethodId);
-  const isSceneBased = generationMethod?.pipelineType === 'scene-based';
   const isShotBased = generationMethod?.pipelineType === 'shot-based';
 
   // Determine if story is in manual mode

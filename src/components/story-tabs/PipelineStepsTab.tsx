@@ -72,7 +72,7 @@ const PipelineStepsTab: React.FC<PipelineStepsTabProps> = ({
   // Get the generation method to know which steps apply
   const generationMethodId = queueItem?.config?.generationMethod || story?.generationMethod || 'wan22';
   const generationMethod = GENERATION_METHODS.find(m => m.id === generationMethodId);
-  const skipSteps = generationMethod?.pipeline.skipSteps || [];
+  const skipSteps = useMemo(() => generationMethod?.pipeline.skipSteps || [], [generationMethod]);
 
   // Get step data from queue item or story
   const getStepContent = useCallback((stepId: string): any => {
@@ -280,7 +280,7 @@ const PipelineStepsTab: React.FC<PipelineStepsTabProps> = ({
         },
       });
     }
-  }, [storyId, isCustomStory, isManualMode, queueItem, updateStory, updateQueueItem]);
+  }, [storyId, isCustomStory, isManualMode, queueItem, updateStory, updateQueueItem, story]);
 
   // Regenerate step with AI
   const handleRegenerateStep = useCallback(async (stepId: string) => {

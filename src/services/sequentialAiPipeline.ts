@@ -245,7 +245,7 @@ class SequentialAiPipelineService {
 
   /**
    * Resume processing from checkpoint
-   * Returns the step to resume from, or null if no checkpoint exists
+   * Skips completed steps and restores state from partial story
    */
   async resumeFromCheckpoint(
     queueItem: QueueItem,
@@ -267,11 +267,8 @@ class SequentialAiPipelineService {
     // Increment resume count
     useStore.getState().incrementResumeCount(queueItem.id);
 
-    // Process with resume flag
-    // The processQueueItem will need to check for checkpoint and skip completed steps
-    // For now, we'll just restart - full resume implementation would require significant refactoring
-    // TODO: Implement true step-skipping based on checkpoint.completedSteps
-    return this.processQueueItem(queueItem, modelConfigs, onProgress);
+    // Process with resume flag - pass completed steps to skip
+    return this.processQueueItem(queueItem, modelConfigs, onProgress, checkpoint.completedSteps);
   }
 
   /**
@@ -319,7 +316,7 @@ class SequentialAiPipelineService {
     debugService.warn('pipeline', '🛑 Stopping all processing');
     
     // Abort all controllers
-    for (const [storyId, abortController] of Array.from(this.abortControllers.entries())) {
+    for (const [, abortController] of Array.from(this.abortControllers.entries())) {
       abortController.abort('All processing stopped by user');
     }
     this.abortControllers.clear();
@@ -334,7 +331,8 @@ class SequentialAiPipelineService {
   async processQueueItem(
     queueItem: QueueItem,
     modelConfigs: ModelConfig[],
-    onProgress?: (progress: SequentialProgress) => void
+    onProgress?: (progress: SequentialProgress) => void,
+    skipCompletedSteps: string[] = []  // Steps to skip when resuming from checkpoint
   ): Promise<Story> {
     // Set model configs in nodeQueueManager
     nodeQueueManager.setModelConfigs(modelConfigs);
@@ -424,8 +422,8 @@ class SequentialAiPipelineService {
           }
         ];
       } else {
-        // Shot-Based Pipeline (Wan 2.2, Kling, CogVideoX)
-        debugService.info('pipeline', '🎥 Using SHOT-BASED pipeline (Wan/Kling)');
+        // Shot-Based Pipeline (Wan 2.2, Kling, Hunyuan)
+        debugService.info('pipeline', '🎥 Using SHOT-BASED pipeline (Wan/Kling/Hunyuan)');
         steps = [
           {
             id: 'story',
@@ -490,14 +488,69 @@ class SequentialAiPipelineService {
       let partialStory: Story | null = null;
       const completedSteps = new Set<string>(); // Track completed steps for dependency validation
 
+      // If resuming, restore state from partial story and mark completed steps
+      if (skipCompletedSteps.length > 0) {
+        debugService.info('pipeline', `🔄 Resuming with ${skipCompletedSteps.length} completed steps to skip: [${skipCompletedSteps.join(', ')}]`);
+
+        // Load partial story to restore state
+        const existingStory = storyDataManager.getPartialStory(queueItem.id);
+        if (existingStory) {
+          partialStory = existingStory;
+          debugService.info('pipeline', `📦 Restored partial story data:`, {
+            hasContent: !!existingStory.content,
+            hasStoryParts: !!existingStory.storyParts?.length,
+            shotsCount: existingStory.shots?.length || 0,
+            charactersCount: existingStory.characters?.length || 0,
+            locationsCount: existingStory.locations?.length || 0
+          });
+
+          // Restore state from partial story
+          if (existingStory.content) {
+            story = {
+              title: existingStory.title,
+              content: existingStory.content,
+              genre: existingStory.genre
+            };
+          }
+          if (existingStory.storyParts?.length) {
+            storyParts = existingStory.storyParts.map((p: any) => ({
+              part_number: p.partNumber,
+              title: p.title,
+              content: p.content,
+              narrative_purpose: p.narrativePurpose,
+              duration_estimate: p.durationEstimate
+            }));
+          }
+          if (existingStory.shots?.length) {
+            shots = existingStory.shots;
+          }
+          if (existingStory.characters?.length) {
+            characters = existingStory.characters;
+          }
+          if (existingStory.locations?.length) {
+            locations = existingStory.locations;
+          }
+        }
+
+        // Mark skipped steps as completed for dependency validation
+        skipCompletedSteps.forEach(stepId => completedSteps.add(stepId));
+      }
+
       // Process each step sequentially with dependency validation
       for (let i = 0; i < activeSteps.length; i++) {
         const step = activeSteps[i];
         const overallProgress = Math.round((i / activeSteps.length) * 100);
-        
+
         // Check for abort signal before each step
         if (abortController.signal.aborted) {
           throw new Error('Processing aborted by user');
+        }
+
+        // Skip completed steps when resuming
+        if (skipCompletedSteps.includes(step.id)) {
+          debugService.info('pipeline', `⏭️ Skipping completed step '${step.id}' (${step.name})`);
+          this.addLog(progress, step.id, 'info', `Skipped (already completed): ${step.name}`);
+          continue;
         }
 
         // Validate dependencies before proceeding
@@ -508,7 +561,7 @@ class SequentialAiPipelineService {
           }
           debugService.info('pipeline', `✅ Dependencies satisfied for step '${step.id}': [${step.dependencies.join(', ')}]`);
         }
-        
+
         this.updateProgress(progress, step.id, step.name, overallProgress, 0);
 
         const nodeInfo = this.getNextAvailableNode(modelConfigs, step.id, queueItem.id);
@@ -1200,7 +1253,7 @@ class SequentialAiPipelineService {
     });
 
     return new Promise((resolve, reject) => {
-      const taskId = nodeQueueManager.addTask(
+      nodeQueueManager.addTask(
         {
           type: 'story',
           priority: 10,
@@ -1283,7 +1336,7 @@ class SequentialAiPipelineService {
     });
 
     return new Promise((resolve, reject) => {
-      const taskId = nodeQueueManager.addTask(
+      nodeQueueManager.addTask(
         {
           type: 'shot',
           priority: 8,
@@ -1340,7 +1393,7 @@ class SequentialAiPipelineService {
     });
 
     return new Promise((resolve, reject) => {
-      const taskId = nodeQueueManager.addTask(
+      nodeQueueManager.addTask(
         {
           type: 'character',
           priority: 8,
@@ -1510,7 +1563,7 @@ class SequentialAiPipelineService {
       if (!nodeInfo) throw new Error('No node available for narration generation');
 
       return new Promise((resolve, reject) => {
-        const taskId = nodeQueueManager.addTask(
+        nodeQueueManager.addTask(
           {
             type: 'narration',
             priority: 3,
@@ -1588,7 +1641,7 @@ class SequentialAiPipelineService {
       if (!nodeInfo) throw new Error('No node available for music generation');
 
       return new Promise((resolve, reject) => {
-        const taskId = nodeQueueManager.addTask(
+        nodeQueueManager.addTask(
           {
             type: 'music',
             priority: 3,
@@ -1624,7 +1677,7 @@ class SequentialAiPipelineService {
     });
 
     return new Promise((resolve, reject) => {
-      const taskId = nodeQueueManager.addTask(
+      nodeQueueManager.addTask(
         {
           type: 'segment',
           priority: 8,
@@ -1776,10 +1829,12 @@ class SequentialAiPipelineService {
       const part = storyParts[partIndex];
 
       if (shots.length > 0) {
+        // Capture current shot number for this iteration to avoid closure warning
+        const startingShotNumber = currentShotNumber;
         const adjustedShots = shots.map((shot, index) => ({
           ...shot,
-          shot_number: currentShotNumber + index,
-          shotNumber: currentShotNumber + index,
+          shot_number: startingShotNumber + index,
+          shotNumber: startingShotNumber + index,
           part_number: part.part_number,
           partNumber: part.part_number,
           part_title: part.title,

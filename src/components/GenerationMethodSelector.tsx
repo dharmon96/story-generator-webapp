@@ -11,12 +11,9 @@ import {
 import {
   CheckCircle,
   AccessTime,
-  Movie,
-  Videocam,
 } from '@mui/icons-material';
 import {
   GenerationMethodId,
-  GenerationMethod,
   GENERATION_METHODS,
 } from '../types/generationMethods';
 
@@ -36,18 +33,6 @@ const GenerationMethodSelector: React.FC<GenerationMethodSelectorProps> = ({
   disabled = false,
 }) => {
   const theme = useTheme();
-
-  const getMethodIcon = (method: GenerationMethod) => {
-    // Return appropriate icon based on method
-    switch (method.id) {
-      case 'holocine':
-        return <Movie sx={{ fontSize: 40 }} />;
-      case 'wan22':
-        return <Videocam sx={{ fontSize: 40 }} />;
-      default:
-        return <Videocam sx={{ fontSize: 40 }} />;
-    }
-  };
 
   return (
     <Box sx={{ mb: 3 }}>

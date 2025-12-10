@@ -1,0 +1,293 @@
+{
+  "6": {
+    "inputs": {
+      "text": "[global caption] The scene features two main characters: [character1], a woman with light brown hair tied in a ponytail, wearing a pink striped tank top; and [character2], a young girl with short brown hair, wearing a white long-sleeve shirt with colorful patterns. They are in a dimly lit, confined room, possibly a bedroom, with a wall adorned with children's drawings and a patterned pillow. This scene contains 6 shots. [per shot caption] Medium shot of [character1] and [character2] sitting, with [character2] speaking and [character1] listening and then smiling at her. [shot cut] Close-up shot of [character2] holding a remote control and intently watching something off-screen. [shot cut] Close-up shot of a television screen displaying a colorful animated cartoon. [shot cut] Close-up shot of [character2]'s face, reacting to the cartoon with an open mouth. [shot cut] Medium shot of [character1] and [character2] sitting, with [character1] looking forward and then down with a somber expression. [shot cut] Close-up shot of [character1]'s face, looking around with a tired expression and then closing her eyes.",
+      "clip": [
+        "38",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "7": {
+    "inputs": {
+      "text": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+      "clip": [
+        "38",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Prompt)"
+    }
+  },
+  "8": {
+    "inputs": {
+      "samples": [
+        "114",
+        0
+      ],
+      "vae": [
+        "39",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE Decode"
+    }
+  },
+  "38": {
+    "inputs": {
+      "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "type": "wan",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "39": {
+    "inputs": {
+      "vae_name": "wan2.2_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "59": {
+    "inputs": {
+      "width": 848,
+      "height": 480,
+      "length": 77,
+      "batch_size": 1
+    },
+    "class_type": "EmptyHunyuanLatentVideo",
+    "_meta": {
+      "title": "Empty HunyuanVideo 1.0 Latent"
+    }
+  },
+  "63": {
+    "inputs": {
+      "frame_rate": 16,
+      "loop_count": 0,
+      "filename_prefix": "wan2.2",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 19,
+      "save_metadata": true,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": false,
+      "images": [
+        "184",
+        0
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Video Combine 🎥🅥🅗🅢"
+    }
+  },
+  "113": {
+    "inputs": {
+      "add_noise": "enable",
+      "noise_seed": 28505730756643,
+      "steps": [
+        "119",
+        0
+      ],
+      "cfg": 3.5,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": 0,
+      "end_at_step": [
+        "120",
+        0
+      ],
+      "return_with_leftover_noise": "enable",
+      "model": [
+        "154",
+        0
+      ],
+      "positive": [
+        "6",
+        0
+      ],
+      "negative": [
+        "7",
+        0
+      ],
+      "latent_image": [
+        "59",
+        0
+      ]
+    },
+    "class_type": "KSamplerAdvanced",
+    "_meta": {
+      "title": "KSampler (Advanced)"
+    }
+  },
+  "114": {
+    "inputs": {
+      "add_noise": "disable",
+      "noise_seed": 792548457729348,
+      "steps": [
+        "119",
+        0
+      ],
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "start_at_step": [
+        "120",
+        0
+      ],
+      "end_at_step": 10000,
+      "return_with_leftover_noise": "disable",
+      "model": [
+        "155",
+        0
+      ],
+      "positive": [
+        "6",
+        0
+      ],
+      "negative": [
+        "7",
+        0
+      ],
+      "latent_image": [
+        "113",
+        0
+      ]
+    },
+    "class_type": "KSamplerAdvanced",
+    "_meta": {
+      "title": "KSampler (Advanced)"
+    }
+  },
+  "119": {
+    "inputs": {
+      "value": 7
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "INT Constant"
+    }
+  },
+  "120": {
+    "inputs": {
+      "value": 3
+    },
+    "class_type": "INTConstant",
+    "_meta": {
+      "title": "INT Constant"
+    }
+  },
+  "123": {
+    "inputs": {
+      "anything": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "easy cleanGpuUsed",
+    "_meta": {
+      "title": "Clean VRAM Used"
+    }
+  },
+  "124": {
+    "inputs": {
+      "anything": [
+        "113",
+        0
+      ]
+    },
+    "class_type": "easy cleanGpuUsed",
+    "_meta": {
+      "title": "Clean VRAM Used"
+    }
+  },
+  "152": {
+    "inputs": {
+      "unet_name": "Wan2_2-T2V-A14B-HIGH-HoloCine-full_fp8_e4m3fn_scaled_KJ.safetensors",
+      "weight_dtype": "fp8_e4m3fn"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "153": {
+    "inputs": {
+      "unet_name": "Wan2_2-T2V-A14B-LOW-HoloCine-full_fp8_e4m3fn_scaled_KJ.safetensors",
+      "weight_dtype": "fp8_e4m3fn"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "154": {
+    "inputs": {
+      "shift": 6.000000000000001,
+      "model": [
+        "152",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingSD3",
+    "_meta": {
+      "title": "ModelSamplingSD3"
+    }
+  },
+  "155": {
+    "inputs": {
+      "shift": 6.000000000000001,
+      "model": [
+        "156",
+        0
+      ]
+    },
+    "class_type": "ModelSamplingSD3",
+    "_meta": {
+      "title": "ModelSamplingSD3"
+    }
+  },
+  "156": {
+    "inputs": {
+      "lora_name": "lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors",
+      "strength_model": 1,
+      "model": [
+        "153",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoraLoaderModelOnly"
+    }
+  },
+  "184": {
+    "inputs": {
+      "sharpen_radius": 1,
+      "sigma": 0.4,
+      "alpha": 0.5,
+      "image": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "ImageSharpen",
+    "_meta": {
+      "title": "ImageSharpen"
+    }
+  }
+}

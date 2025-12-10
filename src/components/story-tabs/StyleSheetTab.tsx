@@ -45,8 +45,6 @@ import {
   HourglassEmpty,
   Add as AddIcon,
   AutoAwesome as GenerateIcon,
-  AutoFixHigh as EnhanceIcon,
-  Delete as DeleteIcon,
 } from '@mui/icons-material';
 import { EnhancedCharacter, Location } from '../../types/storyTypes';
 import { manualModeAiService } from '../../services/manualModeAiService';

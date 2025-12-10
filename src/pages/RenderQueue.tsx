@@ -13,7 +13,6 @@ import {
   Button,
   IconButton,
   Chip,
-  LinearProgress,
   Table,
   TableBody,
   TableCell,
@@ -59,7 +58,6 @@ const MODEL_COLORS: Record<string, { bg: string; text: string }> = {
   holocine: { bg: '#7c4dff', text: 'white' },
   wan22: { bg: '#00bcd4', text: 'white' },
   hunyuan15: { bg: '#ff5722', text: 'white' },
-  cogvideox: { bg: '#4caf50', text: 'white' },
 };
 
 // Type colors
@@ -173,7 +171,6 @@ const RenderQueue: React.FC = () => {
     const displayName = workflow === 'holocine' ? 'HoloCine'
       : workflow === 'wan22' ? 'Wan 2.2'
       : workflow === 'hunyuan15' ? 'Hunyuan 1.5'
-      : workflow === 'cogvideox' ? 'CogVideoX'
       : workflow;
 
     return (
@@ -348,7 +345,7 @@ const RenderQueue: React.FC = () => {
         </Grid>
 
         <Grid size={{ xs: 6, md: 2 }}>
-          <Card sx={{ bgcolor: 'primary.50' }}>
+          <Card sx={{ bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(25, 118, 210, 0.1)' : 'primary.50' }}>
             <CardContent sx={{ textAlign: 'center', py: 2 }}>
               <Typography variant="h4" fontWeight="bold" color="primary.main">
                 {queueStats.rendering}
@@ -361,7 +358,7 @@ const RenderQueue: React.FC = () => {
         </Grid>
 
         <Grid size={{ xs: 6, md: 2 }}>
-          <Card sx={{ bgcolor: 'success.50' }}>
+          <Card sx={{ bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(46, 125, 50, 0.1)' : 'success.50' }}>
             <CardContent sx={{ textAlign: 'center', py: 2 }}>
               <Typography variant="h4" fontWeight="bold" color="success.main">
                 {queueStats.completed}
@@ -374,7 +371,7 @@ const RenderQueue: React.FC = () => {
         </Grid>
 
         <Grid size={{ xs: 6, md: 2 }}>
-          <Card sx={{ bgcolor: 'error.50' }}>
+          <Card sx={{ bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(211, 47, 47, 0.1)' : 'error.50' }}>
             <CardContent sx={{ textAlign: 'center', py: 2 }}>
               <Typography variant="h4" fontWeight="bold" color="error.main">
                 {queueStats.failed}
@@ -387,7 +384,7 @@ const RenderQueue: React.FC = () => {
         </Grid>
 
         <Grid size={{ xs: 12, md: 4 }}>
-          <Card sx={{ bgcolor: 'info.50' }}>
+          <Card sx={{ bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(2, 136, 209, 0.1)' : 'info.50' }}>
             <CardContent sx={{ textAlign: 'center', py: 2 }}>
               <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 1 }}>
                 <Typography variant="h4" fontWeight="bold" color="info.main">
@@ -451,8 +448,9 @@ const RenderQueue: React.FC = () => {
         <TableContainer component={Paper}>
           <Table>
             <TableHead>
-              <TableRow sx={{ bgcolor: 'grey.100' }}>
+              <TableRow sx={{ bgcolor: 'action.hover' }}>
                 <TableCell width={40}></TableCell>
+                <TableCell width={100} sx={{ fontWeight: 'bold', color: 'text.primary' }}>Preview</TableCell>
                 <TableCell sx={{ fontWeight: 'bold', color: 'text.primary' }}>Job</TableCell>
                 <TableCell sx={{ fontWeight: 'bold', color: 'text.primary' }}>Type / Model</TableCell>
                 <TableCell sx={{ fontWeight: 'bold', color: 'text.primary' }}>Settings</TableCell>
@@ -469,8 +467,8 @@ const RenderQueue: React.FC = () => {
                     <TableRow
                       sx={{
                         '&:hover': { bgcolor: 'action.hover' },
-                        ...(job.status === 'failed' && { bgcolor: 'error.50' }),
-                        ...(job.status === 'rendering' && { bgcolor: 'primary.50' }),
+                        ...(job.status === 'failed' && { bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(211, 47, 47, 0.1)' : 'error.50' }),
+                        ...(job.status === 'rendering' && { bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(25, 118, 210, 0.1)' : 'primary.50' }),
                       }}
                     >
                       <TableCell>
@@ -480,6 +478,84 @@ const RenderQueue: React.FC = () => {
                         >
                           {expandedJobs.has(job.id) ? <ExpandLess /> : <ExpandMore />}
                         </IconButton>
+                      </TableCell>
+                      {/* Preview Thumbnail Cell */}
+                      <TableCell>
+                        <Box
+                          sx={{
+                            width: 80,
+                            height: 45,
+                            borderRadius: 1,
+                            overflow: 'hidden',
+                            cursor: job.outputUrl ? 'pointer' : 'default',
+                            bgcolor: job.status === 'completed' ? 'transparent' : 'action.disabledBackground',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            border: '1px solid',
+                            borderColor: 'divider',
+                            position: 'relative',
+                          }}
+                          onClick={() => job.outputUrl && setPreviewUrl(job.outputUrl)}
+                        >
+                          {job.status === 'completed' && job.outputUrl ? (
+                            // Completed - show video thumbnail
+                            <video
+                              src={job.outputUrl}
+                              style={{ width: '100%', height: '100%', objectFit: 'cover' }}
+                              muted
+                            />
+                          ) : job.status === 'rendering' || job.status === 'assigned' ? (
+                            // Rendering - show animated indicator
+                            <Box
+                              sx={{
+                                width: '100%',
+                                height: '100%',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                background: 'linear-gradient(135deg, #1976d2 0%, #42a5f5 50%, #1976d2 100%)',
+                                backgroundSize: '200% 200%',
+                                animation: 'renderingGradient 2s ease infinite',
+                                '@keyframes renderingGradient': {
+                                  '0%': { backgroundPosition: '0% 50%' },
+                                  '50%': { backgroundPosition: '100% 50%' },
+                                  '100%': { backgroundPosition: '0% 50%' },
+                                },
+                              }}
+                            >
+                              <Movie sx={{ color: 'white', fontSize: 24 }} />
+                            </Box>
+                          ) : job.status === 'failed' ? (
+                            // Failed - show error indicator
+                            <Box
+                              sx={{
+                                width: '100%',
+                                height: '100%',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                bgcolor: 'error.dark',
+                              }}
+                            >
+                              <ErrorIcon sx={{ color: 'white', fontSize: 24 }} />
+                            </Box>
+                          ) : (
+                            // Queued - show pending indicator
+                            <Box
+                              sx={{
+                                width: '100%',
+                                height: '100%',
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                bgcolor: 'action.disabledBackground',
+                              }}
+                            >
+                              <Schedule sx={{ color: 'text.disabled', fontSize: 24 }} />
+                            </Box>
+                          )}
+                        </Box>
                       </TableCell>
                       <TableCell>
                         <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -515,18 +591,6 @@ const RenderQueue: React.FC = () => {
                       <TableCell>
                         <Box>
                           {getStatusChip(job.status)}
-                          {(job.status === 'rendering' || job.status === 'assigned') && (
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mt: 1 }}>
-                              <LinearProgress
-                                variant="determinate"
-                                value={job.progress}
-                                sx={{ flex: 1, minWidth: 60 }}
-                              />
-                              <Typography variant="caption" sx={{ minWidth: 35 }}>
-                                {job.progress.toFixed(0)}%
-                              </Typography>
-                            </Box>
-                          )}
                           {job.status === 'failed' && (
                             <Typography variant="caption" color="error.main" sx={{ display: 'block', mt: 0.5 }}>
                               Attempt {job.attempts}/{job.maxAttempts}
@@ -598,9 +662,9 @@ const RenderQueue: React.FC = () => {
 
                     {/* Expanded details */}
                     <TableRow>
-                      <TableCell colSpan={7} sx={{ p: 0, borderBottom: 0 }}>
+                      <TableCell colSpan={8} sx={{ p: 0, borderBottom: 0 }}>
                         <Collapse in={expandedJobs.has(job.id)} timeout="auto" unmountOnExit>
-                          <Box sx={{ p: 2, bgcolor: 'grey.50' }}>
+                          <Box sx={{ p: 2, bgcolor: 'action.hover' }}>
                             <Grid container spacing={2}>
                               <Grid size={{ xs: 12, md: 5 }}>
                                 <Typography variant="caption" color="text.secondary" fontWeight="bold">
@@ -616,7 +680,7 @@ const RenderQueue: React.FC = () => {
                                 <Typography variant="caption" color="text.secondary" fontWeight="bold">
                                   Negative Prompt:
                                 </Typography>
-                                <Paper sx={{ p: 1, mt: 0.5, maxHeight: 100, overflow: 'auto', bgcolor: 'error.50' }}>
+                                <Paper sx={{ p: 1, mt: 0.5, maxHeight: 100, overflow: 'auto', bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(211, 47, 47, 0.1)' : 'error.50' }}>
                                   <Typography variant="body2" sx={{ fontSize: '0.75rem', fontFamily: 'monospace' }}>
                                     {job.negativePrompt ? (
                                       <>
@@ -650,7 +714,7 @@ const RenderQueue: React.FC = () => {
                                     <Typography variant="caption" color="error.main" fontWeight="bold">
                                       Error:
                                     </Typography>
-                                    <Paper sx={{ p: 1, mt: 0.5, bgcolor: 'error.50' }}>
+                                    <Paper sx={{ p: 1, mt: 0.5, bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(211, 47, 47, 0.1)' : 'error.50' }}>
                                       <Typography variant="body2" sx={{ fontSize: '0.75rem' }} color="error">
                                         {job.error}
                                       </Typography>
@@ -662,7 +726,7 @@ const RenderQueue: React.FC = () => {
                                     <Typography variant="caption" color="success.main" fontWeight="bold">
                                       Output:
                                     </Typography>
-                                    <Paper sx={{ p: 1, mt: 0.5, bgcolor: 'success.50' }}>
+                                    <Paper sx={{ p: 1, mt: 0.5, bgcolor: (theme) => theme.palette.mode === 'dark' ? 'rgba(46, 125, 50, 0.1)' : 'success.50' }}>
                                       <Typography variant="body2" sx={{ fontSize: '0.75rem' }} noWrap>
                                         {job.outputUrl}
                                       </Typography>

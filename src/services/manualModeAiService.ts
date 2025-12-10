@@ -104,41 +104,58 @@ class ManualModeAiService {
 
   /**
    * Get the best available node and model for a specific step
+   * Priority order:
+   * 1. ui_ai step config (for all manual mode/UI AI operations)
+   * 2. Specific step config (if provided)
+   * 3. Any enabled config (fallback)
    */
   private getNodeAndModel(step: string = 'story'): { node: any; model: string } | null {
     // Access store to get model configs
     const state = useStore.getState();
     const modelConfigs = state.settings?.modelConfigs || [];
 
-    // Find an enabled config for this step
-    const stepConfig = modelConfigs.find(
-      (config: ModelConfig) => config.enabled && config.step === step
+    // First priority: Check for ui_ai step config (dedicated UI AI model)
+    const uiAiConfig = modelConfigs.find(
+      (config: ModelConfig) => config.enabled && config.step === 'ui_ai' && config.model
     );
 
-    if (!stepConfig) {
-      // Fall back to any enabled config
-      const anyConfig = modelConfigs.find((config: ModelConfig) => config.enabled);
-      if (!anyConfig) {
-        debugService.error('manual-ai', 'No enabled model configurations found');
-        return null;
+    if (uiAiConfig) {
+      const node = nodeDiscoveryService.getNode(uiAiConfig.nodeId);
+      if (node && node.status === 'online') {
+        debugService.info('manual-ai', `Using UI AI model: ${uiAiConfig.model} on ${node.name}`);
+        return { node, model: uiAiConfig.model };
       }
-
-      const node = nodeDiscoveryService.getNode(anyConfig.nodeId);
-      if (!node || node.status !== 'online') {
-        debugService.error('manual-ai', `Node ${anyConfig.nodeId} is not available`);
-        return null;
-      }
-
-      return { node, model: anyConfig.model };
     }
 
-    const node = nodeDiscoveryService.getNode(stepConfig.nodeId);
-    if (!node || node.status !== 'online') {
-      debugService.error('manual-ai', `Node ${stepConfig.nodeId} is not available`);
+    // Second priority: Find an enabled config for the specific step
+    const stepConfig = modelConfigs.find(
+      (config: ModelConfig) => config.enabled && config.step === step && config.model
+    );
+
+    if (stepConfig) {
+      const node = nodeDiscoveryService.getNode(stepConfig.nodeId);
+      if (node && node.status === 'online') {
+        return { node, model: stepConfig.model };
+      }
+    }
+
+    // Fallback: Any enabled config with a model
+    const anyConfig = modelConfigs.find(
+      (config: ModelConfig) => config.enabled && config.model
+    );
+
+    if (!anyConfig) {
+      debugService.error('manual-ai', 'No enabled model configurations found');
       return null;
     }
 
-    return { node, model: stepConfig.model };
+    const node = nodeDiscoveryService.getNode(anyConfig.nodeId);
+    if (!node || node.status !== 'online') {
+      debugService.error('manual-ai', `Node ${anyConfig.nodeId} is not available`);
+      return null;
+    }
+
+    return { node, model: anyConfig.model };
   }
 
   /**
@@ -416,6 +433,217 @@ class ManualModeAiService {
    */
   getSystemPrompts(): Record<string, string> {
     return { ...MANUAL_MODE_PROMPTS };
+  }
+
+  /**
+   * Enhance any text field with AI - robust and dynamic
+   * Automatically determines the best enhancement strategy based on field type and content
+   */
+  async enhanceField(
+    currentValue: string,
+    fieldType: 'positivePrompt' | 'negativePrompt' | 'globalCaption' | 'shotCaption' | 'description' | 'visualStyle' | 'title' | 'story' | 'character' | 'location',
+    context?: {
+      workflowType?: 'shot' | 'scene';
+      generationMethod?: string;
+      storyContent?: string;
+      characters?: string[];
+      style?: string;
+      existingPrompts?: string[];
+    }
+  ): Promise<AIGenerationResult> {
+    // Build dynamic system prompt based on field type
+    const systemPrompts: Record<string, string> = {
+      positivePrompt: `You are an expert video prompt engineer. Enhance the given prompt to be more detailed, cinematic, and effective for AI video generation.
+
+IMPORTANT GUIDELINES:
+- Maintain the core subject and action from the original
+- Add vivid visual details: lighting, atmosphere, camera angle, color palette
+- Use comma-separated descriptive tags/keywords
+- Keep it focused and coherent - don't add unrelated elements
+- Optimize for video AI generation (motion, dynamics, temporal consistency)
+- Output only the enhanced prompt, no explanations`,
+
+      negativePrompt: `You are an expert at crafting negative prompts for AI video generation. Enhance the given negative prompt to better exclude unwanted elements.
+
+IMPORTANT GUIDELINES:
+- Keep existing exclusions that make sense
+- Add common quality issues: blur, artifacts, distortion
+- Add common composition issues: watermark, text, borders
+- Add anatomical issues if characters are involved: bad hands, extra limbs
+- Keep it concise - too many negatives can hurt generation
+- Output only the enhanced negative prompt, no explanations`,
+
+      globalCaption: `You are an expert in multi-shot video prompting (HoloCine format). Enhance the global caption to better describe the overall scene.
+
+IMPORTANT GUIDELINES:
+- The global caption describes what's consistent across all shots in the scene
+- Include: setting, atmosphere, lighting, time of day, main subjects
+- Reference characters using [character1], [character2] format if present
+- Be descriptive but not overly long - this sets the scene
+- Output only the enhanced global caption, no explanations`,
+
+      shotCaption: `You are an expert in multi-shot video prompting. Enhance this individual shot caption within a scene.
+
+IMPORTANT GUIDELINES:
+- Focus on what happens in THIS specific shot/cut
+- Include: action, camera angle, composition, movement
+- Be concise but descriptive
+- Keep character references consistent
+- Output only the enhanced shot caption, no explanations`,
+
+      description: `You are a creative writer. Enhance this description with more vivid, visual details.
+
+IMPORTANT GUIDELINES:
+- Maintain the core meaning and intent
+- Add sensory details: visual, atmospheric
+- Make it more engaging and cinematic
+- Keep the same general length/style
+- Output only the enhanced description, no explanations`,
+
+      visualStyle: `You are a visual art director. Enhance this visual style description to be more specific and implementable.
+
+IMPORTANT GUIDELINES:
+- Specify art style, color palette, mood
+- Include lighting and atmosphere preferences
+- Reference specific visual techniques or aesthetics
+- Make it actionable for AI generation
+- Output only the enhanced style description, no explanations`,
+
+      title: MANUAL_MODE_PROMPTS.generateTitle,
+      story: MANUAL_MODE_PROMPTS.enhanceStory,
+      character: MANUAL_MODE_PROMPTS.enhanceCharacter,
+      location: MANUAL_MODE_PROMPTS.enhanceLocation,
+    };
+
+    const systemPrompt = systemPrompts[fieldType] || systemPrompts.description;
+
+    // Build user prompt with context
+    let userPrompt = `Enhance this ${fieldType.replace(/([A-Z])/g, ' $1').toLowerCase()}:\n\n"${currentValue}"`;
+
+    if (context?.storyContent) {
+      userPrompt += `\n\nStory context (for reference):\n${context.storyContent.slice(0, 500)}...`;
+    }
+
+    if (context?.characters?.length) {
+      userPrompt += `\n\nCharacters in scene: ${context.characters.join(', ')}`;
+    }
+
+    if (context?.style) {
+      userPrompt += `\n\nVisual style: ${context.style}`;
+    }
+
+    if (context?.generationMethod) {
+      userPrompt += `\n\nTarget generation method: ${context.generationMethod}`;
+    }
+
+    return this.generateText({
+      prompt: userPrompt,
+      systemPrompt,
+      step: fieldType === 'positivePrompt' || fieldType === 'negativePrompt' || fieldType === 'globalCaption' || fieldType === 'shotCaption'
+        ? 'prompts'
+        : fieldType === 'character' || fieldType === 'location'
+        ? 'characters'
+        : 'story',
+    });
+  }
+
+  /**
+   * Generate a prompt from scratch based on field type and context
+   */
+  async generateField(
+    fieldType: 'positivePrompt' | 'negativePrompt' | 'globalCaption' | 'shotCaption' | 'description' | 'visualStyle' | 'title',
+    context?: {
+      workflowType?: 'shot' | 'scene';
+      generationMethod?: string;
+      storyContent?: string;
+      characters?: string[];
+      style?: string;
+      shotDescription?: string;
+      placeholder?: string;
+    }
+  ): Promise<AIGenerationResult> {
+    const systemPrompts: Record<string, string> = {
+      positivePrompt: `You are an expert video prompt engineer. Generate a detailed, cinematic prompt for AI video generation.
+
+IMPORTANT GUIDELINES:
+- Create vivid, visual descriptions
+- Include: subject, action, setting, lighting, atmosphere, camera angle
+- Use comma-separated descriptive tags/keywords
+- Optimize for video AI generation
+- Output only the prompt, no explanations`,
+
+      negativePrompt: `You are an expert at crafting negative prompts for AI video generation. Generate an effective negative prompt.
+
+COMMON ELEMENTS TO INCLUDE:
+- Quality issues: blurry, low quality, jpeg artifacts, pixelated
+- Technical issues: watermark, text, logo, borders, frame
+- Style issues: cartoon, anime (if going for realism), or vice versa
+- Common errors: bad anatomy, extra limbs, deformed
+Output only the negative prompt, no explanations`,
+
+      globalCaption: `You are an expert in multi-shot video prompting (HoloCine format). Generate a global caption for a scene.
+
+INCLUDE:
+- Setting and environment
+- Time of day and lighting
+- Atmosphere and mood
+- Main subjects/characters
+Use [character1], [character2] for character references.
+Output only the global caption, no explanations`,
+
+      shotCaption: `You are an expert in multi-shot video prompting. Generate a shot caption for a specific cut within a scene.
+
+INCLUDE:
+- Specific action happening in this shot
+- Camera angle and composition
+- Movement and dynamics
+Keep it focused on this specific moment.
+Output only the shot caption, no explanations`,
+
+      description: `You are a creative writer. Generate a vivid, visual description.
+Output only the description, no explanations`,
+
+      visualStyle: `You are a visual art director. Generate a visual style guide.
+Include: art style, color palette, mood, lighting, atmosphere
+Output only the style description, no explanations`,
+
+      title: MANUAL_MODE_PROMPTS.generateTitle,
+    };
+
+    const systemPrompt = systemPrompts[fieldType] || systemPrompts.description;
+
+    // Build user prompt with context
+    let userPrompt = `Generate a ${fieldType.replace(/([A-Z])/g, ' $1').toLowerCase()}`;
+
+    if (context?.placeholder) {
+      userPrompt += ` based on: "${context.placeholder}"`;
+    }
+
+    if (context?.shotDescription) {
+      userPrompt += `\n\nShot/Scene description: ${context.shotDescription}`;
+    }
+
+    if (context?.storyContent) {
+      userPrompt += `\n\nStory context:\n${context.storyContent.slice(0, 500)}...`;
+    }
+
+    if (context?.characters?.length) {
+      userPrompt += `\n\nCharacters: ${context.characters.join(', ')}`;
+    }
+
+    if (context?.style) {
+      userPrompt += `\n\nVisual style: ${context.style}`;
+    }
+
+    if (context?.generationMethod) {
+      userPrompt += `\n\nTarget generation method: ${context.generationMethod}`;
+    }
+
+    return this.generateText({
+      prompt: userPrompt,
+      systemPrompt,
+      step: 'prompts',
+    });
   }
 }
 
