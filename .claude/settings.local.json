@@ -40,7 +40,9 @@
       "Bash(tree:*)",
       "Bash(wc:*)",
       "Bash(xargs:*)",
-      "Bash(ls -la \"d:\\AI\\story-generator-webapp\\backend\\src\"\" 2>/dev/null || ls -la \"d:AIstory-generator-webappbackend \")"
+      "Bash(ls -la \"d:\\AI\\story-generator-webapp\\backend\\src\"\" 2>/dev/null || ls -la \"d:AIstory-generator-webappbackend \")",
+      "Bash(npm run build:check:*)",
+      "Bash(npx tsc --noEmit)"
     ],
     "deny": [],
     "ask": []

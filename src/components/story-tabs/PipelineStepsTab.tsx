@@ -62,7 +62,7 @@ const PipelineStepsTab: React.FC<PipelineStepsTabProps> = ({
   isManualMode,
   onConvertToManual,
 }) => {
-  const { stories, updateStory, updateQueueItem, settings } = useStore();
+  const { stories, updateStory, updateQueueItem, getModelConfigsFromAssignments } = useStore();
   const story = stories.find(s => s.id === storyId);
 
   const [regeneratingStep, setRegeneratingStep] = useState<string | null>(null);
@@ -289,9 +289,10 @@ const PipelineStepsTab: React.FC<PipelineStepsTabProps> = ({
       return;
     }
 
-    const modelConfigs = settings.modelConfigs || [];
+    // Get model configs from pipeline assignments
+    const modelConfigs = getModelConfigsFromAssignments();
     if (modelConfigs.length === 0) {
-      setError('No model configs available for regeneration');
+      setError('No model configs available for regeneration. Please configure models in Settings.');
       return;
     }
 
@@ -329,7 +330,7 @@ const PipelineStepsTab: React.FC<PipelineStepsTabProps> = ({
     } finally {
       setRegeneratingStep(null);
     }
-  }, [queueItem, story, settings.modelConfigs, updateQueueItem]);
+  }, [queueItem, story, getModelConfigsFromAssignments, updateQueueItem]);
 
   // Skip step
   const handleSkipStep = useCallback((stepId: string) => {

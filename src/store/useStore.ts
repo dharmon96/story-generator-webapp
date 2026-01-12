@@ -184,9 +184,12 @@ export interface Shot {
   soundEffects?: string[];
 
   // Rendering
-  renderStatus?: 'pending' | 'prompt-generated' | 'rendering' | 'completed' | 'failed';
+  renderStatus?: 'pending' | 'queued' | 'prompt-generated' | 'rendering' | 'completed' | 'failed';
   renderUrl?: string;
   renderProgress?: number;
+  renderJobId?: string;  // ID of the render queue job
+  outputUrl?: string;    // URL of rendered output
+  renderError?: string;  // Error message if render failed
 
   // Metadata
   characters?: string[];
@@ -413,6 +416,8 @@ export interface StoreState {
   getVideoModelStatus: () => VideoModelStatus[];
   getConfiguredCloudServices: () => CloudServiceNode[];
   canExecuteStep: (stepId: string) => boolean;
+  // Bridge function: converts pipelineAssignments to legacy modelConfigs format
+  getModelConfigsFromAssignments: () => ModelConfig[];
 
   // Standalone Shotlist methods
   shotlists: Shotlist[];
@@ -802,9 +807,23 @@ export const useStore = create<StoreState>()(
           }
           debugService.info('store', `📝 Updated render job ${id}`, { status: updates.status, progress: updates.progress });
 
+          // Map render job status to shot render status
+          const mapStatusToShotStatus = (status: string | undefined): 'pending' | 'queued' | 'rendering' | 'completed' | 'failed' | undefined => {
+            if (!status) return undefined;
+            switch (status) {
+              case 'queued': return 'queued';
+              case 'assigned':
+              case 'rendering': return 'rendering';
+              case 'completed': return 'completed';
+              case 'failed': return 'failed';
+              default: return undefined;
+            }
+          };
+
           // Also update shotlist shot status if this is a shotlist_shot job
           let updatedShotlists = state.shotlists;
           if (job.type === 'shotlist_shot' && job.shotlistId && updates.status) {
+            const shotStatus = mapStatusToShotStatus(updates.status);
             updatedShotlists = state.shotlists.map((sl) =>
               sl.id === job.shotlistId
                 ? {
@@ -813,13 +832,10 @@ export const useStore = create<StoreState>()(
                       s.id === job.targetId
                         ? {
                             ...s,
-                            renderStatus: updates.status === 'assigned' ? 'rendering'
-                              : updates.status === 'completed' ? 'completed'
-                              : updates.status === 'failed' ? 'failed'
-                              : updates.status === 'rendering' ? 'rendering'
-                              : s.renderStatus,
+                            renderStatus: shotStatus || s.renderStatus,
                             outputUrl: updates.outputUrl || s.outputUrl,
                             renderJobId: job.id,
+                            renderError: updates.error,
                             updatedAt: new Date(),
                           }
                         : s
@@ -833,11 +849,42 @@ export const useStore = create<StoreState>()(
             );
           }
 
+          // Also update story shot status if this is a story-based job
+          let updatedStories = state.stories;
+          if ((job.type === 'shot' || job.type === 'holocine_scene') && job.storyId && updates.status) {
+            const shotStatus = mapStatusToShotStatus(updates.status);
+            updatedStories = state.stories.map((story) =>
+              story.id === job.storyId
+                ? {
+                    ...story,
+                    shots: story.shots?.map((shot) =>
+                      shot.id === job.targetId
+                        ? {
+                            ...shot,
+                            renderStatus: shotStatus || shot.renderStatus || 'pending',
+                            renderJobId: job.id,
+                            outputUrl: updates.outputUrl || shot.outputUrl,
+                            renderError: updates.error,
+                          }
+                        : shot
+                    ) || [],
+                  }
+                : story
+            );
+            if (shotStatus) {
+              debugService.info('store', `📽️ Updated story ${job.storyId} shot ${job.targetId} renderStatus to ${shotStatus}`, {
+                error: updates.error,
+                outputUrl: updates.outputUrl
+              });
+            }
+          }
+
           return {
             renderQueue: state.renderQueue.map(j =>
               j.id === id ? { ...j, ...updates } : j
             ),
             shotlists: updatedShotlists,
+            stories: updatedStories,
           };
         }),
 
@@ -969,9 +1016,13 @@ export const useStore = create<StoreState>()(
           const { agents, cloudServices } = get();
           const models = new Set<string>();
 
-          // Collect models from local agents
+          // Collect models from online/busy local agents
           agents.forEach((agent) => {
-            if (agent.ollama?.available && agent.ollama.models) {
+            if (
+              agent.ollama?.available &&
+              agent.ollama.models &&
+              (agent.status === 'online' || agent.status === 'busy')
+            ) {
               agent.ollama.models.forEach((model) => models.add(model));
             }
           });
@@ -989,8 +1040,11 @@ export const useStore = create<StoreState>()(
         getAgentsForModel: (modelId) => {
           const { agents } = get();
 
-          // Check if it's a cloud model (format: "provider:model")
-          if (modelId.includes(':')) {
+          // Cloud providers are prefixed like "openai:gpt-4", "claude:claude-3", "google:gemini"
+          // Local Ollama models also have colons like "llama3.1:latest" but are NOT cloud models
+          const CLOUD_PROVIDERS = ['openai', 'claude', 'google'];
+          const [potentialProvider] = modelId.split(':');
+          if (CLOUD_PROVIDERS.includes(potentialProvider)) {
             return []; // Cloud models don't have local agents
           }
 
@@ -1069,22 +1123,88 @@ export const useStore = create<StoreState>()(
 
           const modelId = assignment.modelId;
 
+          // Cloud providers are prefixed like "openai:gpt-4", "claude:claude-3", "google:gemini"
+          // Local Ollama models also have colons like "llama3.1:latest" but are NOT cloud models
+          const CLOUD_PROVIDERS = ['openai', 'claude', 'google'];
+          const [potentialProvider] = modelId.split(':');
+          const isCloudModel = CLOUD_PROVIDERS.includes(potentialProvider);
+
           // Check if it's a cloud model
-          if (modelId.includes(':')) {
-            const [provider] = modelId.split(':');
-            const service = cloudServices.find((s) => s.type === provider);
+          if (isCloudModel) {
+            const service = cloudServices.find((s) => s.type === potentialProvider);
             return service?.status === 'online';
           }
 
-          // Check local agents
+          // Check local agents (online or busy agents can execute)
           const availableAgents = agents.filter(
             (agent) =>
               agent.ollama?.available &&
               agent.ollama.models.includes(modelId) &&
-              agent.status === 'online'
+              (agent.status === 'online' || agent.status === 'busy')
           );
 
           return availableAgents.length > 0;
+        },
+
+        // Bridge function: converts pipelineAssignments to legacy modelConfigs format
+        // This allows the new agent-based assignment system to work with existing pipeline code
+        getModelConfigsFromAssignments: () => {
+          const { pipelineAssignments, agents, cloudServices } = get();
+          const modelConfigs: ModelConfig[] = [];
+
+          // Cloud providers are prefixed like "openai:gpt-4", "claude:claude-3", "google:gemini"
+          // Local Ollama models also have colons like "llama3.1:latest" but are NOT cloud models
+          const CLOUD_PROVIDERS = ['openai', 'claude', 'google'];
+
+          pipelineAssignments.forEach((assignment, index) => {
+            if (!assignment.enabled || !assignment.modelId) {
+              return;
+            }
+
+            const modelId = assignment.modelId;
+
+            // Check if it's a cloud model
+            const [potentialProvider] = modelId.split(':');
+            const isCloudModel = CLOUD_PROVIDERS.includes(potentialProvider);
+
+            if (isCloudModel) {
+              // For cloud models, add the cloud service as a single config
+              const service = cloudServices.find((s) => s.type === potentialProvider && s.status === 'online');
+              if (service) {
+                modelConfigs.push({
+                  id: `${assignment.stepId}_${index}_cloud`,
+                  step: assignment.stepId,
+                  nodeId: service.id,
+                  model: modelId,
+                  enabled: true,
+                  priority: index
+                });
+              }
+            } else {
+              // POOL MODE: Find ALL online agents with this model (not just the first one)
+              // This enables true concurrent processing across multiple nodes
+              const matchingAgents = agents.filter(
+                (a) =>
+                  a.ollama?.available &&
+                  a.ollama.models.includes(modelId) &&
+                  (a.status === 'online' || a.status === 'busy')
+              );
+
+              // Add a config for EACH matching agent - enables pool-based task distribution
+              matchingAgents.forEach((agent, agentIndex) => {
+                modelConfigs.push({
+                  id: `${assignment.stepId}_${index}_${agentIndex}`,
+                  step: assignment.stepId,
+                  nodeId: agent.id,
+                  model: modelId,
+                  enabled: true,
+                  priority: index
+                });
+              });
+            }
+          });
+
+          return modelConfigs;
         },
 
         // Standalone Shotlist state and methods

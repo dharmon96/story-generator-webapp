@@ -2,10 +2,11 @@
  * AgentDiscoverySection Component
  *
  * Section for discovering and managing agent nodes.
+ * Agents are registered via heartbeats to the backend - this just displays them.
  * Displays local agents and cloud services in separate subsections.
  */
 
-import React, { useState } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Box,
   Typography,
@@ -17,16 +18,20 @@ import {
   TextField
 } from '@mui/material';
 import {
-  Search as SearchIcon,
+  Refresh as RefreshIcon,
   Add as AddIcon,
   Computer as LocalIcon,
   Cloud as CloudIcon
 } from '@mui/icons-material';
 import { useStore } from '../../store/useStore';
 import { agentDiscoveryService } from '../../services/agentDiscovery';
+import { nodeDiscoveryService } from '../../services/nodeDiscovery';
 import { AgentCard } from './AgentCard';
 import { CloudServiceCard } from './CloudServiceCard';
 import { AgentNode, CloudServiceNode } from '../../types/agentTypes';
+
+// How often to auto-refresh agents from backend (30 seconds)
+const AUTO_REFRESH_INTERVAL = 30000;
 
 export const AgentDiscoverySection: React.FC = () => {
   const {
@@ -36,7 +41,6 @@ export const AgentDiscoverySection: React.FC = () => {
     lastScanTime,
     setAgents,
     addAgent,
-    updateAgent,
     removeAgent,
     setScanning,
     setLastScanTime,
@@ -50,40 +54,49 @@ export const AgentDiscoverySection: React.FC = () => {
 
   const localAgents = agents.filter(a => a.category === 'local');
 
-  // Quick scan for local agents
-  const handleQuickScan = async () => {
-    setScanning(true);
+  // Fetch agents from backend (source of truth from heartbeats)
+  const fetchAgentsFromBackend = useCallback(async (showLoading = true) => {
+    if (showLoading) setScanning(true);
     try {
-      // First try backend registered agents
+      // Backend has authoritative list from heartbeats
       const backendAgents = await agentDiscoveryService.fetchRegisteredAgents(settings.apiEndpoint);
 
-      // Then do quick local scan for development
-      const localAgents = await agentDiscoveryService.quickLocalScan();
+      if (backendAgents.length > 0 || agents.length > 0) {
+        setAgents(backendAgents);
+        setLastScanTime(new Date().toISOString());
 
-      // Merge results, preferring backend data
-      const allAgents = [...backendAgents];
-      for (const local of localAgents) {
-        if (!allAgents.find(a => a.agentUrl === local.agentUrl)) {
-          allAgents.push(local);
-        }
+        // Sync to legacy nodeDiscoveryService for pipeline compatibility
+        nodeDiscoveryService.syncFromAgents(backendAgents);
       }
-
-      setAgents(allAgents);
-      setLastScanTime(new Date().toISOString());
     } catch (error) {
-      console.error('Scan failed:', error);
+      console.error('Failed to fetch agents from backend:', error);
     } finally {
-      setScanning(false);
+      if (showLoading) setScanning(false);
     }
+  }, [settings.apiEndpoint, setAgents, setLastScanTime, setScanning, agents.length]);
+
+  // Auto-fetch on mount and set up polling
+  useEffect(() => {
+    // Initial fetch
+    fetchAgentsFromBackend(true);
+
+    // Set up polling interval
+    const intervalId = setInterval(() => {
+      fetchAgentsFromBackend(false); // Don't show loading spinner for background refreshes
+    }, AUTO_REFRESH_INTERVAL);
+
+    return () => clearInterval(intervalId);
+  }, [fetchAgentsFromBackend]);
+
+  // Manual refresh button
+  const handleRefresh = () => {
+    fetchAgentsFromBackend(true);
   };
 
-  // Refresh a single agent
+  // Refresh a single agent (re-fetch from backend)
   const handleRefreshAgent = async (agent: AgentNode) => {
-    updateAgent(agent.id, { status: 'checking' });
-    const refreshed = await agentDiscoveryService.refreshAgent(agent);
-    if (refreshed) {
-      updateAgent(agent.id, refreshed);
-    }
+    // Just re-fetch all from backend - the heartbeat is the source of truth
+    await fetchAgentsFromBackend(false);
   };
 
   // Remove an agent
@@ -104,6 +117,8 @@ export const AgentDiscoverySection: React.FC = () => {
       if (agent) {
         addAgent(agent);
         setManualIp('');
+        // Sync to legacy nodeDiscoveryService
+        nodeDiscoveryService.syncFromAgents([agent]);
       } else {
         alert(`Could not connect to agent at ${manualIp}`);
       }
@@ -165,11 +180,11 @@ export const AgentDiscoverySection: React.FC = () => {
         <Box display="flex" gap={1}>
           <Button
             variant="contained"
-            startIcon={isScanning ? <CircularProgress size={16} color="inherit" /> : <SearchIcon />}
-            onClick={handleQuickScan}
+            startIcon={isScanning ? <CircularProgress size={16} color="inherit" /> : <RefreshIcon />}
+            onClick={handleRefresh}
             disabled={isScanning}
           >
-            {isScanning ? 'Scanning...' : 'Quick Scan'}
+            {isScanning ? 'Refreshing...' : 'Refresh'}
           </Button>
         </Box>
       </Box>

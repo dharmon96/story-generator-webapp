@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const sqlite3 = require('sqlite3').verbose();
 const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
 const { v4: uuidv4 } = require('uuid');
 
 const app = express();
@@ -847,6 +849,7 @@ app.post('/api/nodes/heartbeat', (req, res) => {
     agent_port,
     ollama,
     comfyui,
+    workflows,
     system,
     timestamp
   } = req.body;
@@ -862,13 +865,15 @@ app.post('/api/nodes/heartbeat', (req, res) => {
     agent_port: agent_port || 8765,
     ollama: ollama || { available: false },
     comfyui: comfyui || { available: false },
+    workflows: workflows || { supported: [], ready: [] },
     system: system || {},
     last_heartbeat: new Date().toISOString(),
     received_timestamp: timestamp
   };
 
   nodeRegistry.set(node_id, nodeData);
-  console.log(`💓 Heartbeat from ${hostname} (${node_id.slice(0, 8)}...) - Ollama: ${ollama?.available ? '✅' : '❌'}, ComfyUI: ${comfyui?.available ? '✅' : '❌'}`);
+  const workflowCount = workflows?.ready?.length || 0;
+  console.log(`💓 Heartbeat from ${hostname} (${node_id.slice(0, 8)}...) - Ollama: ${ollama?.available ? '✅' : '❌'}, ComfyUI: ${comfyui?.available ? '✅' : '❌'}${workflowCount > 0 ? `, Workflows: ${workflowCount}` : ''}`);
 
   res.json({ status: 'ok', registered: true });
 });
@@ -956,6 +961,7 @@ app.get('/api/nodes/discover', async (req, res) => {
       status: isOnline ? 'online' : 'offline',
       ollama: node.ollama,
       comfyui: node.comfyui,
+      workflows: node.workflows,
       system: node.system,
       last_heartbeat: node.last_heartbeat
     });
@@ -1008,6 +1014,118 @@ app.get('/api/nodes/discover', async (req, res) => {
       scanned_found: scannedNodes.length
     }
   });
+});
+
+// ============================================
+// AGENT AUTO-UPDATE SYSTEM
+// ============================================
+
+const AGENT_FILE_PATH = path.join(__dirname, '..', 'node-agent', 'agent.py');
+
+/**
+ * Calculate MD5 hash of a file for version checking
+ */
+function getFileHash(filePath) {
+  try {
+    const content = fs.readFileSync(filePath);
+    return crypto.createHash('md5').update(content).digest('hex');
+  } catch (err) {
+    console.error('Failed to calculate file hash:', err);
+    return null;
+  }
+}
+
+/**
+ * Get agent version info from the file
+ */
+function getAgentVersionInfo() {
+  try {
+    const stats = fs.statSync(AGENT_FILE_PATH);
+    const content = fs.readFileSync(AGENT_FILE_PATH, 'utf-8');
+
+    // Extract version from file if present (look for AGENT_VERSION = "x.x.x")
+    const versionMatch = content.match(/AGENT_VERSION\s*=\s*["']([^"']+)["']/);
+    const version = versionMatch ? versionMatch[1] : null;
+
+    return {
+      version: version,
+      hash: getFileHash(AGENT_FILE_PATH),
+      lastModified: stats.mtime.toISOString(),
+      size: stats.size
+    };
+  } catch (err) {
+    console.error('Failed to get agent version info:', err);
+    return null;
+  }
+}
+
+/**
+ * GET /api/agent/version
+ * Returns current agent version and hash for update checking
+ */
+app.get('/api/agent/version', (req, res) => {
+  const versionInfo = getAgentVersionInfo();
+
+  if (!versionInfo) {
+    return res.status(500).json({ error: 'Failed to read agent file' });
+  }
+
+  res.json({
+    ...versionInfo,
+    updateAvailable: true, // Agents can always check for updates
+    downloadUrl: '/api/agent/download'
+  });
+});
+
+/**
+ * GET /api/agent/check
+ * Check if an update is needed by comparing hashes
+ * Query params: hash (current agent hash)
+ */
+app.get('/api/agent/check', (req, res) => {
+  const clientHash = req.query.hash;
+  const versionInfo = getAgentVersionInfo();
+
+  if (!versionInfo) {
+    return res.status(500).json({ error: 'Failed to read agent file' });
+  }
+
+  const needsUpdate = clientHash !== versionInfo.hash;
+
+  res.json({
+    needsUpdate,
+    currentVersion: versionInfo.version,
+    currentHash: versionInfo.hash,
+    clientHash: clientHash || null,
+    lastModified: versionInfo.lastModified
+  });
+});
+
+/**
+ * GET /api/agent/download
+ * Download the latest agent.py file
+ */
+app.get('/api/agent/download', (req, res) => {
+  try {
+    if (!fs.existsSync(AGENT_FILE_PATH)) {
+      return res.status(404).json({ error: 'Agent file not found' });
+    }
+
+    const versionInfo = getAgentVersionInfo();
+
+    res.setHeader('Content-Type', 'text/x-python');
+    res.setHeader('Content-Disposition', 'attachment; filename="agent.py"');
+    res.setHeader('X-Agent-Version', versionInfo?.version || 'unknown');
+    res.setHeader('X-Agent-Hash', versionInfo?.hash || 'unknown');
+
+    const fileStream = fs.createReadStream(AGENT_FILE_PATH);
+    fileStream.pipe(res);
+
+    console.log(`📥 Agent download requested (hash: ${versionInfo?.hash?.slice(0, 8)}...)`);
+  } catch (err) {
+    console.error('Failed to serve agent file:', err);
+    res.status(500).json({ error: 'Failed to serve agent file' });
+  }
 });
 
 // 404 handler

@@ -208,7 +208,7 @@ export const DEFAULT_SHOT_SETTINGS = {
 export function createNewShotlist(title: string = 'New Shotlist'): Shotlist {
   const now = new Date();
   return {
-    id: `shotlist_${Date.now()}`,
+    id: `shotlist_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
     title,
     description: '',
     ...DEFAULT_SHOTLIST_SETTINGS,

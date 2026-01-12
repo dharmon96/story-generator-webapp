@@ -108,11 +108,22 @@ class ManualModeAiService {
    * 1. ui_ai step config (for all manual mode/UI AI operations)
    * 2. Specific step config (if provided)
    * 3. Any enabled config (fallback)
+   * 4. Direct node discovery (for agents that are online with models)
    */
   private getNodeAndModel(step: string = 'story'): { node: any; model: string } | null {
     // Access store to get model configs
     const state = useStore.getState();
-    const modelConfigs = state.settings?.modelConfigs || [];
+
+    // Try new pipeline assignments system first (preferred)
+    const newModelConfigs = state.getModelConfigsFromAssignments ? state.getModelConfigsFromAssignments() : [];
+
+    // Fall back to legacy model configs
+    const legacyModelConfigs = state.settings?.modelConfigs || [];
+
+    // Use new system if available, otherwise fall back to legacy
+    const modelConfigs = newModelConfigs.length > 0 ? newModelConfigs : legacyModelConfigs;
+
+    debugService.info('manual-ai', `Looking for model config. New configs: ${newModelConfigs.length}, Legacy: ${legacyModelConfigs.length}, Using: ${modelConfigs.length}`);
 
     // First priority: Check for ui_ai step config (dedicated UI AI model)
     const uiAiConfig = modelConfigs.find(
@@ -135,31 +146,40 @@ class ManualModeAiService {
     if (stepConfig) {
       const node = nodeDiscoveryService.getNode(stepConfig.nodeId);
       if (node && node.status === 'online') {
+        debugService.info('manual-ai', `Using step config: ${stepConfig.model} on node ${stepConfig.nodeId}`);
         return { node, model: stepConfig.model };
       }
     }
 
-    // Fallback: Any enabled config with a model
+    // Third priority: Any enabled config with a model
     const anyConfig = modelConfigs.find(
       (config: ModelConfig) => config.enabled && config.model
     );
 
-    if (!anyConfig) {
-      debugService.error('manual-ai', 'No enabled model configurations found');
-      return null;
+    if (anyConfig) {
+      const node = nodeDiscoveryService.getNode(anyConfig.nodeId);
+      if (node && node.status === 'online') {
+        debugService.info('manual-ai', `Using fallback config: ${anyConfig.model} on ${node.name}`);
+        return { node, model: anyConfig.model };
+      }
     }
 
-    const node = nodeDiscoveryService.getNode(anyConfig.nodeId);
-    if (!node || node.status !== 'online') {
-      debugService.error('manual-ai', `Node ${anyConfig.nodeId} is not available`);
-      return null;
+    // Fourth priority: Direct node discovery - find any online node with models
+    const allNodes = nodeDiscoveryService.getNodes();
+    const onlineNode = allNodes.find(n => n.status === 'online' && n.models && n.models.length > 0);
+
+    if (onlineNode) {
+      const firstModel = onlineNode.models[0];
+      debugService.info('manual-ai', `Using discovered node: ${firstModel} on ${onlineNode.name}`);
+      return { node: onlineNode, model: firstModel };
     }
 
-    return { node, model: anyConfig.model };
+    debugService.error('manual-ai', `No enabled model configurations found and no online nodes with models. Configs checked: ${modelConfigs.length}, Online nodes: ${allNodes.filter(n => n.status === 'online').length}`);
+    return null;
   }
 
   /**
-   * Call Ollama API directly
+   * Call Ollama API - routes through agent proxy if available for job tracking
    */
   private async callOllama(
     node: any,
@@ -167,9 +187,16 @@ class ManualModeAiService {
     systemPrompt: string,
     userPrompt: string
   ): Promise<string> {
-    debugService.info('manual-ai', `Calling Ollama at ${node.host}:${node.port} with model ${model}`);
+    // Use agent proxy if available for job tracking, otherwise call Ollama directly
+    const ollamaPort = node.ollamaPort || node.port;
+    const useAgentProxy = !!node.agentPort;
+    const endpoint = useAgentProxy
+      ? `http://${node.host}:${node.agentPort}/proxy/ollama/api/generate`
+      : `http://${node.host}:${ollamaPort}/api/generate`;
 
-    const response = await fetch(`http://${node.host}:${node.port}/api/generate`, {
+    debugService.info('manual-ai', `Calling Ollama at ${endpoint} with model ${model}${useAgentProxy ? ' (via agent proxy)' : ''}`);
+
+    const response = await fetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

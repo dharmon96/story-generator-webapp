@@ -212,6 +212,10 @@ export interface CloudServiceNode {
   capabilities: CloudServiceCapabilities;
   lastValidated?: string;
   error?: string;
+  // Subscription and documentation links
+  subscriptionUrl?: string;
+  apiKeysUrl?: string;
+  docsUrl?: string;
 }
 
 /**
@@ -297,7 +301,10 @@ export const DEFAULT_CLOUD_SERVICES: CloudServiceNode[] = [
       video: ['sora'],
       image: ['dall-e-3', 'dall-e-2']
     },
-    capabilities: { chat: true, vision: true, video: true, image: true }
+    capabilities: { chat: true, vision: true, video: true, image: true },
+    subscriptionUrl: 'https://platform.openai.com/settings/organization/billing/overview',
+    apiKeysUrl: 'https://platform.openai.com/api-keys',
+    docsUrl: 'https://platform.openai.com/docs'
   },
   {
     id: 'cloud_claude',
@@ -312,7 +319,10 @@ export const DEFAULT_CLOUD_SERVICES: CloudServiceNode[] = [
       video: [],
       image: []
     },
-    capabilities: { chat: true, vision: true, video: false, image: false }
+    capabilities: { chat: true, vision: true, video: false, image: false },
+    subscriptionUrl: 'https://console.anthropic.com/settings/plans',
+    apiKeysUrl: 'https://console.anthropic.com/settings/keys',
+    docsUrl: 'https://docs.anthropic.com'
   },
   {
     id: 'cloud_google',
@@ -327,7 +337,10 @@ export const DEFAULT_CLOUD_SERVICES: CloudServiceNode[] = [
       video: ['veo'],
       image: ['imagen-3']
     },
-    capabilities: { chat: true, vision: true, video: true, image: true }
+    capabilities: { chat: true, vision: true, video: true, image: true },
+    subscriptionUrl: 'https://aistudio.google.com/app/billing',
+    apiKeysUrl: 'https://aistudio.google.com/app/apikey',
+    docsUrl: 'https://ai.google.dev/docs'
   }
 ];
 

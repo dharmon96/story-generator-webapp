@@ -146,10 +146,10 @@ export const PREDEFINED_WORKFLOWS: ComfyUIWorkflow[] = [
       },
       {
         type: 'vae',
-        name: 'Wan 2.2 VAE',
-        description: 'VAE for Wan 2.2 video models',
+        name: 'Wan 2.1 VAE',
+        description: 'VAE for Wan 2.x video models',
         required: true,
-        defaultModel: 'wan2.2_vae.safetensors',
+        defaultModel: 'wan_2.1_vae.safetensors',
         alternatives: []
       },
       {

@@ -68,11 +68,12 @@ export const MultiNodeConfig: React.FC<MultiNodeConfigProps> = ({
   });
   const [testStatus, setTestStatus] = useState<Record<string, 'testing' | 'success' | 'error' | null>>({});
 
-  const getNodeTypeIcon = (type: 'ollama' | 'openai' | 'claude' | 'elevenlabs' | 'suno' | 'comfyui' | 'unified') => {
+  const getNodeTypeIcon = (type: 'ollama' | 'openai' | 'claude' | 'google' | 'elevenlabs' | 'suno' | 'comfyui' | 'unified') => {
     switch (type) {
       case 'ollama': return <Computer fontSize="small" />;
       case 'openai': return <SmartToy fontSize="small" />;
       case 'claude': return <Cloud fontSize="small" />;
+      case 'google': return <Cloud fontSize="small" />;
       case 'elevenlabs': return <SmartToy fontSize="small" />;
       case 'suno': return <SmartToy fontSize="small" />;
       case 'unified': return <Speed fontSize="small" />;

@@ -7,8 +7,11 @@ export interface OllamaNode {
   models: string[];
   version?: string;
   lastChecked: Date;
-  type: 'ollama' | 'openai' | 'claude' | 'elevenlabs' | 'suno' | 'comfyui' | 'unified';
+  type: 'ollama' | 'openai' | 'claude' | 'google' | 'elevenlabs' | 'suno' | 'comfyui' | 'unified';
   category: 'local' | 'online';
+
+  // Agent proxy support - routes requests through the agent for job tracking
+  agentPort?: number;    // Default: 8765 - the port the agent listens on
 
   // Dual capability support - for unified nodes that run both Ollama and ComfyUI
   capabilities?: {
@@ -2055,27 +2058,36 @@ class NodeDiscoveryService {
   }
 
   /**
-   * Check if a node is available for a specific capability
+   * Check if a node is available for a specific capability.
+   * For unified nodes, BOTH services must be not-busy (exclusive mode).
+   * In the future, nodes will be able to decide what they can handle based on resources.
    */
   isNodeAvailableFor(nodeId: string, capability: 'ollama' | 'comfyui'): boolean {
     const node = this.nodes.get(nodeId);
     if (!node) return false;
 
-    if (capability === 'ollama') {
-      // Check Ollama availability
-      if (node.type === 'ollama') {
-        return node.status === 'online';
+    // For unified nodes, check BOTH services - if either is busy, node is unavailable
+    // This is exclusive mode: only one job at a time per node
+    if (node.type === 'unified') {
+      const ollamaAvailable = !node.capabilities?.ollama || node.ollamaStatus === 'online';
+      const comfyuiAvailable = !node.capabilities?.comfyui || node.comfyuiStatus === 'online';
+      const bothServicesAvailable = ollamaAvailable && comfyuiAvailable;
+
+      if (capability === 'ollama') {
+        return node.capabilities?.ollama === true && bothServicesAvailable;
+      } else {
+        return node.capabilities?.comfyui === true && bothServicesAvailable;
       }
-      if (node.type === 'unified') {
-        return node.capabilities?.ollama === true && node.ollamaStatus === 'online';
+    }
+
+    // For single-capability nodes, check their specific status
+    if (capability === 'ollama') {
+      if (node.type === 'ollama') {
+        return node.status === 'online' && node.ollamaStatus !== 'busy';
       }
     } else {
-      // Check ComfyUI availability
       if (node.type === 'comfyui') {
-        return node.status === 'online';
-      }
-      if (node.type === 'unified') {
-        return node.capabilities?.comfyui === true && node.comfyuiStatus === 'online';
+        return node.status === 'online' && node.comfyuiStatus !== 'busy';
       }
     }
 
@@ -2087,7 +2099,12 @@ class NodeDiscoveryService {
    */
   markNodeBusy(nodeId: string, capability: 'ollama' | 'comfyui'): void {
     const node = this.nodes.get(nodeId);
-    if (!node) return;
+    if (!node) {
+      console.warn(`[markNodeBusy] Node ${nodeId} not found!`);
+      return;
+    }
+
+    console.log(`🔒 [markNodeBusy] Marking ${node.name} (${nodeId.slice(0, 8)}) ${capability} as BUSY`);
 
     if (node.type === 'unified') {
       if (capability === 'ollama') {
@@ -2106,6 +2123,7 @@ class NodeDiscoveryService {
     }
 
     this.nodes.set(nodeId, node);
+    console.log(`🔒 [markNodeBusy] ${node.name} status now: ollamaStatus=${node.ollamaStatus}, comfyuiStatus=${node.comfyuiStatus}`);
   }
 
   /**
@@ -2113,7 +2131,12 @@ class NodeDiscoveryService {
    */
   markNodeAvailable(nodeId: string, capability: 'ollama' | 'comfyui'): void {
     const node = this.nodes.get(nodeId);
-    if (!node) return;
+    if (!node) {
+      console.warn(`[markNodeAvailable] Node ${nodeId} not found!`);
+      return;
+    }
+
+    console.log(`🔓 [markNodeAvailable] Marking ${node.name} (${nodeId.slice(0, 8)}) ${capability} as AVAILABLE`);
 
     if (capability === 'ollama') {
       node.ollamaStatus = 'online';
@@ -2122,22 +2145,58 @@ class NodeDiscoveryService {
     }
 
     this.nodes.set(nodeId, node);
+    console.log(`🔓 [markNodeAvailable] ${node.name} status now: ollamaStatus=${node.ollamaStatus}, comfyuiStatus=${node.comfyuiStatus}`);
   }
 
   /**
    * Get the correct endpoint URL for a node's capability
    */
-  getNodeEndpoint(nodeId: string, capability: 'ollama' | 'comfyui'): string | null {
+  /**
+   * Get the endpoint for a node capability.
+   * If useAgentProxy is true and node has agentPort, routes through the agent proxy.
+   * This enables job tracking and avoids CORS issues.
+   */
+  getNodeEndpoint(nodeId: string, capability: 'ollama' | 'comfyui', useAgentProxy: boolean = true): string | null {
     const node = this.nodes.get(nodeId);
-    if (!node) return null;
+    if (!node) {
+      console.warn(`⚠️ getNodeEndpoint: Node ${nodeId} not found in nodeDiscoveryService`);
+      return null;
+    }
 
+    console.log(`🔍 getNodeEndpoint: nodeId=${nodeId}, capability=${capability}, useAgentProxy=${useAgentProxy}, agentPort=${node.agentPort}`);
+
+    // If agent proxy is available and enabled, route through it
+    if (useAgentProxy && node.agentPort) {
+      const agentBase = `http://${node.host}:${node.agentPort}`;
+      if (capability === 'ollama') {
+        console.log(`✅ Using agent proxy for Ollama: ${agentBase}/proxy/ollama`);
+        return `${agentBase}/proxy/ollama`;
+      } else {
+        console.log(`✅ Using agent proxy for ComfyUI: ${agentBase}/proxy/comfyui`);
+        return `${agentBase}/proxy/comfyui`;
+      }
+    }
+
+    // Direct connection (fallback)
     if (capability === 'ollama') {
       const port = node.ollamaPort || node.port;
+      console.log(`⚠️ Using DIRECT connection for Ollama: http://${node.host}:${port} (no agent proxy)`);
       return `http://${node.host}:${port}`;
     } else {
       const port = node.comfyUIPort || (node.type === 'comfyui' ? node.port : 8000);
+      console.log(`⚠️ Using DIRECT connection for ComfyUI: http://${node.host}:${port} (no agent proxy)`);
       return `http://${node.host}:${port}`;
     }
+  }
+
+  /**
+   * Get the agent proxy base URL for a node (if available)
+   * Returns null if node doesn't have an agent
+   */
+  getAgentProxyEndpoint(nodeId: string): string | null {
+    const node = this.nodes.get(nodeId);
+    if (!node || !node.agentPort) return null;
+    return `http://${node.host}:${node.agentPort}`;
   }
 
   /**
@@ -2169,6 +2228,180 @@ class NodeDiscoveryService {
    */
   getUnifiedNodes(): OllamaNode[] {
     return Array.from(this.nodes.values()).filter(node => node.type === 'unified');
+  }
+
+  /**
+   * Sync agents from the new agent discovery system into this legacy service.
+   * This bridges the new Zustand-based agent system with the pipeline processor.
+   */
+  syncFromAgents(agents: Array<{
+    id: string;
+    hostname: string;
+    agentUrl: string;
+    agentPort?: number;
+    status: 'online' | 'offline' | 'busy' | 'checking';
+    ollama?: {
+      available: boolean;
+      port: number;
+      models: string[];
+      busy?: boolean;
+    } | null;
+    comfyui?: {
+      available: boolean;
+      port: number;
+      workflows: Array<{ id: string; name: string; available: boolean }>;
+      busy?: boolean;
+    } | null;
+  }>): void {
+    console.log(`🔄 Syncing ${agents.length} agent(s) to nodeDiscoveryService...`);
+
+    // Track which agent IDs we've seen in this sync
+    const syncedAgentIds = new Set<string>();
+
+    agents.forEach(agent => {
+      // Sync agents that have Ollama OR ComfyUI capability and are online/busy
+      const hasOllama = agent.ollama?.available;
+      const hasComfyUI = agent.comfyui?.available;
+
+      if ((hasOllama || hasComfyUI) && (agent.status === 'online' || agent.status === 'busy')) {
+        // Parse host and port from agentUrl
+        const urlMatch = agent.agentUrl.match(/http:\/\/([^:]+):(\d+)/);
+        const host = urlMatch ? urlMatch[1] : 'localhost';
+        const agentPort = urlMatch ? parseInt(urlMatch[2], 10) : (agent.agentPort || 8765);
+
+        // Determine node type based on capabilities
+        let nodeType: OllamaNode['type'] = 'ollama';
+        if (hasOllama && hasComfyUI) {
+          nodeType = 'unified';
+        } else if (hasComfyUI && !hasOllama) {
+          nodeType = 'comfyui';
+        }
+
+        // Determine busy status per service from the agent's busy flags
+        const ollamaBusy = agent.ollama?.busy || false;
+        const comfyuiBusy = agent.comfyui?.busy || false;
+
+        // Node status: 'online' if both services are available and not busy
+        // For the legacy node, we treat busy as 'online' but track per-service status
+        const nodeStatus: 'online' | 'offline' = (agent.status === 'online' || agent.status === 'busy') ? 'online' : 'offline';
+
+        const node: OllamaNode = {
+          id: agent.id,
+          name: agent.hostname || `Agent-${agent.id.slice(0, 8)}`,
+          host: host,
+          port: agent.ollama?.port || agent.comfyui?.port || 8765,
+          status: nodeStatus,
+          models: agent.ollama?.models || [],
+          lastChecked: new Date(),
+          type: nodeType,
+          category: 'local',
+          agentPort: agentPort,  // Store agent port for proxy routing
+          capabilities: {
+            ollama: hasOllama || false,
+            comfyui: hasComfyUI || false
+          },
+          ollamaPort: agent.ollama?.port,
+          comfyUIPort: agent.comfyui?.port,
+          // Track per-service busy status
+          // IMPORTANT: Preserve existing busy status if we marked it locally
+          // This prevents agent sync from overwriting our local busy tracking
+          ollamaStatus: hasOllama ? (ollamaBusy ? 'busy' : 'online') : 'offline',
+          comfyuiStatus: hasComfyUI ? (comfyuiBusy ? 'busy' : 'online') : 'offline'
+        };
+
+        // Check if we have an existing node and preserve its busy status if locally marked
+        const existingNode = this.nodes.get(agent.id);
+        if (existingNode) {
+          // If our local status is 'busy' but agent says 'online', keep it busy
+          // This handles cases where we're processing a task that the agent doesn't know about
+          if (existingNode.ollamaStatus === 'busy' && node.ollamaStatus === 'online') {
+            console.log(`⚠️ [syncFromAgents] Preserving busy status for ${agent.hostname} ollama (local task in progress)`);
+            node.ollamaStatus = 'busy';
+          }
+          if (existingNode.comfyuiStatus === 'busy' && node.comfyuiStatus === 'online') {
+            console.log(`⚠️ [syncFromAgents] Preserving busy status for ${agent.hostname} comfyui (local task in progress)`);
+            node.comfyuiStatus = 'busy';
+          }
+        }
+
+        this.nodes.set(agent.id, node);
+        syncedAgentIds.add(agent.id);
+        const modelCount = agent.ollama?.models?.length || 0;
+        const capabilities = [hasOllama ? 'Ollama' : '', hasComfyUI ? 'ComfyUI' : ''].filter(Boolean).join('+');
+        const busyIndicator = (ollamaBusy || comfyuiBusy) ? ' [BUSY]' : '';
+        console.log(`✅ Synced agent ${agent.hostname} (${agent.id}) - ${capabilities}, ${modelCount} models, agent port: ${agentPort}${busyIndicator}`);
+      }
+    });
+
+    // Remove nodes that are no longer in the active agent list
+    // This ensures offline agents disappear from the pipeline's available nodes
+    const nodesToRemove: string[] = [];
+    Array.from(this.nodes.entries()).forEach(([nodeId, node]) => {
+      // Only remove agent-type nodes (local category)
+      // Don't remove API nodes (openai, claude) or manually added nodes
+      if (node.category === 'local' && !syncedAgentIds.has(nodeId) &&
+          (node.type === 'ollama' || node.type === 'unified' || node.type === 'comfyui')) {
+        nodesToRemove.push(nodeId);
+      }
+    });
+
+    nodesToRemove.forEach(nodeId => {
+      this.nodes.delete(nodeId);
+      console.log(`🗑️ Removed offline agent node: ${nodeId}`);
+    });
+
+    console.log(`🔄 Sync complete. nodeDiscoveryService now has ${this.nodes.size} node(s)`);
+  }
+
+  /**
+   * Sync cloud services (OpenAI, Claude, Google) into this service.
+   * Cloud services are represented as nodes so the pipeline can use them uniformly.
+   */
+  syncCloudServices(cloudServices: Array<{
+    id: string;
+    type: 'openai' | 'claude' | 'google';
+    displayName: string;
+    status: 'online' | 'offline' | 'unconfigured' | 'validating';
+    models: {
+      chat: string[];
+      vision: string[];
+      video: string[];
+      image: string[];
+    };
+  }>): void {
+    console.log(`☁️ Syncing ${cloudServices.length} cloud service(s) to nodeDiscoveryService...`);
+
+    cloudServices.forEach(service => {
+      if (service.status === 'online') {
+        // Build model list with provider prefix (e.g., "openai:gpt-4o")
+        const prefixedModels = service.models.chat.map(m => `${service.type}:${m}`);
+
+        const node: OllamaNode = {
+          id: service.id,
+          name: service.displayName,
+          host: 'api',
+          port: 443,
+          status: 'online',
+          models: prefixedModels,
+          lastChecked: new Date(),
+          type: service.type as OllamaNode['type'],
+          category: 'online',
+          capabilities: {
+            ollama: false,
+            comfyui: false
+          }
+        };
+
+        this.nodes.set(service.id, node);
+        console.log(`☁️ Synced cloud service ${service.displayName} (${service.id}) - ${prefixedModels.length} models`);
+      } else {
+        // Remove offline/unconfigured cloud services
+        if (this.nodes.has(service.id)) {
+          this.nodes.delete(service.id);
+          console.log(`☁️ Removed offline cloud service: ${service.id}`);
+        }
+      }
+    });
   }
 
   /**

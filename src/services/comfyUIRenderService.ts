@@ -213,20 +213,23 @@ class ComfyUIRenderService {
 
   /**
    * Get the first available ComfyUI endpoint, preferring assigned nodes
+   * Uses nodeDiscoveryService.getNodeEndpoint() to route through agent proxy when available
    */
   getEndpoint(stepId?: string): string | null {
     // First try to get assigned node for the step
     if (stepId) {
       const assignedNode = this.getAssignedNode(stepId);
       if (assignedNode) {
-        return `http://${assignedNode.host}:${assignedNode.port}`;
+        // Use nodeDiscoveryService to get the proper endpoint (routes through agent proxy if available)
+        return nodeDiscoveryService.getNodeEndpoint(assignedNode.id, 'comfyui');
       }
     }
 
     // Fall back to first available node
     const nodes = this.getAvailableNodes();
     if (nodes.length === 0) return null;
-    return `http://${nodes[0].host}:${nodes[0].port}`;
+    // Use nodeDiscoveryService to get the proper endpoint (routes through agent proxy if available)
+    return nodeDiscoveryService.getNodeEndpoint(nodes[0].id, 'comfyui');
   }
 
   /**

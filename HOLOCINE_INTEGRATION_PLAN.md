@@ -24,7 +24,7 @@ HoloCine is a text-to-video model that generates **cinematic multi-shot videos**
 ---
 
 ## Architecture Changes
-
+z
 ### 1. New Data Types (src/types/holocineTypes.ts)
 
 ```typescript

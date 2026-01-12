@@ -20,6 +20,11 @@ const DEFAULT_AGENT_PORTS = [8765, 8766, 8767];
 const AGENT_TIMEOUT = 5000;
 
 /**
+ * Timeout for backend API requests in milliseconds
+ */
+const BACKEND_TIMEOUT = 10000;
+
+/**
  * Agent Discovery Service
  */
 class AgentDiscoveryService {
@@ -79,15 +84,16 @@ class AgentDiscoveryService {
 
   /**
    * Fetch registered agents from backend
+   * Only returns online agents - offline agents are filtered out
    */
   async fetchRegisteredAgents(backendUrl: string): Promise<AgentNode[]> {
     try {
-      debugService.info('agentDiscovery', 'Fetching registered agents from backend...');
+      debugService.info('agentDiscovery', `Fetching registered agents from backend at ${backendUrl}...`);
 
       const response = await fetch(`${backendUrl}/api/nodes`, {
         method: 'GET',
         headers: { 'Content-Type': 'application/json' },
-        signal: AbortSignal.timeout(AGENT_TIMEOUT)
+        signal: AbortSignal.timeout(BACKEND_TIMEOUT)
       });
 
       if (!response.ok) {
@@ -97,12 +103,23 @@ class AgentDiscoveryService {
       const data = await response.json();
       const nodes = data.nodes || data || [];
 
-      const agents = nodes.map((node: any) =>
-        apiResponseToAgentNode(node, node.agent_url || `http://${node.ip}:${node.port}`)
+      // Convert all nodes to AgentNode format
+      const allAgents = nodes.map((node: any) => {
+        // Construct agent URL from ip_addresses and agent_port
+        const ip = node.ip_addresses?.[0] || '127.0.0.1';
+        const port = node.agent_port || 8765;
+        const agentUrl = node.agent_url || `http://${ip}:${port}`;
+        return apiResponseToAgentNode(node, agentUrl);
+      });
+
+      // Filter out offline agents - if heartbeat times out, agent should disappear
+      const onlineAgents = allAgents.filter(
+        (agent: AgentNode) => agent.status === 'online' || agent.status === 'busy'
       );
 
-      debugService.info('agentDiscovery', `Fetched ${agents.length} registered agent(s)`);
-      return agents;
+      debugService.info('agentDiscovery',
+        `Fetched ${allAgents.length} total agent(s), ${onlineAgents.length} online`);
+      return onlineAgents;
     } catch (error) {
       debugService.warn('agentDiscovery', 'Failed to fetch registered agents', error);
       return [];

@@ -224,7 +224,7 @@ class HoloCineService {
     const shotCutFrames = this.calculateShotCutFrames(shots, this.generationSettings.numFrames);
 
     const scene: HoloCineScene = {
-      id: `scene_${Date.now()}_${sceneNumber}`,
+      id: `scene_${Date.now()}_${sceneNumber}_${Math.random().toString(36).substr(2, 9)}`,
       sceneNumber,
       title,
       globalCaption,

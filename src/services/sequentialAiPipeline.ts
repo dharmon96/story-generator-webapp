@@ -1608,7 +1608,7 @@ class SequentialAiPipelineService {
       else if (i % 4 === 0) cameraType = 'tracking shot';
       
       shots.push({
-        id: `shot_${Date.now()}_${i}`,
+        id: `shot_${Date.now()}_${i}_${Math.random().toString(36).substr(2, 9)}`,
         storyId: story.id,
         shotNumber: shotNumber,
         description: shotContent.slice(0, 200) || `Shot ${shotNumber} of the story`,

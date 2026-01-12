@@ -14,6 +14,9 @@ export interface ProcessingStatus {
   startedAt: Date | null;
   queueLength: number;
   errors: string[];
+  // New: track if processing was stopped due to a configuration error
+  stoppedDueToError: boolean;
+  stopReason: 'configuration' | 'user' | 'completed' | null;
 }
 
 class QueueProcessor {
@@ -29,6 +32,10 @@ class QueueProcessor {
   private progressCallbacks = new Map<string, (progress: any) => void>();
   private statusCallbacks = new Set<(status: ProcessingStatus) => void>();
   private errors: string[] = [];
+
+  // Track why processing stopped
+  private stoppedDueToError: boolean = false;
+  private stopReason: 'configuration' | 'user' | 'completed' | null = null;
 
   static getInstance(): QueueProcessor {
     if (!QueueProcessor.instance) {
@@ -64,8 +71,43 @@ class QueueProcessor {
       currentItemId: this.currentItemId,
       startedAt: this.currentItemId ? new Date() : null,
       queueLength: this.processingLock.size,
-      errors: [...this.errors]
+      errors: [...this.errors],
+      stoppedDueToError: this.stoppedDueToError,
+      stopReason: this.stopReason
     };
+  }
+
+  /**
+   * Check if an error is a configuration error that should stop the entire queue
+   * These are errors that will likely affect ALL items, not just the current one
+   */
+  private isConfigurationError(error: Error): boolean {
+    const message = error.message.toLowerCase();
+
+    // API key issues
+    if (message.includes('api key') || message.includes('apikey')) return true;
+    if (message.includes('not configured')) return true;
+    if (message.includes('authentication') || message.includes('unauthorized')) return true;
+    if (message.includes('invalid_api_key') || message.includes('invalid api key')) return true;
+
+    // Model issues
+    if (message.includes('model') && (message.includes('not found') || message.includes('does not exist'))) return true;
+    if (message.includes('unsupported parameter')) return true;
+    if (message.includes('model not available')) return true;
+
+    // Node/connection issues
+    if (message.includes('node') && message.includes('not found')) return true;
+    if (message.includes('node') && message.includes('offline')) return true;
+    if (message.includes('no model configurations')) return true;
+    if (message.includes('missing required model')) return true;
+
+    // Rate limiting (stop to prevent further rate limit hits)
+    if (message.includes('rate limit') || message.includes('too many requests') || message.includes('429')) return true;
+
+    // Quota exhausted
+    if (message.includes('quota') || message.includes('billing') || message.includes('exceeded')) return true;
+
+    return false;
   }
 
   /**
@@ -95,6 +137,8 @@ class QueueProcessor {
 
     this.isRunning = true;
     this.errors = []; // Clear previous errors
+    this.stoppedDueToError = false; // Clear error stop state
+    this.stopReason = null;
     this.notifyStatusChange();
 
     // Start health monitoring during processing
@@ -119,11 +163,13 @@ class QueueProcessor {
   /**
    * Stop all processing
    */
-  stopProcessing(): void {
-    debugService.info('queue', '🛑 QueueProcessor.stopProcessing called');
-    
+  stopProcessing(reason: 'user' | 'configuration' = 'user'): void {
+    debugService.info('queue', `🛑 QueueProcessor.stopProcessing called (reason: ${reason})`);
+
     this.isRunning = false;
-    
+    this.stopReason = reason;
+    this.stoppedDueToError = reason === 'configuration';
+
     // Abort current processing if active
     if (this.abortController) {
       this.abortController.abort();
@@ -136,7 +182,7 @@ class QueueProcessor {
     // Clear processing locks
     this.processingLock.clear();
     this.currentItemId = null;
-    
+
     this.notifyStatusChange();
     debugService.info('queue', '✅ All processing stopped');
   }
@@ -192,6 +238,16 @@ class QueueProcessor {
         });
         // Also mark as processed so we don't retry in this session (user can manually re-queue)
         processedItemIds.add(nextItem.id);
+
+        // Check if this is a configuration error that should stop the entire queue
+        if (this.isConfigurationError(error)) {
+          debugService.error('queue', `🛑 Configuration error detected - stopping auto-queue: ${error.message}`);
+          this.stoppedDueToError = true;
+          this.stopReason = 'configuration';
+          this.isRunning = false;
+          this.notifyStatusChange();
+          break; // Exit the processing loop
+        }
       } finally {
         // Always clean up processing state
         this.processingLock.delete(nextItem.id);
@@ -414,10 +470,12 @@ class QueueProcessor {
   }
 
   /**
-   * Clear all errors
+   * Clear all errors and reset error state
    */
   clearErrors(): void {
     this.errors = [];
+    this.stoppedDueToError = false;
+    this.stopReason = null;
     this.notifyStatusChange();
   }
 

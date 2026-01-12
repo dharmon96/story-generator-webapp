@@ -63,8 +63,14 @@ interface PipelineStepExecution {
 }
 
 const GenerationSettingsTab: React.FC<GenerationSettingsTabProps> = ({ queueItem, storyData }) => {
-  const { settings } = useStore();
+  const { pipelineAssignments } = useStore();
   const [expandedStep, setExpandedStep] = useState<string | null>(null);
+
+  // Helper to get model from pipeline assignments
+  const getModelForStep = (stepId: string): string => {
+    const assignment = pipelineAssignments?.find(a => a.stepId === stepId && a.enabled);
+    return assignment?.modelId || 'Not configured';
+  };
 
   // Mock pipeline execution data based on actual story data and queue item
   const pipelineSteps: PipelineStepExecution[] = [
@@ -77,7 +83,7 @@ const GenerationSettingsTab: React.FC<GenerationSettingsTabProps> = ({ queueItem
       nodeId: 'node_1',
       nodeName: 'Local Ollama',
       nodeType: 'ollama',
-      model: settings.modelConfigs?.find(c => c.step === 'story')?.model || 'llama3.2:3b',
+      model: getModelForStep('story'),
       startTime: queueItem?.startedAt,
       endTime: storyData?.content && queueItem?.startedAt ? new Date(queueItem.startedAt.getTime() + 45000) : undefined,
       duration: storyData?.content ? 45 : undefined,
@@ -100,7 +106,7 @@ const GenerationSettingsTab: React.FC<GenerationSettingsTabProps> = ({ queueItem
       nodeId: 'node_1',
       nodeName: 'Local Ollama',
       nodeType: 'ollama',
-      model: settings.modelConfigs?.find(c => c.step === 'characters')?.model || 'llama3.2:3b',
+      model: getModelForStep('characters'),
       startTime: storyData?.content && queueItem?.startedAt ? new Date(queueItem.startedAt.getTime() + 45000) : undefined,
       endTime: storyData?.characters?.length && queueItem?.startedAt ? new Date(queueItem.startedAt.getTime() + 60000) : undefined,
       duration: storyData?.characters?.length ? 15 : undefined,
@@ -122,7 +128,7 @@ const GenerationSettingsTab: React.FC<GenerationSettingsTabProps> = ({ queueItem
       nodeId: 'node_1',
       nodeName: 'Local Ollama',
       nodeType: 'ollama',
-      model: settings.modelConfigs?.find(c => c.step === 'shots')?.model || 'llama3.2:3b',
+      model: getModelForStep('shots'),
       startTime: storyData?.characters?.length && queueItem?.startedAt ? new Date(queueItem.startedAt.getTime() + 60000) : undefined,
       endTime: storyData?.shots?.length && queueItem?.startedAt ? new Date(queueItem.startedAt.getTime() + 85000) : undefined,
       duration: storyData?.shots?.length ? 25 : undefined,
@@ -145,7 +151,7 @@ const GenerationSettingsTab: React.FC<GenerationSettingsTabProps> = ({ queueItem
       nodeId: 'node_2',
       nodeName: 'OpenAI GPT-4',
       nodeType: 'openai',
-      model: settings.modelConfigs?.find(c => c.step === 'prompts')?.model || 'gpt-4',
+      model: getModelForStep('prompts'),
       startTime: storyData?.shots?.length && queueItem?.startedAt ? new Date(queueItem.startedAt.getTime() + 85000) : undefined,
       endTime: storyData?.shots?.some(s => s.visualPrompt) && queueItem?.startedAt ? new Date(queueItem.startedAt.getTime() + 110000) : undefined,
       duration: storyData?.shots?.some(s => s.visualPrompt) ? 25 : undefined,
@@ -169,7 +175,7 @@ const GenerationSettingsTab: React.FC<GenerationSettingsTabProps> = ({ queueItem
       nodeId: 'node_1',
       nodeName: 'Local Ollama',
       nodeType: 'ollama',
-      model: settings.modelConfigs?.find(c => c.step === 'narration')?.model || 'llama3.2:3b',
+      model: getModelForStep('narration'),
       parameters: {
         voice_style: 'natural',
         pacing: 'moderate',
@@ -187,7 +193,7 @@ const GenerationSettingsTab: React.FC<GenerationSettingsTabProps> = ({ queueItem
       nodeId: 'node_1', 
       nodeName: 'Local Ollama',
       nodeType: 'ollama',
-      model: settings.modelConfigs?.find(c => c.step === 'music')?.model || 'llama3.2:3b',
+      model: getModelForStep('music'),
       parameters: {
         mood: 'auto',
         genre: 'cinematic',
@@ -305,7 +311,7 @@ const GenerationSettingsTab: React.FC<GenerationSettingsTabProps> = ({ queueItem
           />
 
           <Typography variant="body2" color="text.secondary">
-            Pipeline executing with {settings.modelConfigs?.filter(c => c.enabled).length || 0} configured models
+            Pipeline executing with {pipelineAssignments?.filter(a => a.enabled && a.modelId).length || 0} configured steps
           </Typography>
         </CardContent>
       </Card>

@@ -35,6 +35,8 @@ class RenderQueueManager {
   private wsConnections: Map<string, WebSocket> = new Map();
   private statusCheckInterval: NodeJS.Timeout | null = null;
   private statusCheckIntervalMs: number = 10000;  // Check rendering jobs every 10 seconds
+  private syncInterval: NodeJS.Timeout | null = null;
+  private syncIntervalMs: number = 5000;  // Sync node status every 5 seconds
 
   /**
    * Start the render queue processing loop
@@ -52,11 +54,17 @@ class RenderQueueManager {
     // Start status checking for rendering jobs (fallback for disconnected WebSockets)
     this.statusCheckInterval = setInterval(() => this.checkRenderingJobsStatus(), this.statusCheckIntervalMs);
 
+    // Start node status sync (cleans up stale busy states)
+    this.syncInterval = setInterval(() => this.syncNodeStatus(), this.syncIntervalMs);
+
     // Do an immediate check
     this.processQueue();
 
     // Also check for any jobs that might have completed while we were offline
     this.checkRenderingJobsStatus();
+
+    // Initial sync
+    this.syncNodeStatus();
   }
 
   /**
@@ -70,6 +78,10 @@ class RenderQueueManager {
     if (this.statusCheckInterval) {
       clearInterval(this.statusCheckInterval);
       this.statusCheckInterval = null;
+    }
+    if (this.syncInterval) {
+      clearInterval(this.syncInterval);
+      this.syncInterval = null;
     }
     this.isProcessing = false;
 
@@ -93,6 +105,7 @@ class RenderQueueManager {
 
   /**
    * Main queue processing loop
+   * POOL MODE: Assigns jobs to ALL available nodes, not just one
    */
   private async processQueue(): Promise<void> {
     const store = useStore.getState();
@@ -102,46 +115,85 @@ class RenderQueueManager {
       return;
     }
 
-    // Get next job
-    const nextJob = store.getNextRenderJob();
-    if (!nextJob) {
+    // Get all queued jobs
+    const queuedJobs = store.renderQueue.filter(j => j.status === 'queued');
+    if (queuedJobs.length === 0) {
       return;  // No queued jobs
     }
 
-    // Find an available ComfyUI node
-    const availableNode = this.findAvailableRenderNode();
-    if (!availableNode) {
-      // All nodes busy
-      return;
+    // Find ALL available ComfyUI nodes
+    const availableNodes = this.findAllAvailableRenderNodes();
+    if (availableNodes.length === 0) {
+      return;  // All nodes busy
     }
 
-    // Assign the job to the node
-    await this.assignJobToNode(nextJob, availableNode);
+    debugService.info('renderQueue', `🔄 Pool processing: ${queuedJobs.length} queued jobs, ${availableNodes.length} available nodes`);
+
+    // Assign jobs to available nodes (up to the number of available nodes)
+    const assignmentPromises: Promise<void>[] = [];
+    const jobsToAssign = queuedJobs.slice(0, availableNodes.length);
+
+    for (let i = 0; i < jobsToAssign.length; i++) {
+      const job = jobsToAssign[i];
+      const node = availableNodes[i];
+
+      // Mark node as busy IMMEDIATELY to prevent race conditions
+      nodeDiscoveryService.markNodeBusy(node.id, 'comfyui');
+      this.nodeStatus.set(node.id, {
+        nodeId: node.id,
+        currentJobId: job.id,
+        wsConnection: null,
+        lastActivity: new Date()
+      });
+
+      debugService.info('renderQueue', `📤 Assigning job ${job.id} (${job.title}) to node ${node.name}`);
+      assignmentPromises.push(this.assignJobToNode(job, node));
+    }
+
+    // Wait for all assignments to complete
+    await Promise.allSettled(assignmentPromises);
   }
 
   /**
    * Find an available node with ComfyUI capability
    */
   private findAvailableRenderNode(): OllamaNode | null {
+    const available = this.findAllAvailableRenderNodes();
+    return available.length > 0 ? available[0] : null;
+  }
+
+  /**
+   * Find ALL available nodes with ComfyUI capability (for pool processing)
+   */
+  private findAllAvailableRenderNodes(): OllamaNode[] {
     // Get all nodes with ComfyUI capability
     const comfyNodes = nodeDiscoveryService.getComfyUICapableNodes();
+    const availableNodes: OllamaNode[] = [];
 
     for (const node of comfyNodes) {
-      // Check if node is busy with a render job
+      // Check if node is busy with a render job (local tracking)
       const status = this.nodeStatus.get(node.id);
-      if (!status || status.currentJobId === null) {
-        // Node is available
-        if (nodeDiscoveryService.isNodeAvailableFor(node.id, 'comfyui')) {
-          return node;
-        }
+      if (status && status.currentJobId !== null) {
+        continue;  // Node is busy with a job we're tracking
+      }
+
+      // Also check nodeDiscoveryService status
+      if (nodeDiscoveryService.isNodeAvailableFor(node.id, 'comfyui')) {
+        availableNodes.push(node);
       }
     }
 
-    return null;
+    debugService.info('renderQueue', `Found ${availableNodes.length} available ComfyUI nodes out of ${comfyNodes.length} total`, {
+      available: availableNodes.map(n => n.name),
+      total: comfyNodes.map(n => n.name)
+    });
+
+    return availableNodes;
   }
 
   /**
    * Assign a render job to a node and start rendering
+   * Note: Node should already be marked busy by processQueue() before calling this
    */
   private async assignJobToNode(job: RenderJob, node: OllamaNode): Promise<void> {
     const store = useStore.getState();
@@ -163,31 +215,38 @@ class RenderQueueManager {
       attempts: job.attempts + 1
     });
 
-    // Track node status
-    this.nodeStatus.set(node.id, {
-      nodeId: node.id,
-      currentJobId: job.id,
-      wsConnection: null,
-      lastActivity: new Date()
-    });
+    // Track node status (may already be set by processQueue, but ensure it's correct)
+    const existingStatus = this.nodeStatus.get(node.id);
+    if (!existingStatus || existingStatus.currentJobId !== job.id) {
+      this.nodeStatus.set(node.id, {
+        nodeId: node.id,
+        currentJobId: job.id,
+        wsConnection: null,
+        lastActivity: new Date()
+      });
+    }
 
-    // Mark node as busy
+    // Ensure node is marked busy (idempotent - safe to call multiple times)
     nodeDiscoveryService.markNodeBusy(node.id, 'comfyui');
 
     try {
-      // Get the endpoint for ComfyUI - prefer assigned node, fallback to discovered node
-      let endpoint: string | null = null;
+      // ALWAYS get endpoint directly from nodeDiscoveryService using node ID
+      // This ensures we have the latest node info with agentPort for proxy routing
+      const endpoint = nodeDiscoveryService.getNodeEndpoint(node.id, 'comfyui');
 
-      if (assignment?.nodeId) {
-        endpoint = nodeDiscoveryService.getNodeEndpoint(assignment.nodeId, 'comfyui');
-      }
+      // Get fresh node info for debugging
+      const freshNode = nodeDiscoveryService.getNode(node.id);
+      debugService.info('renderQueue', `🔍 Getting endpoint for node ${node.id}`, {
+        nodeId: node.id,
+        nodeName: node.name,
+        passedAgentPort: node.agentPort,
+        freshAgentPort: freshNode?.agentPort,
+        freshComfyUIPort: freshNode?.comfyUIPort,
+        endpoint
+      });
 
       if (!endpoint) {
-        endpoint = nodeDiscoveryService.getNodeEndpoint(node.id, 'comfyui');
-      }
-
-      if (!endpoint) {
-        throw new Error('Could not get ComfyUI endpoint for node');
+        throw new Error(`Could not get ComfyUI endpoint for node ${node.id}`);
       }
 
       // Build the workflow using the assignment settings
@@ -388,10 +447,20 @@ class RenderQueueManager {
 
   /**
    * Connect WebSocket for real-time progress updates
+   * Note: WebSocket connections must go DIRECTLY to ComfyUI, not through agent proxy
    */
   private connectWebSocket(endpoint: string, nodeId: string, jobId: string, promptId: string): void {
-    const wsUrl = endpoint.replace('http://', 'ws://').replace('https://', 'wss://');
+    // Get the DIRECT ComfyUI endpoint for WebSocket (agent doesn't proxy WebSocket)
+    const directEndpoint = nodeDiscoveryService.getNodeEndpoint(nodeId, 'comfyui', false);
+    if (!directEndpoint) {
+      debugService.warn('renderQueue', `Could not get direct ComfyUI endpoint for WebSocket, using polling fallback`);
+      return;
+    }
+
+    const wsUrl = directEndpoint.replace('http://', 'ws://').replace('https://', 'wss://');
     const clientId = `render_queue_${Date.now()}`;
+
+    debugService.info('renderQueue', `🔌 Connecting WebSocket to ${wsUrl}/ws (direct to ComfyUI, not via agent proxy)`);
 
     const ws = new WebSocket(`${wsUrl}/ws?clientId=${clientId}`);
 
@@ -438,6 +507,15 @@ class RenderQueueManager {
   ): void {
     const store = useStore.getState();
 
+    // Log ALL WebSocket messages for debugging (at debug level to avoid spam)
+    debugService.info('renderQueue', `WS message for job ${jobId}`, {
+      type: data.type,
+      dataPromptId: data.data?.prompt_id,
+      ourPromptId: promptId,
+      matches: data.data?.prompt_id === promptId,
+      node: data.data?.node
+    });
+
     // Progress update
     if (data.type === 'progress' && data.data?.prompt_id === promptId) {
       const progress = (data.data.value / data.data.max) * 100;
@@ -448,7 +526,7 @@ class RenderQueueManager {
     // ComfyUI signals completion with 'executing' type where node is null
     // This is the official way to detect when a prompt has finished
     if (data.type === 'executing' && data.data?.prompt_id === promptId && data.data?.node === null) {
-      debugService.info('renderQueue', `Job ${jobId}: Execution finished, fetching output...`);
+      debugService.success('renderQueue', `🎉 Job ${jobId}: Execution finished, fetching output...`);
       this.fetchOutputAndComplete(jobId, nodeId, promptId);
     }
 
@@ -464,6 +542,7 @@ class RenderQueueManager {
     // Execution error
     if (data.type === 'execution_error' && data.data?.prompt_id === promptId) {
       const error = data.data.exception_message || 'Unknown execution error';
+      debugService.error('renderQueue', `Job ${jobId}: Execution error`, { error });
       const job = store.renderQueue.find(j => j.id === jobId);
       if (job) {
         const node = nodeDiscoveryService.getNodes().find(n => n.id === nodeId);
@@ -483,6 +562,12 @@ class RenderQueueManager {
       this.handleJobComplete(jobId, nodeId, {});
       return;
     }
+
+    debugService.info('renderQueue', `📥 Fetching output for job ${jobId}`, {
+      endpoint,
+      promptId,
+      historyUrl: `${endpoint}/history/${promptId}`
+    });
 
     try {
       // Fetch the history for this prompt to get output files
@@ -551,15 +636,26 @@ class RenderQueueManager {
 
     if (renderingJobs.length === 0) return;
 
-    // Get ComfyUI endpoint
-    const comfyNodes = nodeDiscoveryService.getComfyUICapableNodes();
-    if (comfyNodes.length === 0) return;
-
-    const endpoint = nodeDiscoveryService.getNodeEndpoint(comfyNodes[0].id, 'comfyui');
-    if (!endpoint) return;
+    debugService.info('renderQueue', `🔍 Status polling: checking ${renderingJobs.length} rendering job(s)`);
 
     for (const job of renderingJobs) {
       if (!job.comfyPromptId) continue;
+
+      // Use the job's assigned node endpoint, or fall back to first available
+      let endpoint: string | null = null;
+      if (job.assignedNode) {
+        endpoint = nodeDiscoveryService.getNodeEndpoint(job.assignedNode, 'comfyui');
+      }
+      if (!endpoint) {
+        const comfyNodes = nodeDiscoveryService.getComfyUICapableNodes();
+        if (comfyNodes.length > 0) {
+          endpoint = nodeDiscoveryService.getNodeEndpoint(comfyNodes[0].id, 'comfyui');
+        }
+      }
+      if (!endpoint) {
+        debugService.warn('renderQueue', `No endpoint available to check job ${job.id}`);
+        continue;
+      }
 
       try {
         const response = await fetch(`${endpoint}/history/${job.comfyPromptId}`);
@@ -615,12 +711,16 @@ class RenderQueueManager {
             }
           }
 
-          // Build output URL
+          // Build output URL (include subfolder if present)
           let outputUrl: string | undefined;
           if (outputData.output?.videos?.[0]) {
-            outputUrl = `${endpoint}/view?filename=${outputData.output.videos[0].filename}&type=output`;
+            const video = outputData.output.videos[0];
+            const subfolder = video.subfolder ? `&subfolder=${encodeURIComponent(video.subfolder)}` : '';
+            outputUrl = `${endpoint}/view?filename=${encodeURIComponent(video.filename)}&type=output${subfolder}`;
           } else if (outputData.output?.images?.[0]) {
-            outputUrl = `${endpoint}/view?filename=${outputData.output.images[0].filename}&type=output`;
+            const image = outputData.output.images[0];
+            const subfolder = image.subfolder ? `&subfolder=${encodeURIComponent(image.subfolder)}` : '';
+            outputUrl = `${endpoint}/view?filename=${encodeURIComponent(image.filename)}&type=output${subfolder}`;
           }
 
           store.updateRenderJob(job.id, {
@@ -650,13 +750,18 @@ class RenderQueueManager {
     const store = useStore.getState();
 
     // Extract output URL if available
+    // ComfyUI output objects have: filename, subfolder (optional), type
     let outputUrl: string | undefined;
     if (data.output?.videos?.[0]) {
       const endpoint = nodeDiscoveryService.getNodeEndpoint(nodeId, 'comfyui');
-      outputUrl = `${endpoint}/view?filename=${data.output.videos[0].filename}&type=output`;
+      const video = data.output.videos[0];
+      const subfolder = video.subfolder ? `&subfolder=${encodeURIComponent(video.subfolder)}` : '';
+      outputUrl = `${endpoint}/view?filename=${encodeURIComponent(video.filename)}&type=output${subfolder}`;
     } else if (data.output?.images?.[0]) {
       const endpoint = nodeDiscoveryService.getNodeEndpoint(nodeId, 'comfyui');
-      outputUrl = `${endpoint}/view?filename=${data.output.images[0].filename}&type=output`;
+      const image = data.output.images[0];
+      const subfolder = image.subfolder ? `&subfolder=${encodeURIComponent(image.subfolder)}` : '';
+      outputUrl = `${endpoint}/view?filename=${encodeURIComponent(image.filename)}&type=output${subfolder}`;
     }
 
     store.updateRenderJob(jobId, {
@@ -725,18 +830,96 @@ class RenderQueueManager {
   }
 
   /**
-   * Get status of all render nodes
+   * Sync node status - cleans up stale busy states
+   * This runs periodically to ensure local tracking matches actual state
    */
-  getNodeStatuses(): { nodeId: string; nodeName: string; busy: boolean; currentJob: string | null }[] {
+  private syncNodeStatus(): void {
+    const store = useStore.getState();
+    const activeJobIds = new Set(
+      store.renderQueue
+        .filter(j => j.status === 'rendering' || j.status === 'assigned')
+        .map(j => j.id)
+    );
+
+    let cleanedCount = 0;
+
+    // Check each tracked node
+    this.nodeStatus.forEach((status, nodeId) => {
+      if (status.currentJobId) {
+        // If the job is no longer active, release the node
+        if (!activeJobIds.has(status.currentJobId)) {
+          debugService.warn('renderQueue', `🧹 Cleaning stale node status for ${nodeId} (job ${status.currentJobId} no longer active)`);
+          this.releaseNode(nodeId);
+          cleanedCount++;
+        }
+      }
+    });
+
+    // Also check for nodes that nodeDiscoveryService thinks are busy for comfyui
+    // but we have no tracking for - these might be stale from a previous session
+    const comfyNodes = nodeDiscoveryService.getComfyUICapableNodes();
+    for (const node of comfyNodes) {
+      const localStatus = this.nodeStatus.get(node.id);
+      const hasActiveLocalJob = localStatus?.currentJobId && activeJobIds.has(localStatus.currentJobId);
+
+      // If nodeDiscoveryService says busy but we have no active job, mark available
+      if (node.comfyuiStatus === 'busy' && !hasActiveLocalJob) {
+        debugService.warn('renderQueue', `🧹 Clearing stale comfyui busy status for ${node.name} (no active render job)`);
+        nodeDiscoveryService.markNodeAvailable(node.id, 'comfyui');
+        cleanedCount++;
+      }
+    }
+
+    if (cleanedCount > 0) {
+      debugService.info('renderQueue', `🧹 Sync complete: cleaned ${cleanedCount} stale status(es)`);
+    }
+  }
+
+  /**
+   * Force sync node status (can be called externally)
+   */
+  forceSync(): void {
+    debugService.info('renderQueue', '🔄 Force sync requested');
+    this.syncNodeStatus();
+  }
+
+  /**
+   * Get status of all render nodes
+   * Checks both local render job tracking AND nodeDiscoveryService status
+   */
+  getNodeStatuses(): { nodeId: string; nodeName: string; busy: boolean; currentJob: string | null; busyReason?: string }[] {
     const nodes = nodeDiscoveryService.getComfyUICapableNodes();
 
     return nodes.map(node => {
       const status = this.nodeStatus.get(node.id);
+      const hasRenderJob = status?.currentJobId !== null && status?.currentJobId !== undefined;
+
+      // Check if node is available for ComfyUI work (considers both comfyui AND ollama busy status)
+      const isAvailableForComfyUI = nodeDiscoveryService.isNodeAvailableFor(node.id, 'comfyui');
+
+      // Determine busy reason for better UI feedback
+      let busyReason: string | undefined;
+      if (hasRenderJob) {
+        busyReason = 'Rendering';
+      } else if (!isAvailableForComfyUI) {
+        // Check what's making it unavailable
+        if (node.comfyuiStatus === 'busy') {
+          busyReason = 'ComfyUI busy';
+        } else if (node.ollamaStatus === 'busy') {
+          busyReason = 'Ollama busy';
+        } else if (node.status === 'offline') {
+          busyReason = 'Offline';
+        } else {
+          busyReason = 'Unavailable';
+        }
+      }
+
       return {
         nodeId: node.id,
         nodeName: node.name,
-        busy: status?.currentJobId !== null && status?.currentJobId !== undefined,
-        currentJob: status?.currentJobId || null
+        busy: hasRenderJob || !isAvailableForComfyUI,
+        currentJob: status?.currentJobId || null,
+        busyReason
       };
     });
   }

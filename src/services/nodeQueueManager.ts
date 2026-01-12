@@ -1,4 +1,4 @@
-import { ModelConfig } from '../store/useStore';
+import { ModelConfig, useStore } from '../store/useStore';
 import { nodeDiscoveryService, OllamaNode } from './nodeDiscovery';
 import { debugService } from './debugService';
 import { aiLogService } from './aiLogService';
@@ -413,24 +413,30 @@ class NodeQueueManager {
     
     for (const config of modelConfigs) {
       console.log(`  🔍 Checking configured node ${config.nodeId} with model ${config.model}`);
-      const node = nodes.find(n => 
-        n.id === config.nodeId && 
+      const node = nodes.find(n =>
+        n.id === config.nodeId &&
         n.status === 'online' &&
         n.models.includes(config.model)
       );
-      
+
       if (node) {
-        console.log(`    ✅ Found node ${node.name}, checking availability`);
+        console.log(`    ✅ Found node ${node.name} (type: ${node.type}), checking availability`);
         const stats = this.getOrCreateNodeStats(node.id);
-        if (stats.isAvailable) {
-          availableNodes.push({ 
-            node, 
+
+        // Cloud services (openai, claude, google) don't have Ollama capability
+        // so skip the Ollama availability check for them
+        const isCloudService = node.type === 'openai' || node.type === 'claude' || node.type === 'google';
+        const ollamaAvailable = isCloudService ? true : nodeDiscoveryService.isNodeAvailableFor(node.id, 'ollama');
+
+        if (stats.isAvailable && ollamaAvailable) {
+          availableNodes.push({
+            node,
             model: config.model,
-            stats 
+            stats
           });
-          console.log(`    ✅ Node is available`);
+          console.log(`    ✅ Node is available${isCloudService ? ' (cloud service)' : ' (local stats + Ollama not busy)'}`);
         } else {
-          console.log(`    ❌ Node is busy`);
+          console.log(`    ❌ Node is busy (local available: ${stats.isAvailable}, ollama available: ${ollamaAvailable})`);
         }
       } else {
         console.log(`    ❌ Node not found or offline`);
@@ -445,11 +451,19 @@ class NodeQueueManager {
     // Select node with lowest current load
     availableNodes.sort((a, b) => a.stats.currentTasks - b.stats.currentTasks);
     const selected = availableNodes[0];
-    
+
     // Update node stats
     selected.stats.currentTasks++;
     selected.stats.lastUsed = new Date();
-    
+
+    // CRITICAL: Mark node as busy IMMEDIATELY to prevent race conditions
+    // This ensures other concurrent tasks don't grab the same node
+    const isCloudService = selected.node.type === 'openai' || selected.node.type === 'claude' || selected.node.type === 'google';
+    if (!isCloudService) {
+      nodeDiscoveryService.markNodeBusy(selected.node.id, 'ollama');
+      console.log(`🔒 Node ${selected.node.id} marked busy immediately after selection`);
+    }
+
     return {
       nodeId: selected.node.id,
       model: selected.model
@@ -588,7 +602,10 @@ class NodeQueueManager {
     if (!node) {
       throw new Error(`Node ${task.assignedNode} not found`);
     }
-    
+
+    // Node is already marked busy in findBestNodeForTask() to prevent race conditions
+    const isCloudService = node.type === 'openai' || node.type === 'claude' || node.type === 'google';
+
     try {
       const result = await this.executeTaskByType(task, node, task.assignedModel);
       return {
@@ -600,6 +617,12 @@ class NodeQueueManager {
     } catch (error) {
       console.error(`❌ Task execution failed:`, error);
       throw error;
+    } finally {
+      // Mark node as available again when task completes (success or failure)
+      if (!isCloudService) {
+        nodeDiscoveryService.markNodeAvailable(task.assignedNode, 'ollama');
+        console.log(`🔓 Node ${task.assignedNode} marked available after task completion`);
+      }
     }
   }
 
@@ -1164,7 +1187,7 @@ ${contentToProcess}`;
         const sceneSetting = data.scene_setting || data.sceneSetting || '';
 
         const shots = data.shots.map((shot: any, index: number) => ({
-          id: `shot_${Date.now()}_${index}`,
+          id: `shot_${Date.now()}_${index}_${Math.random().toString(36).substr(2, 9)}`,
           storyId: task.data.story.id,
           shotNumber: shot.shot_number || shot.shotNumber || index + 1,
           description: shot.description || shot.content || `Shot ${index + 1}`,
@@ -1694,14 +1717,19 @@ Create a complete HoloCine scene from this story part. Generate:
 
     let response: string;
     try {
-      if (node.type === 'ollama') {
+      // Handle unified nodes that have Ollama capability
+      // Unified nodes are nodes with both Ollama and ComfyUI
+      const hasOllamaCapability = node.type === 'ollama' ||
+        (node.type === 'unified' && node.capabilities?.ollama);
+
+      if (hasOllamaCapability) {
         response = await this.callOllama(node, model, systemPrompt, userPrompt);
       } else if (node.type === 'openai') {
         response = await this.callOpenAI(model, systemPrompt, userPrompt);
       } else if (node.type === 'claude') {
         response = await this.callClaude(model, systemPrompt, userPrompt);
       } else {
-        throw new Error(`Unsupported node type: ${node.type}`);
+        throw new Error(`Unsupported node type: ${node.type} (capabilities: ${JSON.stringify(node.capabilities)})`);
       }
 
       // Log the successful response
@@ -1743,15 +1771,27 @@ Create a complete HoloCine scene from this story part. Generate:
 
   private async callOllama(node: any, model: string, systemPrompt: string, userPrompt: string): Promise<string> {
     const timestamp = new Date().toISOString();
+    // For unified nodes, prefer ollamaPort; otherwise use the default port
+    const ollamaPort = node.ollamaPort || node.port;
+
+    // If node has an agent port, route through the agent proxy for job tracking
+    // Otherwise, call Ollama directly (for non-agent nodes or fallback)
+    const useAgentProxy = !!node.agentPort;
+    const endpoint = useAgentProxy
+      ? `http://${node.host}:${node.agentPort}/proxy/ollama/api/generate`
+      : `http://${node.host}:${ollamaPort}/api/generate`;
+
     debugService.info('ai', `🤖 ===== CALLING OLLAMA =====`);
-    debugService.info('ai', `Node: ${node.host}:${node.port}, Model: ${model}`, {
-      node: `${node.host}:${node.port}`,
+    debugService.info('ai', `Node: ${node.host}:${ollamaPort}, Model: ${model}${useAgentProxy ? ' (via agent proxy)' : ''}`, {
+      node: `${node.host}:${ollamaPort}`,
       model,
+      useAgentProxy,
+      endpoint,
       systemPrompt: systemPrompt.slice(0, 200) + '...',
       userPrompt: userPrompt.slice(0, 300) + '...',
       timestamp
     });
-    
+
     const requestBody = {
       model: model,
       system: systemPrompt,
@@ -1763,10 +1803,11 @@ Create a complete HoloCine scene from this story part. Generate:
         num_predict: 8192  // Increase max tokens for longer shot list responses
       }
     };
-    
+
     console.log(`🤖 [${timestamp}] Request Body:`, JSON.stringify(requestBody, null, 2));
-    
-    const response = await fetch(`http://${node.host}:${node.port}/api/generate`, {
+    console.log(`🤖 [${timestamp}] Endpoint: ${endpoint}`);
+
+    const response = await fetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1790,35 +1831,57 @@ Create a complete HoloCine scene from this story part. Generate:
       preview: data.response.slice(0, 200) + '...',
       timestamp: responseTimestamp
     });
-    
+
     return data.response;
   }
 
   private async callOpenAI(model: string, systemPrompt: string, userPrompt: string): Promise<string> {
     const timestamp = new Date().toISOString();
+
+    // Strip the 'openai:' prefix if present (internal routing prefix)
+    const actualModel = model.startsWith('openai:') ? model.slice(7) : model;
+
     debugService.info('ai', `🤖 ===== CALLING OPENAI =====`);
-    debugService.info('ai', `OpenAI Model: ${model}`, {
-      model,
+    debugService.info('ai', `OpenAI Model: ${actualModel}`, {
+      model: actualModel,
+      originalModel: model,
       systemPrompt: systemPrompt.slice(0, 200) + '...',
       userPrompt: userPrompt.slice(0, 300) + '...',
       timestamp
     });
-    
-    const apiKey = nodeDiscoveryService.getAPIKey('openai');
+
+    // Get API key from store's cloudServices (primary) or nodeDiscoveryService (fallback)
+    const store = useStore.getState();
+    const openaiService = store.cloudServices.find(s => s.type === 'openai');
+    const apiKey = openaiService?.apiKey || nodeDiscoveryService.getAPIKey('openai');
     if (!apiKey) {
-      throw new Error('OpenAI API key not configured');
+      throw new Error('OpenAI API key not configured. Please add your API key in Settings > Cloud Services.');
     }
 
-    const requestBody = {
-      model: model,
+    // Newer OpenAI models (o1, o3, gpt-4o, etc.) use max_completion_tokens
+    // Older models (gpt-3.5-turbo, gpt-4) use max_tokens
+    const isNewerModel = actualModel.startsWith('o1') ||
+                         actualModel.startsWith('o3') ||
+                         actualModel.startsWith('gpt-4o') ||
+                         actualModel.startsWith('gpt-4-turbo') ||
+                         actualModel.includes('preview');
+
+    const requestBody: any = {
+      model: actualModel,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt }
       ],
       temperature: 0.7,
-      max_tokens: 2000
     };
-    
+
+    // Use the appropriate token limit parameter based on model
+    if (isNewerModel) {
+      requestBody.max_completion_tokens = 2000;
+    } else {
+      requestBody.max_tokens = 2000;
+    }
+
     console.log(`🤖 [${timestamp}] Request Body:`, JSON.stringify(requestBody, null, 2));
 
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -1853,21 +1916,29 @@ Create a complete HoloCine scene from this story part. Generate:
 
   private async callClaude(model: string, systemPrompt: string, userPrompt: string): Promise<string> {
     const timestamp = new Date().toISOString();
+
+    // Strip the 'claude:' prefix if present (internal routing prefix)
+    const actualModel = model.startsWith('claude:') ? model.slice(7) : model;
+
     debugService.info('ai', `🤖 ===== CALLING CLAUDE =====`);
-    debugService.info('ai', `Claude Model: ${model}`, {
-      model,
+    debugService.info('ai', `Claude Model: ${actualModel}`, {
+      model: actualModel,
+      originalModel: model,
       systemPrompt: systemPrompt.slice(0, 200) + '...',
       userPrompt: userPrompt.slice(0, 300) + '...',
       timestamp
     });
-    
-    const apiKey = nodeDiscoveryService.getAPIKey('claude');
+
+    // Get API key from store's cloudServices (primary) or nodeDiscoveryService (fallback)
+    const store = useStore.getState();
+    const claudeService = store.cloudServices.find(s => s.type === 'claude');
+    const apiKey = claudeService?.apiKey || nodeDiscoveryService.getAPIKey('claude');
     if (!apiKey) {
-      throw new Error('Claude API key not configured');
+      throw new Error('Claude API key not configured. Please add your API key in Settings > Cloud Services.');
     }
 
     const requestBody = {
-      model: model,
+      model: actualModel,
       max_tokens: 2000,
       system: systemPrompt,
       messages: [
@@ -1910,7 +1981,17 @@ Create a complete HoloCine scene from this story part. Generate:
 
   private handleTaskError(task: QueueTask, error: Error, queue: ProcessingQueue) {
     task.attempts++;
-    
+
+    // Release the node if it was assigned (marked busy in findBestNodeForTask)
+    if (task.assignedNode) {
+      const node = nodeDiscoveryService.getNode(task.assignedNode);
+      const isCloudService = node?.type === 'openai' || node?.type === 'claude' || node?.type === 'google';
+      if (!isCloudService) {
+        nodeDiscoveryService.markNodeAvailable(task.assignedNode, 'ollama');
+        console.log(`🔓 Node ${task.assignedNode} released after task error`);
+      }
+    }
+
     if (task.attempts < task.maxAttempts) {
       // Retry the task
       console.log(`🔄 Retrying task ${task.id} (attempt ${task.attempts}/${task.maxAttempts})`);
@@ -1924,25 +2005,25 @@ Create a complete HoloCine scene from this story part. Generate:
       task.status = 'failed';
       task.completedAt = new Date();
       task.error = error.message;
-      
+
       // Update node stats if assigned
       if (task.assignedNode) {
         const stats = this.getOrCreateNodeStats(task.assignedNode);
         stats.currentTasks--;
         stats.failedTasks++;
       }
-      
+
       // Notify error callback
       const errorCallback = this.errorCallbacks.get(task.id);
       if (errorCallback) {
         errorCallback(error);
       }
-      
+
       // Clean up callbacks after error
       this.taskCallbacks.delete(task.id);
       this.errorCallbacks.delete(task.id);
       this.progressCallbacks.delete(task.id);
-      
+
       console.error(`❌ Task ${task.id} failed after ${task.maxAttempts} attempts:`, error.message);
     }
   }

@@ -22,6 +22,24 @@ import {
 } from '../../types/agentTypes';
 
 /**
+ * Maps backend workflow IDs (from agent heartbeat) to frontend video model IDs
+ * Backend uses descriptive IDs like "hunyuan_video_1.5_720p_t2v"
+ * Frontend uses short IDs like "hunyuan15" for VIDEO_MODELS
+ */
+const WORKFLOW_ID_MAP: Record<string, string> = {
+  'hunyuan_video_1.5_720p_t2v': 'hunyuan15',
+  'wan2.2_14B_t2v': 'wan22',
+  'holocine': 'holocine'
+};
+
+/**
+ * Convert backend workflow ID to frontend video model ID
+ */
+const mapWorkflowId = (backendId: string): string => {
+  return WORKFLOW_ID_MAP[backendId] || backendId;
+};
+
+/**
  * Agent slice state and actions
  */
 export interface AgentSlice {
@@ -31,6 +49,9 @@ export interface AgentSlice {
   pipelineAssignments: PipelineModelAssignment[];
   isScanning: boolean;
   lastScanTime: string | null;
+  // Map of agentId -> set of disabled model names
+  // Models not in this map (or set to false) are enabled
+  disabledModels: Record<string, string[]>;
 
   // Agent actions
   setAgents: (agents: AgentNode[]) => void;
@@ -53,6 +74,12 @@ export interface AgentSlice {
   setScanning: (isScanning: boolean) => void;
   setLastScanTime: (time: string | null) => void;
 
+  // Model filtering actions
+  toggleModelEnabled: (agentId: string, modelName: string) => void;
+  setModelEnabled: (agentId: string, modelName: string, enabled: boolean) => void;
+  isModelEnabled: (agentId: string, modelName: string) => boolean;
+  getEnabledModelsForAgent: (agentId: string) => string[];
+
   // Computed getters
   getOnlineAgents: () => AgentNode[];
   getLocalAgents: () => AgentNode[];
@@ -73,6 +100,7 @@ export const createAgentSlice: StateCreator<AgentSlice, [], [], AgentSlice> = (s
   pipelineAssignments: DEFAULT_PIPELINE_ASSIGNMENTS,
   isScanning: false,
   lastScanTime: null,
+  disabledModels: {},
 
   // Agent actions
   setAgents: (agents) => set({ agents }),
@@ -151,6 +179,71 @@ export const createAgentSlice: StateCreator<AgentSlice, [], [], AgentSlice> = (s
 
   setLastScanTime: (time) => set({ lastScanTime: time }),
 
+  // Model filtering actions
+  toggleModelEnabled: (agentId, modelName) =>
+    set((state) => {
+      const currentDisabled = state.disabledModels[agentId] || [];
+      const isCurrentlyDisabled = currentDisabled.includes(modelName);
+
+      if (isCurrentlyDisabled) {
+        // Enable it (remove from disabled list)
+        return {
+          disabledModels: {
+            ...state.disabledModels,
+            [agentId]: currentDisabled.filter((m) => m !== modelName)
+          }
+        };
+      } else {
+        // Disable it (add to disabled list)
+        return {
+          disabledModels: {
+            ...state.disabledModels,
+            [agentId]: [...currentDisabled, modelName]
+          }
+        };
+      }
+    }),
+
+  setModelEnabled: (agentId, modelName, enabled) =>
+    set((state) => {
+      const currentDisabled = state.disabledModels[agentId] || [];
+      const isCurrentlyDisabled = currentDisabled.includes(modelName);
+
+      if (enabled && isCurrentlyDisabled) {
+        // Enable it (remove from disabled list)
+        return {
+          disabledModels: {
+            ...state.disabledModels,
+            [agentId]: currentDisabled.filter((m) => m !== modelName)
+          }
+        };
+      } else if (!enabled && !isCurrentlyDisabled) {
+        // Disable it (add to disabled list)
+        return {
+          disabledModels: {
+            ...state.disabledModels,
+            [agentId]: [...currentDisabled, modelName]
+          }
+        };
+      }
+      return state;
+    }),
+
+  isModelEnabled: (agentId, modelName) => {
+    const { disabledModels } = get();
+    const disabled = disabledModels[agentId] || [];
+    return !disabled.includes(modelName);
+  },
+
+  getEnabledModelsForAgent: (agentId) => {
+    const { agents } = get();
+    const agent = agents.find((a) => a.id === agentId);
+    if (!agent || !agent.ollama?.models) return [];
+
+    // Agent already filters models on its side - the models list only contains enabled models
+    return agent.ollama.models;
+  },
+
   // Computed getters
   getOnlineAgents: () => {
     const { agents } = get();
@@ -166,9 +259,14 @@ export const createAgentSlice: StateCreator<AgentSlice, [], [], AgentSlice> = (s
     const { agents, cloudServices } = get();
     const models = new Set<string>();
 
-    // Collect models from local agents
+    // Collect models from online/busy local agents
+    // Note: Agent already filters models on its side - we trust the agent's models list
     agents.forEach((agent) => {
-      if (agent.ollama?.available && agent.ollama.models) {
+      if (
+        agent.ollama?.available &&
+        agent.ollama.models &&
+        (agent.status === 'online' || agent.status === 'busy')
+      ) {
         agent.ollama.models.forEach((model) => models.add(model));
       }
     });
@@ -187,16 +285,29 @@ export const createAgentSlice: StateCreator<AgentSlice, [], [], AgentSlice> = (s
     const { agents } = get();
 
     // Check if it's a cloud model (format: "provider:model")
-    if (modelId.includes(':')) {
+    // But Ollama models like "llama3.1:latest" also have colons, so check against known providers
+    const CLOUD_PROVIDERS = ['openai', 'claude', 'google'];
+    const [potentialProvider] = modelId.split(':');
+    if (CLOUD_PROVIDERS.includes(potentialProvider)) {
       return []; // Cloud models don't have local agents
     }
 
-    return agents.filter(
+    // Debug: Log what models each agent has
+    console.log(`[getAgentsForModel] Looking for model: "${modelId}"`);
+    agents.forEach((agent) => {
+      console.log(`  Agent ${agent.hostname} (${agent.id.slice(0, 8)}): status=${agent.status}, ollama.available=${agent.ollama?.available}, models=`, agent.ollama?.models);
+    });
+
+    // Agent already filters models on its side - we trust the agent's models list
+    const result = agents.filter(
       (agent) =>
         agent.ollama?.available &&
         agent.ollama.models.includes(modelId) &&
         (agent.status === 'online' || agent.status === 'busy')
     );
+
+    console.log(`[getAgentsForModel] Found ${result.length} agents with model "${modelId}"`);
+    return result;
   },
 
   getVideoModelStatus: () => {
@@ -273,12 +384,12 @@ export const createAgentSlice: StateCreator<AgentSlice, [], [], AgentSlice> = (s
       return service?.status === 'online';
     }
 
-    // Check local agents
+    // Check local agents (online or busy agents can execute)
     const availableAgents = agents.filter(
       (agent) =>
         agent.ollama?.available &&
         agent.ollama.models.includes(modelId) &&
-        agent.status === 'online'
+        (agent.status === 'online' || agent.status === 'busy')
     );
 
     return availableAgents.length > 0;
@@ -289,6 +400,20 @@ export const createAgentSlice: StateCreator<AgentSlice, [], [], AgentSlice> = (s
  * Helper to convert agent data from API response to AgentNode
  */
 export function apiResponseToAgentNode(data: any, agentUrl: string): AgentNode {
+  // Determine if agent is busy (has active job on either service)
+  const ollamaBusy = !!data.ollama?.current_job;
+  const comfyuiBusy = !!data.comfyui?.current_job;
+  const isBusy = ollamaBusy || comfyuiBusy;
+
+  // Use backend status if provided, otherwise determine from service availability and job status
+  const hasServices = data.ollama?.available || data.comfyui?.available;
+  let status = data.status || (hasServices ? 'online' : 'offline');
+
+  // Override to 'busy' if there's an active job
+  if (status === 'online' && isBusy) {
+    status = 'busy';
+  }
+
   return {
     id: data.node_id || data.id,
     hostname: data.hostname || 'Unknown',
@@ -297,8 +422,8 @@ export function apiResponseToAgentNode(data: any, agentUrl: string): AgentNode {
     ipAddresses: data.ip_addresses || [],
     agentPort: data.agent_port || 8765,
     agentUrl,
-    status: data.ollama?.available || data.comfyui?.available ? 'online' : 'offline',
-    lastHeartbeat: data.timestamp || new Date().toISOString(),
+    status: status as 'online' | 'offline' | 'busy' | 'checking',
+    lastHeartbeat: data.last_heartbeat || data.timestamp || new Date().toISOString(),
     lastChecked: new Date().toISOString(),
     ollama: data.ollama?.available
       ? {
@@ -331,11 +456,11 @@ export function apiResponseToAgentNode(data: any, agentUrl: string): AgentNode {
       ? {
           available: true,
           port: data.comfyui.port || 8000,
-          workflows: data.workflows?.ready?.map((id: string) => ({
-            id,
+          workflows: (data.workflows?.supported || []).map((id: string) => ({
+            id: mapWorkflowId(id),  // Map backend workflow ID to frontend video model ID
             name: id,
-            available: true
-          })) || [],
+            available: (data.workflows?.ready || []).includes(id)  // Check if all models are ready
+          })),
           busy: !!data.comfyui.current_job,
           currentJob: data.comfyui.current_job
             ? {

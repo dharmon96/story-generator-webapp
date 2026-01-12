@@ -40,11 +40,17 @@ export const PipelineConfigSection: React.FC = () => {
     setAllPipelineModels,
     getAllAvailableModels,
     getAgentsForModel,
-    canExecuteStep
+    canExecuteStep,
+    // Subscribe to agents and cloudServices to trigger re-renders when they change
+    agents,
+    cloudServices
   } = useStore();
 
   // Get all available models from agents and cloud services
-  const availableModels = useMemo(() => getAllAvailableModels(), [getAllAvailableModels]);
+  // The agents and cloudServices subscriptions ensure re-renders when agent state changes
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _agentCount = agents.length + cloudServices.length; // Force subscription usage
+  const availableModels = getAllAvailableModels();
 
   // Get assignment for a step
   const getAssignment = (stepId: PipelineStepId) => {
@@ -72,8 +78,12 @@ export const PipelineConfigSection: React.FC = () => {
     }
   };
 
-  // Check if model is from cloud
-  const isCloudModel = (modelId: string) => modelId.includes(':');
+  // Check if model is from cloud (prefixed with provider name like "openai:", "claude:", "google:")
+  const CLOUD_PROVIDERS = ['openai', 'claude', 'google'];
+  const isCloudModel = (modelId: string) => {
+    const provider = modelId.split(':')[0];
+    return CLOUD_PROVIDERS.includes(provider);
+  };
 
   // Get agent count for a model
   const getModelAgentCount = (modelId: string) => {
@@ -95,7 +105,8 @@ export const PipelineConfigSection: React.FC = () => {
     });
 
     return { local, cloud };
-  }, [availableModels]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [availableModels]); // isCloudModel is stable (pure function with no deps)
 
   return (
     <Paper sx={{ p: 3 }}>

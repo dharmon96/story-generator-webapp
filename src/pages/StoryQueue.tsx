@@ -21,6 +21,7 @@ import {
   DialogContent,
   DialogActions,
   Alert,
+  Collapse,
 } from '@mui/material';
 import {
   PlayArrow,
@@ -38,6 +39,9 @@ import {
   Movie,
   MovieFilter,
   Build,
+  ExpandMore,
+  ExpandLess,
+  ReplayOutlined,
 } from '@mui/icons-material';
 import { useStore } from '../store/useStore';
 import { debugService } from '../services/debugService';
@@ -51,17 +55,33 @@ interface StoryQueueProps {
 }
 
 const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
-  const { queue, renderQueue, removeFromQueue, clearCompletedQueue, moveQueueItem, updateQueueItem, addStory, reQueueItem, settings } = useStore();
+  const { queue, renderQueue, removeFromQueue, clearCompletedQueue, moveQueueItem, updateQueueItem, addStory, reQueueItem, settings, getModelConfigsFromAssignments, agents, pipelineAssignments } = useStore();
   const [selectedItem, setSelectedItem] = useState<string | null>(null);
   const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
   const [customStoryDialogOpen, setCustomStoryDialogOpen] = useState(false);
+  const [expandedErrors, setExpandedErrors] = useState<Set<string>>(new Set());
   const [processingStatus, setProcessingStatus] = useState<ProcessingStatus>({
     isProcessing: false,
     currentItemId: null,
     startedAt: null,
     queueLength: 0,
-    errors: []
+    errors: [],
+    stoppedDueToError: false,
+    stopReason: null
   });
+
+  // Toggle error expansion for a queue item
+  const toggleErrorExpansion = (itemId: string) => {
+    setExpandedErrors(prev => {
+      const next = new Set(prev);
+      if (next.has(itemId)) {
+        next.delete(itemId);
+      } else {
+        next.add(itemId);
+      }
+      return next;
+    });
+  };
 
   // Logging function
   const addDebugLog = useCallback((message: string, level: 'info' | 'error' | 'success' | 'warning' = 'info') => {
@@ -149,13 +169,20 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
       // Start processing
       try {
         addDebugLog('🚀 Starting queue processing...', 'success');
-        
+
         // Clear any previous errors
         queueProcessor.clearErrors();
-        
+
+        // Sync agents to legacy nodeDiscoveryService for pipeline compatibility
+        nodeDiscoveryService.syncFromAgents(agents);
+
+        // Use the bridge function to get modelConfigs from pipelineAssignments
+        const modelConfigs = getModelConfigsFromAssignments();
+        addDebugLog(`📋 Model configs: ${modelConfigs.length} configured, steps: ${modelConfigs.map(c => c.step).join(', ')}`);
+
         await queueProcessor.startProcessing(
           queue,
-          settings.modelConfigs || [],
+          modelConfigs,
           updateQueueItem,
           addStory
         );
@@ -177,7 +204,7 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
         });
       }
     }
-  }, [processingStatus.isProcessing, queue, settings.modelConfigs, updateQueueItem, addStory, reQueueItem, addDebugLog]);
+  }, [processingStatus.isProcessing, queue, getModelConfigsFromAssignments, updateQueueItem, addStory, reQueueItem, addDebugLog, agents]);
 
   const handleOpenStory = (item: any) => {
     if (onOpenStory) {
@@ -345,11 +372,11 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
     const methodId = item.config.generationMethod || 'wan22';
     const method = GENERATION_METHODS.find(m => m.id === methodId);
 
-    // Find LLM model from settings (for the 'story' step)
-    const storyModelConfig = settings.modelConfigs?.find(
-      c => c.step === 'story' && c.enabled
+    // Find LLM model from pipeline assignments (for the 'story' step)
+    const storyAssignment = pipelineAssignments?.find(
+      a => a.stepId === 'story' && a.enabled
     );
-    const llmModel = storyModelConfig?.model || 'Default LLM';
+    const llmModel = storyAssignment?.modelId || 'Default LLM';
 
     // Shorten model name for display
     const shortLlmName = llmModel
@@ -387,10 +414,14 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
       const startImmediateProcessing = async () => {
         try {
           addDebugLog('🚀 Starting immediate processing for high-priority items...', 'success');
-          
+
+          // Sync agents to legacy nodeDiscoveryService for pipeline compatibility
+          nodeDiscoveryService.syncFromAgents(agents);
+
+          const modelConfigs = getModelConfigsFromAssignments();
           await queueProcessor.startProcessing(
             queue,
-            settings.modelConfigs || [],
+            modelConfigs,
             updateQueueItem,
             addStory
           );
@@ -402,7 +433,7 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
       
       startImmediateProcessing();
     }
-  }, [queue, processingStatus.isProcessing, updateQueueItem, addStory, addDebugLog, settings.processingEnabled, settings.modelConfigs]);
+  }, [queue, processingStatus.isProcessing, updateQueueItem, addStory, addDebugLog, settings.processingEnabled, getModelConfigsFromAssignments, pipelineAssignments, agents]);
 
   // Manual queue processing only starts when user clicks "Start Processing" button
 
@@ -577,6 +608,55 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
         )}
       </Paper>
 
+      {/* Configuration Error Banner - Prominent alert when queue stopped due to config error */}
+      {processingStatus.stoppedDueToError && processingStatus.stopReason === 'configuration' && (
+        <Alert
+          severity="error"
+          variant="filled"
+          sx={{
+            mb: 3,
+            '& .MuiAlert-message': { width: '100%' }
+          }}
+          action={
+            <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+              <Button
+                color="inherit"
+                size="small"
+                onClick={() => {
+                  // Clear errors and allow restart
+                  queueProcessor.clearErrors();
+                }}
+              >
+                Dismiss
+              </Button>
+              <Button
+                color="inherit"
+                size="small"
+                variant="outlined"
+                onClick={handleToggleProcessing}
+              >
+                Retry
+              </Button>
+            </Box>
+          }
+        >
+          <Typography variant="subtitle1" fontWeight="bold" gutterBottom>
+            Queue Stopped - Configuration Error
+          </Typography>
+          <Typography variant="body2">
+            The story queue was automatically stopped due to a configuration error that would likely affect all items.
+            Please check your settings (API keys, model configurations, node connections) and try again.
+          </Typography>
+          {processingStatus.errors.length > 0 && (
+            <Box sx={{ mt: 1, p: 1, bgcolor: 'rgba(0,0,0,0.1)', borderRadius: 1 }}>
+              <Typography variant="caption" component="div" sx={{ fontFamily: 'monospace' }}>
+                {processingStatus.errors[processingStatus.errors.length - 1]}
+              </Typography>
+            </Box>
+          )}
+        </Alert>
+      )}
+
       {/* Queue Table - Full Width */}
       <Card>
         <CardContent>
@@ -584,9 +664,9 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
             <Typography variant="h6">
               Queue Items ({queue.length})
             </Typography>
-            {settings.modelConfigs && settings.modelConfigs.length > 0 && (
+            {pipelineAssignments && pipelineAssignments.length > 0 && (
               <Typography variant="body2" color="text.secondary">
-                {settings.modelConfigs.filter(c => c.enabled).length} models configured
+                {pipelineAssignments.filter(a => a.enabled && a.modelId).length} steps configured
               </Typography>
             )}
           </Box>
@@ -611,8 +691,8 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
                     </TableHead>
                     <TableBody>
                       {queue.map((item, index) => (
+                        <React.Fragment key={item.id}>
                         <TableRow
-                          key={item.id}
                           sx={{
                             // Custom stories have a distinct visual style
                             ...(item.isCustom && {
@@ -623,6 +703,11 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
                             ...(item.manualMode && !item.isCustom && {
                               bgcolor: 'rgba(156, 39, 176, 0.08)',
                               borderLeft: '4px solid #9c27b0',
+                            }),
+                            // Failed stories have a red tint
+                            ...(item.status === 'failed' && {
+                              bgcolor: 'rgba(244, 67, 54, 0.08)',
+                              borderLeft: '4px solid #f44336',
                             }),
                           }}
                         >
@@ -716,12 +801,29 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
                             {(() => {
                               const renderInfo = item.status === 'completed' ? getRenderStatus(item.storyId) : null;
                               return (
-                                <Chip
-                                  icon={getStatusIcon(item.status, renderInfo)}
-                                  label={getStatusLabel(item.status, renderInfo)}
-                                  size="small"
-                                  color={getStatusColor(item.status, renderInfo)}
-                                />
+                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.5 }}>
+                                  <Chip
+                                    icon={getStatusIcon(item.status, renderInfo)}
+                                    label={getStatusLabel(item.status, renderInfo)}
+                                    size="small"
+                                    color={getStatusColor(item.status, renderInfo)}
+                                  />
+                                  {/* Show error expand button for failed items */}
+                                  {item.status === 'failed' && item.error && (
+                                    <Tooltip title={expandedErrors.has(item.id) ? "Hide error details" : "Show error details"}>
+                                      <IconButton
+                                        size="small"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          toggleErrorExpansion(item.id);
+                                        }}
+                                        sx={{ p: 0.25 }}
+                                      >
+                                        {expandedErrors.has(item.id) ? <ExpandLess fontSize="small" /> : <ExpandMore fontSize="small" />}
+                                      </IconButton>
+                                    </Tooltip>
+                                  )}
+                                </Box>
                               );
                             })()}
                           </TableCell>
@@ -867,6 +969,39 @@ const StoryQueue: React.FC<StoryQueueProps> = ({ onOpenStory }) => {
                             </Box>
                           </TableCell>
                         </TableRow>
+                        {/* Expandable error row */}
+                        {item.status === 'failed' && item.error && (
+                          <TableRow>
+                            <TableCell colSpan={7} sx={{ py: 0, borderBottom: expandedErrors.has(item.id) ? undefined : 'none' }}>
+                              <Collapse in={expandedErrors.has(item.id)} timeout="auto" unmountOnExit>
+                                <Alert
+                                  severity="error"
+                                  sx={{ my: 1 }}
+                                  action={
+                                    <Box sx={{ display: 'flex', gap: 1 }}>
+                                      <Button
+                                        size="small"
+                                        startIcon={<ReplayOutlined />}
+                                        onClick={() => reQueueItem(item.id)}
+                                        color="inherit"
+                                      >
+                                        Retry
+                                      </Button>
+                                    </Box>
+                                  }
+                                >
+                                  <Typography variant="subtitle2" fontWeight="bold" gutterBottom>
+                                    {item.currentStep ? `Failed at step: ${getStepDisplayName(item.currentStep)}` : 'Generation Failed'}
+                                  </Typography>
+                                  <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: '0.75rem' }}>
+                                    {item.error}
+                                  </Typography>
+                                </Alert>
+                              </Collapse>
+                            </TableCell>
+                          </TableRow>
+                        )}
+                      </React.Fragment>
                       ))}
                     </TableBody>
                   </Table>

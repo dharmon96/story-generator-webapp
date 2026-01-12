@@ -9,18 +9,21 @@ A lightweight agent that runs on each AI node to:
 4. Enable automatic discovery by the main application
 5. Display supported ComfyUI workflows with model requirements
 6. Log all Ollama and ComfyUI communications for debugging
+7. Auto-update from central server on startup
 
 Usage:
-    python agent.py [--port 8765] [--server http://192.168.0.181:8001]
+    python agent.py [--port 8765] [--server http://192.168.0.181:8001] [--no-update]
 
 Requirements:
     pip install flask requests psutil
 """
 
 import argparse
+import hashlib
 import json
 import os
 import platform
+import shutil
 import socket
 import subprocess
 import sys
@@ -41,6 +44,9 @@ except ImportError:
     import psutil
 
 
+# Agent Version - used for update checking
+AGENT_VERSION = "1.1.0"
+
 # Configuration
 DEFAULT_PORT = 8765
 DEFAULT_OLLAMA_PORT = 11434
@@ -54,6 +60,66 @@ COMFYUI_MODELS_PATHS = {
     "clip": ["models/clip", "models/text_encoders"],
     "lora": ["models/loras"]
 }
+
+# Config file path (same directory as agent.py)
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'agent_config.json')
+
+# Model visibility config (which models are enabled for broadcast)
+model_config = {
+    "ollama_disabled_models": [],  # List of Ollama model names to hide
+    "comfyui_disabled_workflows": []  # List of workflow IDs to hide
+}
+
+
+def load_config():
+    """Load agent configuration from file"""
+    global model_config
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                loaded = json.load(f)
+                model_config.update(loaded)
+                print(f"[Config] Loaded configuration from {CONFIG_FILE}")
+    except Exception as e:
+        print(f"[Config] Failed to load config: {e}")
+
+
+def save_config():
+    """Save agent configuration to file"""
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(model_config, f, indent=2)
+        print(f"[Config] Saved configuration to {CONFIG_FILE}")
+        return True
+    except Exception as e:
+        print(f"[Config] Failed to save config: {e}")
+        return False
+
+
+def get_enabled_ollama_models():
+    """Get list of Ollama models that are enabled for broadcast"""
+    all_models = node_state['ollama'].get('models', [])
+    disabled = model_config.get('ollama_disabled_models', [])
+    return [m for m in all_models if m not in disabled]
+
+
+def is_ollama_model_enabled(model_name: str) -> bool:
+    """Check if an Ollama model is enabled"""
+    return model_name not in model_config.get('ollama_disabled_models', [])
+
+
+def set_ollama_model_enabled(model_name: str, enabled: bool):
+    """Enable or disable an Ollama model for broadcast"""
+    disabled = model_config.get('ollama_disabled_models', [])
+
+    if enabled and model_name in disabled:
+        disabled.remove(model_name)
+    elif not enabled and model_name not in disabled:
+        disabled.append(model_name)
+
+    model_config['ollama_disabled_models'] = disabled
+    save_config()
+
 
 # Real-time statistics for load balancing
 agent_stats = {
@@ -96,6 +162,159 @@ agent_stats = {
     "uptime_seconds": 0,
     "started_at": None
 }
+
+
+# ============================================
+# AUTO-UPDATE SYSTEM
+# ============================================
+
+def get_file_hash(filepath: str) -> Optional[str]:
+    """Calculate MD5 hash of a file"""
+    try:
+        hash_md5 = hashlib.md5()
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    except Exception as e:
+        print(f"[!] Failed to calculate file hash: {e}")
+        return None
+
+
+def check_for_updates(server_url: str) -> Dict:
+    """Check if an update is available from the server"""
+    try:
+        current_hash = get_file_hash(__file__)
+        if not current_hash:
+            return {"needsUpdate": False, "error": "Failed to get current file hash"}
+
+        response = requests.get(
+            f"{server_url}/api/agent/check",
+            params={"hash": current_hash},
+            timeout=10
+        )
+
+        if response.ok:
+            return response.json()
+        else:
+            return {"needsUpdate": False, "error": f"Server returned {response.status_code}"}
+    except Exception as e:
+        return {"needsUpdate": False, "error": str(e)}
+
+
+def download_update(server_url: str) -> Optional[str]:
+    """Download the latest agent.py to a temp file"""
+    try:
+        response = requests.get(
+            f"{server_url}/api/agent/download",
+            timeout=30,
+            stream=True
+        )
+
+        if not response.ok:
+            print(f"[!] Failed to download update: {response.status_code}")
+            return None
+
+        # Save to temp file
+        temp_path = __file__ + ".new"
+        with open(temp_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+
+        # Verify the download
+        new_hash = get_file_hash(temp_path)
+        server_hash = response.headers.get("X-Agent-Hash")
+
+        if server_hash and new_hash != server_hash:
+            print(f"[!] Download verification failed: hash mismatch")
+            os.remove(temp_path)
+            return None
+
+        return temp_path
+    except Exception as e:
+        print(f"[!] Failed to download update: {e}")
+        return None
+
+
+def apply_update(temp_path: str) -> bool:
+    """Apply the downloaded update"""
+    try:
+        current_path = __file__
+        backup_path = current_path + ".backup"
+
+        # Create backup
+        shutil.copy2(current_path, backup_path)
+        print(f"[Update] Created backup at {backup_path}")
+
+        # Replace current file
+        shutil.move(temp_path, current_path)
+        print(f"[Update] Applied update successfully")
+
+        return True
+    except Exception as e:
+        print(f"[!] Failed to apply update: {e}")
+
+        # Try to restore backup
+        try:
+            if os.path.exists(backup_path):
+                shutil.move(backup_path, current_path)
+                print("[Update] Restored from backup")
+        except:
+            pass
+
+        return False
+
+
+def perform_auto_update(server_url: str) -> bool:
+    """
+    Check for updates and apply if available.
+    Returns True if an update was applied (requires restart).
+    """
+    print(f"[Update] Checking for updates from {server_url}...")
+
+    # Check if update is available
+    update_info = check_for_updates(server_url)
+
+    if update_info.get("error"):
+        print(f"[Update] Check failed: {update_info['error']}")
+        return False
+
+    if not update_info.get("needsUpdate"):
+        print(f"[Update] Agent is up to date (hash: {get_file_hash(__file__)[:8]}...)")
+        return False
+
+    print(f"[Update] Update available!")
+    print(f"  Current hash: {update_info.get('clientHash', 'unknown')[:8]}...")
+    print(f"  Server hash:  {update_info.get('currentHash', 'unknown')[:8]}...")
+    print(f"  Server version: {update_info.get('currentVersion', 'unknown')}")
+
+    # Download update
+    print("[Update] Downloading update...")
+    temp_path = download_update(server_url)
+
+    if not temp_path:
+        print("[Update] Download failed")
+        return False
+
+    # Apply update
+    print("[Update] Applying update...")
+    if apply_update(temp_path):
+        print("[Update] Update applied successfully!")
+        print("[Update] Restarting agent...")
+        return True
+
+    return False
+
+
+def restart_agent():
+    """Restart the agent process"""
+    print("[Restart] Restarting agent...")
+    time.sleep(1)
+
+    # Re-execute the current script with the same arguments
+    python = sys.executable
+    os.execl(python, python, *sys.argv)
+
 
 app = Flask(__name__)
 
@@ -205,7 +424,7 @@ WORKFLOW_REGISTRY = {
         "models": {
             "unet_high": "Wan2_2-T2V-A14B-HIGH-HoloCine-full_fp8_e4m3fn_scaled_KJ.safetensors",
             "unet_low": "Wan2_2-T2V-A14B-LOW-HoloCine-full_fp8_e4m3fn_scaled_KJ.safetensors",
-            "vae": "wan2.2_vae.safetensors",
+            "vae": "wan_2.1_vae.safetensors",
             "clip": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
             "lora": "lightx2v_T2V_14B_cfg_step_distill_v2_lora_rank64_bf16.safetensors"
         },
@@ -223,7 +442,7 @@ WORKFLOW_REGISTRY = {
             "7": {"inputs": {"text": "{{NEGATIVE_PROMPT}}", "clip": ["38", 0]}, "class_type": "CLIPTextEncode", "_meta": {"title": "CLIP Text Encode (Prompt)"}},
             "8": {"inputs": {"samples": ["114", 0], "vae": ["39", 0]}, "class_type": "VAEDecode", "_meta": {"title": "VAE Decode"}},
             "38": {"inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}, "class_type": "CLIPLoader", "_meta": {"title": "Load CLIP"}},
-            "39": {"inputs": {"vae_name": "wan2.2_vae.safetensors"}, "class_type": "VAELoader", "_meta": {"title": "Load VAE"}},
+            "39": {"inputs": {"vae_name": "wan_2.1_vae.safetensors"}, "class_type": "VAELoader", "_meta": {"title": "Load VAE"}},
             "59": {"inputs": {"width": 848, "height": 480, "length": 77, "batch_size": 1}, "class_type": "EmptyHunyuanLatentVideo", "_meta": {"title": "Empty HunyuanVideo 1.0 Latent"}},
             "63": {"inputs": {"frame_rate": 16, "loop_count": 0, "filename_prefix": "wan2.2", "format": "video/h264-mp4", "pix_fmt": "yuv420p", "crf": 19, "save_metadata": True, "trim_to_audio": False, "pingpong": False, "save_output": False, "images": ["184", 0]}, "class_type": "VHS_VideoCombine", "_meta": {"title": "Video Combine"}},
             "113": {"inputs": {"add_noise": "enable", "noise_seed": "{{SEED}}", "steps": ["119", 0], "cfg": 3.5, "sampler_name": "euler", "scheduler": "simple", "start_at_step": 0, "end_at_step": ["120", 0], "return_with_leftover_noise": "enable", "model": ["154", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["59", 0]}, "class_type": "KSamplerAdvanced", "_meta": {"title": "KSampler (Advanced)"}},
@@ -755,15 +974,24 @@ def send_heartbeat():
             "ollama": {
                 "available": node_state['ollama']['available'],
                 "port": node_state['ollama']['port'],
-                "models": node_state['ollama']['models'],
+                "models": get_enabled_ollama_models(),  # Only broadcast enabled models
+                "all_models": node_state['ollama']['models'],  # Full list for reference
                 "current_job": node_state['ollama']['current_job'],
                 "jobs_completed": node_state['ollama']['jobs_completed']
             },
             "comfyui": {
                 "available": node_state['comfyui']['available'],
                 "port": node_state['comfyui']['port'],
+                "models_info": node_state['comfyui'].get('models_info', {}),
                 "current_job": node_state['comfyui']['current_job'],
                 "jobs_completed": node_state['comfyui']['jobs_completed']
+            },
+            "workflows": {
+                "supported": list(WORKFLOW_REGISTRY.keys()),
+                "ready": [
+                    wf_id for wf_id in WORKFLOW_REGISTRY
+                    if check_workflow_model_availability(wf_id).get("all_available", False)
+                ]
             },
             "system": node_state['system'],
             "timestamp": datetime.now().isoformat()
@@ -784,13 +1012,44 @@ def send_heartbeat():
         print(f"[!] Heartbeat error: {e}")
 
 
+# Counter for periodic update checks
+heartbeat_counter = 0
+UPDATE_CHECK_INTERVAL = 25  # Check for updates every N heartbeats
+
+
 def background_tasks():
     """Background thread for periodic updates"""
+    global heartbeat_counter
+
     while True:
         try:
             update_system_stats()
             update_services()
             send_heartbeat()
+
+            # Increment heartbeat counter
+            heartbeat_counter += 1
+
+            # Check for updates every UPDATE_CHECK_INTERVAL heartbeats
+            if heartbeat_counter >= UPDATE_CHECK_INTERVAL and node_state.get('central_server'):
+                heartbeat_counter = 0
+                try:
+                    print(f"[Update] Periodic update check (every {UPDATE_CHECK_INTERVAL} heartbeats)...")
+                    update_info = check_for_updates(node_state['central_server'])
+
+                    if update_info.get("needsUpdate"):
+                        print(f"[Update] New version available! Downloading...")
+                        temp_path = download_update(node_state['central_server'])
+
+                        if temp_path and apply_update(temp_path):
+                            print(f"[Update] Update applied! Restarting agent...")
+                            time.sleep(1)
+                            restart_agent()
+                    else:
+                        print(f"[Update] Agent is up to date")
+                except Exception as e:
+                    print(f"[Update] Periodic update check failed: {e}")
+
         except Exception as e:
             print(f"Background task error: {e}")
         time.sleep(HEARTBEAT_INTERVAL)
@@ -876,6 +1135,38 @@ DASHBOARD_HTML = """
             border-radius: 4px;
             margin: 4px 0;
             font-family: monospace;
+        }
+        .model-toggle {
+            cursor: pointer;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .model-toggle:hover {
+            transform: translateX(4px);
+            background: rgba(0,217,255,0.2);
+        }
+        .model-enabled {
+            background: rgba(0,200,83,0.15);
+            border-left: 3px solid #00c853;
+        }
+        .model-disabled {
+            background: rgba(255,82,82,0.1);
+            border-left: 3px solid #ff5252;
+            opacity: 0.7;
+        }
+        .model-status {
+            font-weight: bold;
+            font-size: 0.9em;
+        }
+        .model-enabled .model-status { color: #00c853; }
+        .model-disabled .model-status { color: #ff5252; }
+        .hint {
+            font-size: 0.75rem;
+            color: #666;
+            margin-top: 8px;
+            font-style: italic;
         }
         .job-card {
             background: rgba(0,217,255,0.1);
@@ -1189,13 +1480,19 @@ DASHBOARD_HTML = """
                 </div>
                 {% if ollama.available %}
                 <div class="metric">
-                    <span class="metric-label">Models ({{ ollama.models | length }})</span>
+                    <span class="metric-label">Models ({{ enabled_models | length }} enabled / {{ ollama.models | length }} total)</span>
                 </div>
                 <div class="model-list">
                     {% for model in ollama.models %}
-                    <div class="model-item">{{ model }}</div>
+                    <div class="model-item model-toggle {% if model in enabled_models %}model-enabled{% else %}model-disabled{% endif %}"
+                         onclick="toggleModel('{{ model }}')"
+                         title="Click to {{ 'disable' if model in enabled_models else 'enable' }}">
+                        <span class="model-status">{% if model in enabled_models %}✓{% else %}✗{% endif %}</span>
+                        {{ model }}
+                    </div>
                     {% endfor %}
                 </div>
+                <p class="hint">Click models to enable/disable them for the pipeline</p>
                 {% endif %}
                 <div class="job-card {{ 'idle' if not ollama.current_job else '' }}">
                     {% if ollama.current_job %}
@@ -1431,6 +1728,27 @@ DASHBOARD_HTML = """
                     .then(() => location.reload());
             }
         }
+
+        // Toggle model enabled/disabled status
+        function toggleModel(modelName) {
+            fetch('/api/models/toggle', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ model: modelName })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.status === 'ok') {
+                    // Reload to show updated state
+                    location.reload();
+                } else {
+                    alert('Failed to toggle model: ' + (data.error || 'Unknown error'));
+                }
+            })
+            .catch(err => {
+                alert('Error toggling model: ' + err);
+            });
+        }
     </script>
 </body>
 </html>
@@ -1485,6 +1803,7 @@ def dashboard():
     return render_template_string(
         DASHBOARD_HTML,
         **node_state,
+        enabled_models=get_enabled_ollama_models(),
         workflows=workflows_display,
         workflow_availability=workflow_availability,
         stats=stats_for_template,
@@ -1503,15 +1822,131 @@ def api_status():
     })
 
 
+@app.route('/api/version')
+def api_version():
+    """Get agent version info"""
+    return jsonify({
+        "version": AGENT_VERSION,
+        "hash": get_file_hash(__file__),
+        "hostname": node_state['hostname'],
+        "node_id": node_state['node_id']
+    })
+
+
+@app.route('/api/update/check')
+def api_update_check():
+    """Check if an update is available from the central server"""
+    if not node_state.get('central_server'):
+        return jsonify({"error": "No central server configured"}), 400
+
+    update_info = check_for_updates(node_state['central_server'])
+    return jsonify({
+        "currentVersion": AGENT_VERSION,
+        "currentHash": get_file_hash(__file__),
+        **update_info
+    })
+
+
+@app.route('/api/update/apply', methods=['POST'])
+def api_update_apply():
+    """Manually trigger an update from the central server"""
+    if not node_state.get('central_server'):
+        return jsonify({"error": "No central server configured"}), 400
+
+    # Check for update
+    update_info = check_for_updates(node_state['central_server'])
+
+    if not update_info.get("needsUpdate"):
+        return jsonify({
+            "status": "up_to_date",
+            "message": "Agent is already up to date"
+        })
+
+    # Download and apply
+    temp_path = download_update(node_state['central_server'])
+    if not temp_path:
+        return jsonify({"error": "Failed to download update"}), 500
+
+    if apply_update(temp_path):
+        # Schedule restart in background
+        def delayed_restart():
+            time.sleep(2)
+            restart_agent()
+        threading.Thread(target=delayed_restart, daemon=True).start()
+
+        return jsonify({
+            "status": "updated",
+            "message": "Update applied, agent restarting in 2 seconds..."
+        })
+    else:
+        return jsonify({"error": "Failed to apply update"}), 500
+
+
 @app.route('/api/health')
 def api_health():
     """Simple health check endpoint"""
     return jsonify({
         "status": "ok",
+        "version": AGENT_VERSION,
         "node_id": node_state['node_id'],
         "hostname": node_state['hostname'],
         "ollama": node_state['ollama']['available'],
         "comfyui": node_state['comfyui']['available']
+    })
+
+
+@app.route('/api/models/config')
+def api_models_config():
+    """Get model visibility configuration"""
+    all_models = node_state['ollama'].get('models', [])
+    disabled = model_config.get('ollama_disabled_models', [])
+
+    return jsonify({
+        "ollama_models": [
+            {"name": m, "enabled": m not in disabled}
+            for m in all_models
+        ],
+        "ollama_disabled_models": disabled,
+        "comfyui_disabled_workflows": model_config.get('comfyui_disabled_workflows', [])
+    })
+
+
+@app.route('/api/models/toggle', methods=['POST'])
+def api_models_toggle():
+    """Toggle a model's enabled/disabled status"""
+    data = request.json
+    model_name = data.get('model')
+    enabled = data.get('enabled')
+
+    if not model_name:
+        return jsonify({"error": "Model name required"}), 400
+
+    if enabled is None:
+        # Toggle current state
+        enabled = not is_ollama_model_enabled(model_name)
+
+    set_ollama_model_enabled(model_name, enabled)
+
+    return jsonify({
+        "status": "ok",
+        "model": model_name,
+        "enabled": enabled
+    })
+
+
+@app.route('/api/models/set-enabled', methods=['POST'])
+def api_models_set_enabled():
+    """Set multiple models enabled/disabled at once"""
+    data = request.json
+    models = data.get('models', {})  # {"model_name": true/false, ...}
+
+    for model_name, enabled in models.items():
+        set_ollama_model_enabled(model_name, enabled)
+
+    return jsonify({
+        "status": "ok",
+        "updated": list(models.keys()),
+        "current_disabled": model_config.get('ollama_disabled_models', [])
     })
 
 
@@ -2188,13 +2623,30 @@ def proxy_comfyui(path):
                 timeout=30
             )
 
-        # Parse response
+        duration_ms = (datetime.now() - start_time).total_seconds() * 1000
+
+        # Check content type from ComfyUI response
+        content_type = response.headers.get('Content-Type', '')
+
+        # For binary content (images, videos), return raw content with proper MIME type
+        if content_type.startswith(('image/', 'video/', 'audio/', 'application/octet-stream')):
+            log_comfyui_response(endpoint, start_time, {"binary_content": True, "content_type": content_type, "size": len(response.content)}, status_code=response.status_code)
+            update_stats("comfyui", duration_ms, response.ok)
+            return app.response_class(
+                response.content,
+                mimetype=content_type,
+                headers={
+                    'Content-Disposition': response.headers.get('Content-Disposition', ''),
+                    'Content-Length': response.headers.get('Content-Length', str(len(response.content)))
+                }
+            )
+
+        # Parse JSON response
         try:
             resp_data = response.json()
         except:
             resp_data = response.text
 
-        duration_ms = (datetime.now() - start_time).total_seconds() * 1000
         log_comfyui_response(endpoint, start_time, resp_data, status_code=response.status_code)
 
         # Update stats
@@ -2205,7 +2657,7 @@ def proxy_comfyui(path):
             if node_state['comfyui']['current_job']:
                 node_state['comfyui']['current_job']['prompt_id'] = resp_data['prompt_id']
 
-        return jsonify(resp_data) if isinstance(resp_data, dict) else app.response_class(resp_data, mimetype='text/plain')
+        return jsonify(resp_data) if isinstance(resp_data, dict) else app.response_class(resp_data, mimetype=content_type or 'text/plain')
 
     except Exception as e:
         error_msg = str(e)
@@ -2283,7 +2735,20 @@ def main():
     parser.add_argument('--server', type=str, help='Central server URL for heartbeats (e.g., http://192.168.0.181:8001)')
     parser.add_argument('--ollama-port', type=int, default=DEFAULT_OLLAMA_PORT, help=f'Ollama port (default: {DEFAULT_OLLAMA_PORT})')
     parser.add_argument('--comfyui-port', type=int, default=DEFAULT_COMFYUI_PORT, help=f'ComfyUI port (default: {DEFAULT_COMFYUI_PORT})')
+    parser.add_argument('--no-update', action='store_true', help='Skip auto-update check on startup')
     args = parser.parse_args()
+
+    # Auto-update check (only if server is specified and --no-update not set)
+    if args.server and not args.no_update:
+        print(f"\n[Agent v{AGENT_VERSION}] Checking for updates...")
+        if perform_auto_update(args.server):
+            # Update was applied, restart the agent
+            restart_agent()
+            return  # This won't be reached due to exec
+    elif args.no_update:
+        print(f"\n[Agent v{AGENT_VERSION}] Auto-update skipped (--no-update flag)")
+    else:
+        print(f"\n[Agent v{AGENT_VERSION}] No server configured, skipping update check")
 
     # Initialize node state
     node_state['node_id'] = generate_node_id()
@@ -2292,6 +2757,9 @@ def main():
     node_state['ollama']['port'] = args.ollama_port
     node_state['comfyui']['port'] = args.comfyui_port
     node_state['central_server'] = args.server
+
+    # Load model configuration from file
+    load_config()
 
     # Initialize stats tracking timestamp
     agent_stats["started_at"] = datetime.now().isoformat()
@@ -2313,7 +2781,7 @@ def main():
 
     print("")
     print("=" * 65)
-    print("         Story Generator Node Agent v1.1")
+    print(f"         Story Generator Node Agent v{AGENT_VERSION}")
     print("=" * 65)
     print(f"  Node ID:    {node_state['node_id'][:32]}...")
     print(f"  Hostname:   {node_state['hostname']}")

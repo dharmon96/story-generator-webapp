@@ -78,7 +78,7 @@ const RenderQueue: React.FC = () => {
     stories,
     shotlists,
   } = useStore();
-  const [nodeStatuses, setNodeStatuses] = useState<{ nodeId: string; nodeName: string; busy: boolean; currentJob: string | null }[]>([]);
+  const [nodeStatuses, setNodeStatuses] = useState<{ nodeId: string; nodeName: string; busy: boolean; currentJob: string | null; busyReason?: string }[]>([]);
   const [queueStats, setQueueStats] = useState({ queued: 0, rendering: 0, completed: 0, failed: 0, total: 0 });
   const [expandedJobs, setExpandedJobs] = useState<Set<string>>(new Set());
   const [confirmClearDialog, setConfirmClearDialog] = useState(false);
@@ -414,8 +414,8 @@ const RenderQueue: React.FC = () => {
               <Chip
                 key={node.nodeId}
                 icon={node.busy ? <Movie fontSize="small" /> : <Computer fontSize="small" />}
-                label={`${node.nodeName}${node.busy ? ' (Rendering)' : ''}`}
-                color={node.busy ? 'primary' : 'default'}
+                label={`${node.nodeName}${node.busy ? ` (${node.busyReason || 'Busy'})` : ''}`}
+                color={node.busy ? (node.busyReason === 'Ollama busy' ? 'warning' : 'primary') : 'default'}
                 variant={node.busy ? 'filled' : 'outlined'}
               />
             ))}
@@ -427,6 +427,36 @@ const RenderQueue: React.FC = () => {
       {nodeStatuses.length === 0 && (
         <Alert severity="warning" sx={{ mb: 3 }}>
           No ComfyUI nodes available. Please configure ComfyUI nodes in Settings to enable video rendering.
+        </Alert>
+      )}
+
+      {/* Failed jobs summary alert */}
+      {queueStats.failed > 0 && (
+        <Alert
+          severity="error"
+          sx={{ mb: 3 }}
+          action={
+            <Button
+              color="inherit"
+              size="small"
+              startIcon={<Replay />}
+              onClick={() => {
+                // Retry all failed jobs
+                renderQueue
+                  .filter(job => job.status === 'failed')
+                  .forEach(job => handleRetryJob(job.id));
+              }}
+            >
+              Retry All ({queueStats.failed})
+            </Button>
+          }
+        >
+          <Typography variant="body2" fontWeight="bold">
+            {queueStats.failed} render job{queueStats.failed > 1 ? 's' : ''} failed
+          </Typography>
+          <Typography variant="caption">
+            Expand failed jobs below to see error details. Click "Retry All" to requeue all failed jobs.
+          </Typography>
         </Alert>
       )}
 

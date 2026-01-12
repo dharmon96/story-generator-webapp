@@ -102,7 +102,7 @@ interface RawLocation {
 }
 
 const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack }) => {
-  const { queue, stories, updateStory, checkpoints, renderQueue, settings, updateQueueItem } = useStore();
+  const { queue, stories, updateStory, checkpoints, renderQueue, updateQueueItem, getModelConfigsFromAssignments } = useStore();
   const [currentTab, setCurrentTab] = useState(0);
   const [storyData, setStoryData] = useState<EnhancedStory | null>(null);
   const [aiLogs, setAiLogs] = useState<AILogEntry[]>([]);
@@ -156,9 +156,10 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
   const handleResume = async () => {
     if (!queueItem || isResuming) return;
 
-    const modelConfigs = settings.modelConfigs || [];
+    // Get model configs from pipeline assignments
+    const modelConfigs = getModelConfigsFromAssignments();
     if (modelConfigs.length === 0) {
-      console.error('No model configs available for resume');
+      console.error('No model configs available for resume. Please configure models in Settings.');
       return;
     }
 
@@ -196,9 +197,10 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
   const handleRestart = async () => {
     if (!queueItem || isResuming) return;
 
-    const modelConfigs = settings.modelConfigs || [];
+    // Get model configs from pipeline assignments
+    const modelConfigs = getModelConfigsFromAssignments();
     if (modelConfigs.length === 0) {
-      console.error('No model configs available for restart');
+      console.error('No model configs available for restart. Please configure models in Settings.');
       return;
     }
 
@@ -860,7 +862,7 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
               // Add new shot in manual mode
               if (storyData) {
                 const newShot = {
-                  id: `shot_${Date.now()}`,
+                  id: `shot_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                   shotNumber: shotData.shotNumber || (storyData.shots?.length || 0) + 1,
                   title: `Shot ${shotData.shotNumber || (storyData.shots?.length || 0) + 1}`,
                   description: shotData.description || '',
@@ -954,7 +956,7 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
               if (storyData) {
                 const newChar = {
                   ...character,
-                  id: `char_${Date.now()}`,
+                  id: `char_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                   name: character.name || 'Unnamed Character',
                   role: character.role || 'supporting',
                   createdAt: new Date(),
@@ -978,7 +980,7 @@ const StoryDetail: React.FC<StoryDetailProps> = ({ storyId, queueItemId, onBack 
               if (storyData) {
                 const newLoc = {
                   ...location,
-                  id: `loc_${Date.now()}`,
+                  id: `loc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
                   name: location.name || 'Unnamed Location',
                   type: location.type || 'interior',
                   createdAt: new Date(),

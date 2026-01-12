@@ -1,0 +1,6 @@
+{
+  "ollama_disabled_models": [
+    "gpt-oss:20b"
+  ],
+  "comfyui_disabled_workflows": []
+}
